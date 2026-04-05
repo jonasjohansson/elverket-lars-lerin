@@ -20,7 +20,10 @@ const info = document.getElementById('info');
 // ─── Params ───
 const params = {
   splatScale: 3.5,
+  sizeVariation: 3.0, // range of size variation (organic)
   opacity: 1.0,
+  exposure: 1.2,
+  toneMapping: 'ACES',
   bgColor: '#000000',
   depthNear: 1.5,
   depthFar: -4.0,
@@ -82,6 +85,7 @@ renderer.toneMappingExposure = 1.2;
 
 // ─── Scene & Camera ───
 const scene = new THREE.Scene();
+scene.background = new THREE.Color(params.bgColor);
 const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.01, 100);
 camera.position.set(0, 0, 3.8);
 
@@ -161,7 +165,9 @@ async function buildParticles() {
     randoms[i * 4] = (Math.random() - 0.5) * 2;
     randoms[i * 4 + 1] = (Math.random() - 0.5) * 2;
     randoms[i * 4 + 2] = Math.random();
-    randoms[i * 4 + 3] = 0.3 + Math.random() * 0.7;
+    // Size: power distribution for organic variation (many small, few large)
+    const sizeRoll = Math.random();
+    randoms[i * 4 + 3] = Math.pow(sizeRoll, 2.0) * params.sizeVariation + 0.2;
   }
 
   return { positions, colors, randoms };
@@ -405,23 +411,27 @@ async function init() {
   };
   const hideTransforms = () => { if (activeTransform) { scene.remove(activeTransform.getHelper()); activeTransform = null; } };
 
-  // ─── Post-processing: trails + DOF + vignette ───
+  // ─── Post-processing ───
   const uVignetteStrength = uniform(params.vignetteStrength);
   const uTrailStrength = uniform(params.trailStrength);
   const uDofFocus = uniform(params.dofFocus);
   const uDofAperture = uniform(params.dofAperture);
   const uDofMaxBlur = uniform(params.dofMaxBlur);
+  const uExposure = uniform(params.exposure);
 
   const postProcessing = new THREE.PostProcessing(renderer);
   const scenePass = pass(scene, camera);
   const sceneColor = scenePass.getTextureNode('output');
   const sceneViewZ = scenePass.getViewZNode();
 
-  // Feedback trails (afterimage)
+  // Feedback trails
   const trailPass = afterImage(sceneColor, uTrailStrength);
 
   // DOF
   const dofPass = dof(trailPass, sceneViewZ, uDofFocus, uDofAperture, uDofMaxBlur);
+
+  // Exposure
+  const exposed = dofPass.mul(uExposure);
 
   // Vignette
   const uv = viewportUV;
@@ -429,7 +439,7 @@ async function init() {
   const vignette = clamp(vigDist.mul(2.0), 0.0, 1.0);
   const vignetteFactor = float(1.0).sub(vignette.mul(vignette).mul(uVignetteStrength));
 
-  postProcessing.outputNode = dofPass.mul(vignetteFactor);
+  postProcessing.outputNode = exposed.mul(vignetteFactor);
 
   info.textContent = `${(PARTICLE_COUNT / 1e6).toFixed(1)}M · WebGPU · Space: dissolve · R: reset`;
 
@@ -437,9 +447,14 @@ async function init() {
   const gui = new GUI({ title: 'Point Cloud' });
 
   const fR = gui.addFolder('Rendering');
-  fR.add(params, 'splatScale', 0.5, 15, 0.25).name('Scale').onChange(v => uScale.value = v);
-  fR.add(params, 'opacity', 0, 1, 0.01).name('Opacity').onChange(v => uOpacity.value = v);
-  fR.addColor(params, 'bgColor').name('Background').onChange(v => renderer.setClearColor(v));
+  fR.add(params, 'splatScale', 0.5, 15, 0.25).name('Scale').onChange(v => { uScale.value = v; });
+  fR.add(params, 'opacity', 0, 1, 0.01).name('Opacity').onChange(v => { uOpacity.value = v; });
+  fR.addColor(params, 'bgColor').name('Background').onChange(v => { renderer.setClearColor(v); scene.background = new THREE.Color(v); });
+  fR.add(params, 'exposure', 0.1, 3, 0.05).name('Exposure').onChange(v => { uExposure.value = v; });
+  fR.add(params, 'toneMapping', ['None', 'Linear', 'Reinhard', 'Cineon', 'ACES']).name('Tone Map').onChange(v => {
+    const map = { None: THREE.NoToneMapping, Linear: THREE.LinearToneMapping, Reinhard: THREE.ReinhardToneMapping, Cineon: THREE.CineonToneMapping, ACES: THREE.ACESFilmicToneMapping };
+    renderer.toneMapping = map[v] || THREE.ACESFilmicToneMapping;
+  });
 
   const fW = gui.addFolder('Waves');
   fW.add(params, 'waveAmplitude', 0, 0.2, 0.005).name('Wave 1 Amp').onChange(v => uWaveAmp.value = v);
