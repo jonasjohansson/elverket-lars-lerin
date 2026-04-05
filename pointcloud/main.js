@@ -4,8 +4,9 @@ import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import {
   uniform, attribute, float, vec2, vec3, vec4,
   Fn, sin, cos, mix, clamp, smoothstep,
-  pass, viewportUV, mrt, output, emissive,
+  pass, viewportUV,
 } from 'three/tsl';
+import { dof } from 'three/addons/tsl/display/DepthOfFieldNode.js';
 import GUI from 'https://cdn.jsdelivr.net/npm/lil-gui@0.20/+esm';
 
 // ─── Config ───
@@ -25,7 +26,7 @@ const params = {
   depthCurve: 0.8,
   depthScatter: 0.5,
   // Breathing
-  breatheAmplitude: 0.015,
+  breatheAmplitude: 0,
   breatheSpeed: 0.4,
   microDrift: 0.003,
   // Dissolution
@@ -43,6 +44,10 @@ const params = {
   lightFalloff: 1.5,
   // Vignette
   vignetteStrength: 0.4,
+  // DOF
+  dofFocus: 4.8,
+  dofAperture: 0.003,
+  dofMaxBlur: 0.015,
   // Dust
   dustOpacity: 0.15,
   dustSpeed: 0.05,
@@ -201,7 +206,7 @@ async function init() {
   const material = new THREE.PointsNodeMaterial({
     transparent: true,
     blending: THREE.NormalBlending,
-    depthWrite: false,
+    depthWrite: true,
     depthTest: true,
   });
 
@@ -378,12 +383,19 @@ async function init() {
     manualLightMode = false;
   };
 
-  // ─── Post-processing: vignette ───
+  // ─── Post-processing: DOF + vignette ───
   const uVignetteStrength = uniform(params.vignetteStrength);
+  const uDofFocus = uniform(params.dofFocus);
+  const uDofAperture = uniform(params.dofAperture);
+  const uDofMaxBlur = uniform(params.dofMaxBlur);
 
   const postProcessing = new THREE.PostProcessing(renderer);
   const scenePass = pass(scene, camera);
   const sceneColor = scenePass.getTextureNode('output');
+  const sceneViewZ = scenePass.getViewZNode();
+
+  // Bokeh DOF
+  const dofPass = dof(sceneColor, sceneViewZ, uDofFocus, uDofAperture, uDofMaxBlur);
 
   // Vignette
   const uv = viewportUV;
@@ -391,7 +403,7 @@ async function init() {
   const vignette = clamp(vigDist.mul(2.0), 0.0, 1.0);
   const vignetteFactor = float(1.0).sub(vignette.mul(vignette).mul(uVignetteStrength));
 
-  postProcessing.outputNode = sceneColor.mul(vignetteFactor);
+  postProcessing.outputNode = dofPass.mul(vignetteFactor);
 
   info.textContent = `${(PARTICLE_COUNT / 1e6).toFixed(1)}M · WebGPU · Space: dissolve · R: reset · 1/2: drag lights · Esc: hide gizmo`;
 
@@ -428,6 +440,11 @@ async function init() {
   fLights.addColor(params, 'light2Color').name('Light 2 Color').onChange(v => { uLight2Col.value.set(v); light2Helper.material.color.set(v); });
   fLights.add(params, 'light2Intensity', 0, 5, 0.1).name('Light 2 Power').onChange(v => uLight2Int.value = v);
   fLights.add(params, 'lightFalloff', 0.5, 3, 0.1).name('Falloff').onChange(v => uLightFalloff.value = v);
+
+  const fDof = gui.addFolder('Depth of Field');
+  fDof.add(params, 'dofFocus', 0.1, 50, 0.1).name('Focus Distance').onChange(v => uDofFocus.value = v);
+  fDof.add(params, 'dofAperture', 0, 0.15, 0.001).name('Aperture').onChange(v => uDofAperture.value = v);
+  fDof.add(params, 'dofMaxBlur', 0, 0.08, 0.001).name('Max Blur').onChange(v => uDofMaxBlur.value = v);
 
   const fFx = gui.addFolder('FX');
   fFx.add(params, 'vignetteStrength', 0, 1.5, 0.05).name('Vignette').onChange(v => uVignetteStrength.value = v);
