@@ -1,13 +1,12 @@
 // ============================================================
-// Lars Lerin — Particle Dissolution (WebGL2 + GLSL)
+// Lars Lerin — Pixel Displacement Dissolution (WebGL2 + GLSL)
+// Fullscreen image rendered as texture, dissolved via fragment shader
 // ============================================================
 
-const PARTICLE_COUNT = 80000;
 const HOLD_TIME = 3.0;
-const DISSOLVE_TIME = 4.0;
+const DISSOLVE_TIME = 6.0;
 const BLACK_TIME = 2.0;
 
-// ---- State machine ----
 const STATE = { HOLDING: 0, DISSOLVING: 1, BLACK: 2 };
 let state = STATE.BLACK;
 let stateTimer = 0;
@@ -17,23 +16,21 @@ let images = [];
 
 // ---- Canvas & GL ----
 const canvas = document.getElementById('c');
-const gl = canvas.getContext('webgl2', { alpha: false, antialias: false });
+const gl = canvas.getContext('webgl2', { alpha: false, antialias: false, premultipliedAlpha: false });
 if (!gl) {
   document.body.textContent = 'WebGL2 not supported';
   throw new Error('WebGL2 not supported');
 }
 
-// ---- Fullscreen ----
-function toggleFullscreen() {
-  if (!document.fullscreenElement) {
-    canvas.requestFullscreen().catch(() => {});
-  } else {
-    document.exitFullscreen();
-  }
-}
-canvas.addEventListener('click', toggleFullscreen);
+// ---- Fullscreen (F key only) ----
 window.addEventListener('keydown', (e) => {
-  if (e.key === 'f' || e.key === 'F') toggleFullscreen();
+  if (e.key === 'f' || e.key === 'F') {
+    if (!document.fullscreenElement) {
+      canvas.requestFullscreen().catch(() => {});
+    } else {
+      document.exitFullscreen();
+    }
+  }
 });
 
 // ---- Resize ----
@@ -53,25 +50,38 @@ const VERT = `#version 300 es
 precision highp float;
 
 in vec2 a_position;
-in vec3 a_color;
-in float a_size;
-in vec3 a_noiseOffset;
+out vec2 v_uv;
 
-uniform float u_time;
+void main() {
+  v_uv = a_position * 0.5 + 0.5;
+  gl_Position = vec4(a_position, 0.0, 1.0);
+}
+`;
+
+const FRAG = `#version 300 es
+precision highp float;
+
+in vec2 v_uv;
+out vec4 fragColor;
+
+uniform sampler2D u_image;
 uniform float u_dissolve;
+uniform float u_time;
 uniform vec2 u_resolution;
+uniform vec2 u_imageSize;
 
-out vec3 v_color;
-out float v_alpha;
+// ============================================================
+// Simplex 3D Noise — Ashima Arts (Stefan Gustavson, Ian McEwan)
+// github.com/ashima/webgl-noise
+// ============================================================
 
-// ---- Simplex 3D noise (Ashima / Stefan Gustavson) ----
-vec3 mod289(vec3 x) { return x - floor(x * (1.0/289.0)) * 289.0; }
-vec4 mod289(vec4 x) { return x - floor(x * (1.0/289.0)) * 289.0; }
-vec4 permute(vec4 x) { return mod289(((x*34.0)+10.0)*x); }
+vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+vec4 mod289(vec4 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+vec4 permute(vec4 x) { return mod289(((x * 34.0) + 10.0) * x); }
 vec4 taylorInvSqrt(vec4 r) { return 1.79284291400159 - 0.85373472095314 * r; }
 
 float snoise(vec3 v) {
-  const vec2 C = vec2(1.0/6.0, 1.0/3.0);
+  const vec2 C = vec2(1.0 / 6.0, 1.0 / 3.0);
   const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
 
   vec3 i  = floor(v + dot(v, C.yyy));
@@ -107,89 +117,142 @@ float snoise(vec3 v) {
   vec4 b0 = vec4(x.xy, y.xy);
   vec4 b1 = vec4(x.zw, y.zw);
 
-  vec4 s0 = floor(b0)*2.0 + 1.0;
-  vec4 s1 = floor(b1)*2.0 + 1.0;
+  vec4 s0 = floor(b0) * 2.0 + 1.0;
+  vec4 s1 = floor(b1) * 2.0 + 1.0;
   vec4 sh = -step(h, vec4(0.0));
 
-  vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy;
-  vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww;
+  vec4 a0 = b0.xzyw + s0.xzyw * sh.xxyy;
+  vec4 a1 = b1.xzyw + s1.xzyw * sh.zzww;
 
   vec3 p0 = vec3(a0.xy, h.x);
   vec3 p1 = vec3(a0.zw, h.y);
   vec3 p2 = vec3(a1.xy, h.z);
   vec3 p3 = vec3(a1.zw, h.w);
 
-  vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2,p2), dot(p3,p3)));
+  vec4 norm = taylorInvSqrt(vec4(dot(p0, p0), dot(p1, p1), dot(p2, p2), dot(p3, p3)));
   p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
 
-  vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+  vec4 m = max(0.6 - vec4(dot(x0, x0), dot(x1, x1), dot(x2, x2), dot(x3, x3)), 0.0);
   m = m * m;
-  return 42.0 * dot(m*m, vec4(dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3)));
+  return 42.0 * dot(m * m, vec4(dot(p0, x0), dot(p1, x1), dot(p2, x2), dot(p3, x3)));
 }
 
-// ---- Curl-like offset from simplex noise ----
-vec3 curlOffset(vec3 p) {
-  float e = 0.01;
-  float nx = snoise(p + vec3(e,0,0)) - snoise(p - vec3(e,0,0));
-  float ny = snoise(p + vec3(0,e,0)) - snoise(p - vec3(0,e,0));
-  float nz = snoise(p + vec3(0,0,e)) - snoise(p - vec3(0,0,e));
-  return vec3(ny - nz, nz - nx, nx - ny) / (2.0 * e);
+// Fractional Brownian Motion for richer noise
+float fbm(vec3 p) {
+  float val = 0.0;
+  float amp = 0.5;
+  float freq = 1.0;
+  for (int i = 0; i < 4; i++) {
+    val += amp * snoise(p * freq);
+    freq *= 2.0;
+    amp *= 0.5;
+  }
+  return val;
 }
+
+// ============================================================
+// Image fitting — cover viewport, centered
+// ============================================================
+
+vec2 fitUV(vec2 uv) {
+  float viewAspect = u_resolution.x / u_resolution.y;
+  float imgAspect = u_imageSize.x / u_imageSize.y;
+
+  vec2 scale = vec2(1.0);
+  if (imgAspect > viewAspect) {
+    // Image is wider — fit height, crop sides
+    scale.x = viewAspect / imgAspect;
+  } else {
+    // Image is taller — fit width, crop top/bottom
+    scale.y = imgAspect / viewAspect;
+  }
+
+  return (uv - 0.5) / scale + 0.5;
+}
+
+// ============================================================
+// Main fragment shader
+// ============================================================
 
 void main() {
-  float d = u_dissolve;
+  vec2 uv = v_uv;
 
-  // Curl noise displacement
-  vec3 noiseInput = a_noiseOffset * 2.0 + u_time * 0.3;
-  vec3 curl = curlOffset(noiseInput);
+  // Fit image to viewport (contain, not cover — show full painting)
+  float viewAspect = u_resolution.x / u_resolution.y;
+  float imgAspect = u_imageSize.x / u_imageSize.y;
 
-  // Scale displacement with dissolve — gentle organic drift
-  float driftStrength = d * d * 300.0;
-  vec2 offset = curl.xy * driftStrength;
+  vec2 scale = vec2(1.0);
+  if (imgAspect > viewAspect) {
+    scale.y = viewAspect / imgAspect;
+  } else {
+    scale.x = imgAspect / viewAspect;
+  }
 
-  // Gentle downward gravity pull
-  offset.y += d * d * 120.0;
+  vec2 imgUV = (uv - 0.5) / scale + 0.5;
 
-  // Add slight individual wiggle
-  float wiggle = snoise(vec3(a_noiseOffset.xy * 5.0, u_time * 0.8));
-  offset += vec2(wiggle, wiggle * 0.6) * d * 40.0;
+  // Check if we're outside the image area
+  bool outsideImage = imgUV.x < 0.0 || imgUV.x > 1.0 || imgUV.y < 0.0 || imgUV.y > 1.0;
 
-  vec2 pos = a_position + offset;
+  if (outsideImage && u_dissolve < 0.001) {
+    fragColor = vec4(0.0, 0.0, 0.0, 1.0);
+    return;
+  }
 
-  // Map to clip space
-  vec2 ndc = (pos / u_resolution) * 2.0 - 1.0;
-  ndc.y = -ndc.y;
-  gl_Position = vec4(ndc, 0.0, 1.0);
+  // Directional dissolve: left side goes first
+  float localDelay = imgUV.x * 0.6;
+  float d = clamp((u_dissolve - localDelay) / (1.0 - localDelay + 0.001), 0.0, 1.0);
 
-  // Size: shrink as dissolve progresses (keep minimum so particles don't vanish abruptly)
-  float sizeFade = max(1.0 - pow(d, 1.5), 0.15);
-  gl_PointSize = a_size * sizeFade;
+  // Smooth easing for organic feel
+  float dEased = d * d * (3.0 - 2.0 * d);
 
-  v_color = a_color;
+  if (dEased > 0.0) {
+    float noiseScale = 3.0;
+    float t = u_time;
 
-  // Alpha: slow start, then accelerating fade
-  float alphaFade = 1.0 - pow(d, 2.0);
-  v_alpha = alphaFade;
-}
-`;
+    // Multi-octave noise for organic displacement
+    float n1 = fbm(vec3(imgUV * noiseScale, t * 0.2));
+    float n2 = fbm(vec3(imgUV * noiseScale + 100.0, t * 0.15));
+    float n3 = snoise(vec3(imgUV * 6.0, t * 0.1));
 
-const FRAG = `#version 300 es
-precision highp float;
+    // Primary leftward displacement — accelerates with dissolve
+    float displacement = dEased * dEased * 0.4;
+    imgUV.x -= displacement;
 
-in vec3 v_color;
-in float v_alpha;
+    // Noise-based horizontal scatter — like wind gusts
+    imgUV.x -= n1 * dEased * 0.08;
 
-out vec4 fragColor;
+    // Subtle vertical wobble — paint drifting
+    imgUV.y += n2 * dEased * 0.03;
 
-void main() {
-  // Soft circle from point sprite
-  vec2 crd = gl_PointCoord * 2.0 - 1.0;
-  float dist = length(crd);
-  float alpha = smoothstep(1.0, 0.4, dist);
+    // Fine-grain turbulence for strand-like detail
+    imgUV.x -= n3 * dEased * 0.02;
+    imgUV.y += snoise(vec3(imgUV * 10.0, t * 0.25)) * dEased * 0.01;
+  }
 
-  if (alpha < 0.01) discard;
+  // Sample the displaced image
+  vec4 color;
+  if (imgUV.x < 0.0 || imgUV.x > 1.0 || imgUV.y < 0.0 || imgUV.y > 1.0) {
+    color = vec4(0.0);
+  } else {
+    color = texture(u_image, imgUV);
+  }
 
-  fragColor = vec4(v_color, alpha * v_alpha);
+  // Fade: pixels that have been displaced far enough become transparent
+  float alpha = 1.0 - smoothstep(0.25, 0.95, dEased);
+
+  // Edge wisps: near the dissolve front, add organic transparency
+  float edgeNoise = snoise(vec3(v_uv * 8.0, u_time * 0.3));
+  float wispFactor = dEased * 0.35 * (0.5 + edgeNoise * 0.5);
+  alpha *= 1.0 - wispFactor;
+
+  // Fine wispy tendrils at the leading edge of dissolution
+  float edgeD = smoothstep(0.0, 0.15, dEased) * (1.0 - smoothstep(0.15, 0.5, dEased));
+  float tendrilNoise = snoise(vec3(v_uv.x * 20.0, v_uv.y * 12.0, u_time * 0.2));
+  alpha -= edgeD * max(tendrilNoise, 0.0) * 0.4;
+  alpha = max(alpha, 0.0);
+
+  // Final compositing over black
+  fragColor = vec4(color.rgb * alpha, 1.0);
 }
 `;
 
@@ -218,161 +281,56 @@ gl.linkProgram(program);
 if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
   console.error(gl.getProgramInfoLog(program));
 }
-gl.useProgram(program);
 
-// ---- Locations ----
+// ---- Uniform locations ----
 const loc = {
-  a_position: gl.getAttribLocation(program, 'a_position'),
-  a_color: gl.getAttribLocation(program, 'a_color'),
-  a_size: gl.getAttribLocation(program, 'a_size'),
-  a_noiseOffset: gl.getAttribLocation(program, 'a_noiseOffset'),
-  u_time: gl.getUniformLocation(program, 'u_time'),
+  u_image: gl.getUniformLocation(program, 'u_image'),
   u_dissolve: gl.getUniformLocation(program, 'u_dissolve'),
+  u_time: gl.getUniformLocation(program, 'u_time'),
   u_resolution: gl.getUniformLocation(program, 'u_resolution'),
+  u_imageSize: gl.getUniformLocation(program, 'u_imageSize'),
 };
 
-// ---- VAO + Buffers ----
+// ---- Fullscreen quad ----
+const quadVerts = new Float32Array([
+  -1, -1,
+   1, -1,
+  -1,  1,
+   1,  1,
+]);
+
 const vao = gl.createVertexArray();
 gl.bindVertexArray(vao);
 
-const posBuffer = gl.createBuffer();
-const colorBuffer = gl.createBuffer();
-const sizeBuffer = gl.createBuffer();
-const noiseBuffer = gl.createBuffer();
+const quadBuffer = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+gl.bufferData(gl.ARRAY_BUFFER, quadVerts, gl.STATIC_DRAW);
 
-function setupAttrib(buffer, location, size) {
-  gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-  gl.enableVertexAttribArray(location);
-  gl.vertexAttribPointer(location, size, gl.FLOAT, false, 0, 0);
-}
-
-setupAttrib(posBuffer, loc.a_position, 2);
-setupAttrib(colorBuffer, loc.a_color, 3);
-setupAttrib(sizeBuffer, loc.a_size, 1);
-setupAttrib(noiseBuffer, loc.a_noiseOffset, 3);
+const aPos = gl.getAttribLocation(program, 'a_position');
+gl.enableVertexAttribArray(aPos);
+gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
 
 gl.bindVertexArray(null);
 
-// ---- Blending ----
-gl.enable(gl.BLEND);
-gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+// ---- Texture ----
+const texture = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, texture);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
 
-// ============================================================
-// Image sampling
-// ============================================================
+let currentImageWidth = 1;
+let currentImageHeight = 1;
 
-function sampleImage(img, count) {
+function uploadImage(img) {
   const w = img.width || img.naturalWidth;
   const h = img.height || img.naturalHeight;
-  const offCanvas = document.createElement('canvas');
-  offCanvas.width = w;
-  offCanvas.height = h;
-  const ctx = offCanvas.getContext('2d');
-  ctx.drawImage(img, 0, 0, w, h);
-  const data = ctx.getImageData(0, 0, w, h).data;
+  currentImageWidth = w;
+  currentImageHeight = h;
 
-  // Build brightness-weighted cumulative distribution for rejection sampling
-  const totalPixels = w * h;
-  const brightness = new Float32Array(totalPixels);
-  let brightnessSum = 0;
-  for (let i = 0; i < totalPixels; i++) {
-    const idx = i * 4;
-    const b = (data[idx] * 0.299 + data[idx + 1] * 0.587 + data[idx + 2] * 0.114) / 255;
-    // Weight: brighter = more particles, but give some floor so dark areas aren't empty
-    const weight = 0.1 + b * 0.9;
-    brightness[i] = weight;
-    brightnessSum += weight;
-  }
-
-  // Normalize to CDF
-  const cdf = new Float32Array(totalPixels);
-  cdf[0] = brightness[0] / brightnessSum;
-  for (let i = 1; i < totalPixels; i++) {
-    cdf[i] = cdf[i - 1] + brightness[i] / brightnessSum;
-  }
-
-  // Scale image to fit viewport (centered)
-  const vw = canvas.width;
-  const vh = canvas.height;
-  const scale = Math.min(vw / w, vh / h) * 0.9; // 90% of viewport
-  const offsetX = (vw - w * scale) / 2;
-  const offsetY = (vh - h * scale) / 2;
-
-  const positions = new Float32Array(count * 2);
-  const colors = new Float32Array(count * 3);
-  const sizes = new Float32Array(count);
-  const noiseOffsets = new Float32Array(count * 3);
-
-  // Compute local density map (for size variation — sparser areas get bigger particles)
-  // We'll approximate by sampling and then just using brightness inversely for size
-  for (let i = 0; i < count; i++) {
-    // Binary search on CDF for weighted random sampling
-    const r = Math.random();
-    let lo = 0, hi = totalPixels - 1;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      if (cdf[mid] < r) lo = mid + 1;
-      else hi = mid;
-    }
-
-    const pixelIdx = lo;
-    const px = pixelIdx % w;
-    const py = (pixelIdx / w) | 0;
-    const dataIdx = pixelIdx * 4;
-
-    // Position (mapped to viewport)
-    // Add small jitter within pixel
-    const jx = (Math.random() - 0.5) * scale;
-    const jy = (Math.random() - 0.5) * scale;
-    positions[i * 2] = offsetX + px * scale + jx;
-    positions[i * 2 + 1] = offsetY + py * scale + jy;
-
-    // Color with slight warmth/saturation jitter
-    let cr = data[dataIdx] / 255;
-    let cg = data[dataIdx + 1] / 255;
-    let cb = data[dataIdx + 2] / 255;
-    // Warmth jitter
-    cr += (Math.random() - 0.3) * 0.04;
-    cg += (Math.random() - 0.5) * 0.02;
-    cb += (Math.random() - 0.7) * 0.03;
-    colors[i * 3] = Math.max(0, Math.min(1, cr));
-    colors[i * 3 + 1] = Math.max(0, Math.min(1, cg));
-    colors[i * 3 + 2] = Math.max(0, Math.min(1, cb));
-
-    // Size: mix of fine dust and larger brushstroke particles
-    // Sparser (darker) areas get slightly larger particles
-    const b = brightness[pixelIdx];
-    const baseSize = 2 + Math.random() * 4; // 2-6 fine dust
-    const largeProbability = 0.15 + (1 - b) * 0.15; // darker areas more likely to get big particles
-    const isLarge = Math.random() < largeProbability;
-    const size = isLarge ? (8 + Math.random() * 12) : baseSize;
-    sizes[i] = size;
-
-    // Noise offset (random per particle for unique motion)
-    noiseOffsets[i * 3] = Math.random() * 100;
-    noiseOffsets[i * 3 + 1] = Math.random() * 100;
-    noiseOffsets[i * 3 + 2] = Math.random() * 100;
-  }
-
-  return { positions, colors, sizes, noiseOffsets };
-}
-
-// ============================================================
-// Upload particle data to GPU
-// ============================================================
-
-function uploadParticles(particleData) {
-  gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
-  gl.bufferData(gl.ARRAY_BUFFER, particleData.positions, gl.STATIC_DRAW);
-
-  gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
-  gl.bufferData(gl.ARRAY_BUFFER, particleData.colors, gl.STATIC_DRAW);
-
-  gl.bindBuffer(gl.ARRAY_BUFFER, sizeBuffer);
-  gl.bufferData(gl.ARRAY_BUFFER, particleData.sizes, gl.STATIC_DRAW);
-
-  gl.bindBuffer(gl.ARRAY_BUFFER, noiseBuffer);
-  gl.bufferData(gl.ARRAY_BUFFER, particleData.noiseOffsets, gl.STATIC_DRAW);
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
 }
 
 // ============================================================
@@ -385,7 +343,6 @@ function generateWatercolorImage(seed) {
   c.height = 768;
   const ctx = c.getContext('2d');
 
-  // Lerin-inspired palettes: moody blues, earth tones, soft greens, warm grays
   const palettes = [
     ['#2b4570', '#5a7fa5', '#8fb3d4', '#c4a882', '#e8dcc8', '#3d6b5e', '#7a9e8e'],
     ['#4a3728', '#7d6b5d', '#b8a592', '#6b8f71', '#a3c4a0', '#d4c5a9', '#8b7355'],
@@ -394,11 +351,9 @@ function generateWatercolorImage(seed) {
 
   const palette = palettes[seed % palettes.length];
 
-  // Base wash
   ctx.fillStyle = palette[palette.length - 1];
   ctx.fillRect(0, 0, c.width, c.height);
 
-  // Layer overlapping radial gradients to simulate watercolor washes
   const rng = mulberry32(seed * 12345);
 
   for (let layer = 0; layer < 25; layer++) {
@@ -416,7 +371,6 @@ function generateWatercolorImage(seed) {
     ctx.fillRect(0, 0, c.width, c.height);
   }
 
-  // Soft edge bleeds
   for (let i = 0; i < 12; i++) {
     const cx = rng() * c.width;
     const cy = rng() * c.height;
@@ -458,7 +412,6 @@ function mulberry32(a) {
 async function loadImages() {
   const loaded = [];
 
-  // Try loading from shared/images/
   const filenames = [
     'image1.jpg', 'image2.jpg', 'image3.jpg',
     'image1.png', 'image2.png', 'image3.png',
@@ -484,7 +437,6 @@ async function loadImages() {
 
   if (loaded.length > 0) return loaded;
 
-  // Fallback: generate 3 watercolor-style canvases
   console.log('No images found in shared/images/ — using generated watercolor fallbacks');
   for (let i = 0; i < 3; i++) {
     loaded.push(generateWatercolorImage(i));
@@ -498,13 +450,12 @@ async function loadImages() {
 
 let lastTime = 0;
 let globalTime = 0;
-let particlesReady = false;
+let imageReady = false;
 
 function transitionToNextImage() {
   const img = images[currentImageIndex % images.length];
-  const data = sampleImage(img, PARTICLE_COUNT);
-  uploadParticles(data);
-  particlesReady = true;
+  uploadImage(img);
+  imageReady = true;
   currentImageIndex++;
   state = STATE.HOLDING;
   stateTimer = 0;
@@ -519,7 +470,6 @@ function frame(now) {
   globalTime += dt;
   stateTimer += dt;
 
-  // State machine
   switch (state) {
     case STATE.HOLDING:
       dissolve = 0;
@@ -533,7 +483,7 @@ function frame(now) {
       if (stateTimer >= DISSOLVE_TIME) {
         state = STATE.BLACK;
         stateTimer = 0;
-        particlesReady = false;
+        imageReady = false;
       }
       break;
     case STATE.BLACK:
@@ -544,18 +494,21 @@ function frame(now) {
       break;
   }
 
-  // Render
   gl.clearColor(0, 0, 0, 1);
   gl.clear(gl.COLOR_BUFFER_BIT);
 
-  if (particlesReady) {
+  if (imageReady) {
     gl.useProgram(program);
-    gl.uniform1f(loc.u_time, globalTime);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.uniform1i(loc.u_image, 0);
     gl.uniform1f(loc.u_dissolve, dissolve);
+    gl.uniform1f(loc.u_time, globalTime);
     gl.uniform2f(loc.u_resolution, canvas.width, canvas.height);
+    gl.uniform2f(loc.u_imageSize, currentImageWidth, currentImageHeight);
 
     gl.bindVertexArray(vao);
-    gl.drawArrays(gl.POINTS, 0, PARTICLE_COUNT);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     gl.bindVertexArray(null);
   }
 }

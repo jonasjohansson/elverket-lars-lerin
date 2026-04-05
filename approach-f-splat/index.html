@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lars Lerin — Gaussian Splat</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+    canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
+    #spinner { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; color: #666; font-family: monospace; font-size: 14px; z-index: 10; pointer-events: none; }
+    #message { position: fixed; bottom: 20px; left: 20px; color: #555; font-family: monospace; font-size: 12px; z-index: 10; }
+    #fps, #camid { display: none; }
+    #progress { position: fixed; top: 0; left: 0; height: 2px; background: #444; z-index: 20; transition: width 0.2s; }
+  </style>
+  <script src="coi-serviceworker.min.js"></script>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <div id="spinner">Loading Gaussian splat...</div>
+  <div id="message">Space: play dissolve · R: reset · F: fullscreen</div>
+  <div id="fps"></div>
+  <div id="camid"></div>
+  <div id="progress"></div>
+  <script>
+    if (!location.search.includes('url=')) {
+      location.replace(location.pathname + '?url=../shared/splats/lerin2.splat');
+    }
+  </script>
+  <script src="splat-viewer.js"></script>
+</body>
+</html>

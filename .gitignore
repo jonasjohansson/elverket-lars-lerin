@@ -1,2 +1,6 @@
 .DS_Store
 node_modules/
+.venv/
+shared/splats/*.ply
+shared/splats/*.splat
+shared/images/lerin1.jpg
