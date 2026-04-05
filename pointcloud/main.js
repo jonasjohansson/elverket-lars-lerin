@@ -350,39 +350,40 @@ async function init() {
   scene.add(light1Helper);
   scene.add(light2Helper);
 
-  // Transform controls for placing lights
+  // Light placement — only created on demand
+  let manualLightMode = true;
   let activeTransform = null;
-  const transform1 = new TransformControls(camera, canvas);
-  transform1.attach(light1Helper);
-  transform1.setSize(0.5);
-  transform1.addEventListener('dragging-changed', (e) => {
-    controls.enabled = !e.value;
-    if (!e.value) uLight1Pos.value.copy(light1Helper.position);
-  });
-  transform1.addEventListener('change', () => uLight1Pos.value.copy(light1Helper.position));
 
-  const transform2 = new TransformControls(camera, canvas);
-  transform2.attach(light2Helper);
-  transform2.setSize(0.5);
-  transform2.addEventListener('dragging-changed', (e) => {
-    controls.enabled = !e.value;
-    if (!e.value) uLight2Pos.value.copy(light2Helper.position);
-  });
-  transform2.addEventListener('change', () => uLight2Pos.value.copy(light2Helper.position));
+  const createTransform = (helper, uniformPos) => {
+    const tc = new TransformControls(camera, canvas);
+    tc.attach(helper);
+    tc.setSize(0.5);
+    tc.addEventListener('dragging-changed', (e) => {
+      controls.enabled = !e.value;
+      if (!e.value) uniformPos.value.copy(helper.position);
+    });
+    tc.addEventListener('change', () => uniformPos.value.copy(helper.position));
+    return tc;
+  };
 
-  // Toggle: 1/2 keys to select light, Escape to deselect
-  let manualLightMode = true; // lights are placeable by default
+  let transform1 = null, transform2 = null;
+
   const showTransform = (which) => {
-    scene.remove(transform1.getHelper());
-    scene.remove(transform2.getHelper());
+    if (activeTransform) { scene.remove(activeTransform.getHelper()); activeTransform = null; }
+    if (which === 1) {
+      if (!transform1) transform1 = createTransform(light1Helper, uLight1Pos);
+      scene.add(transform1.getHelper());
+      activeTransform = transform1;
+    }
+    if (which === 2) {
+      if (!transform2) transform2 = createTransform(light2Helper, uLight2Pos);
+      scene.add(transform2.getHelper());
+      activeTransform = transform2;
+    }
     manualLightMode = true;
-    if (which === 1) scene.add(transform1.getHelper());
-    if (which === 2) scene.add(transform2.getHelper());
   };
   const hideTransforms = () => {
-    scene.remove(transform1.getHelper());
-    scene.remove(transform2.getHelper());
-    manualLightMode = false;
+    if (activeTransform) { scene.remove(activeTransform.getHelper()); activeTransform = null; }
   };
 
   // ─── Post-processing: DOF + vignette ───
