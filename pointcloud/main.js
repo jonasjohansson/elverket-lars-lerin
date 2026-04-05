@@ -202,6 +202,8 @@ async function init() {
   geometry.setAttribute('position', new THREE.BufferAttribute(data.positions, 3));
   geometry.setAttribute('aColor', new THREE.BufferAttribute(data.colors, 3));
   geometry.setAttribute('aRandom', new THREE.BufferAttribute(data.randoms, 4));
+  // Prevent frustum culling — dissolution moves particles far from original bounds
+  geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 0), 100);
 
   const material = new THREE.PointsNodeMaterial({
     transparent: true,
