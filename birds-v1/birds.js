@@ -100,8 +100,43 @@ export class Flock {
   constructor({ count, curve, scene }) {
     this.count = count;
     this.curve = curve;
-    this.speed = 2.0;
+
+    this.params = {
+      speed: 4.0,
+      separationRadius: 0.5,
+      separationWeight: 1.6,
+      alignmentRadius: 1.2,
+      alignmentWeight: 1.0,
+      cohesionRadius: 1.6,
+      cohesionWeight: 0.8,
+      pathWeight: 2.5,
+      maxForce: 8.0,
+      maxSpeed: 6.0,
+      minSpeed: 2.5,
+    };
+
     this.t = 0;
+
+    this.positions      = new Float32Array(count * 3);
+    this.velocities     = new Float32Array(count * 3);
+    this.tOffsets       = new Float32Array(count);
+    this.lateralOffsets = new Float32Array(count * 3);
+
+    const spread = 2.0;
+    const start = curve.getPointAt(0);
+    for (let i = 0; i < count; i++) {
+      this.tOffsets[i] = (i / count) * 0.12;
+      this.lateralOffsets[i*3+0] = (Math.random() - 0.5) * spread;
+      this.lateralOffsets[i*3+1] = (Math.random() - 0.5) * spread;
+      this.lateralOffsets[i*3+2] = (Math.random() - 0.5) * spread;
+      this.positions[i*3+0] = start.x + this.lateralOffsets[i*3+0];
+      this.positions[i*3+1] = start.y + this.lateralOffsets[i*3+1];
+      this.positions[i*3+2] = start.z + this.lateralOffsets[i*3+2];
+      this.velocities[i*3+0] = (Math.random() - 0.5) * 2;
+      this.velocities[i*3+1] = (Math.random() - 0.5) * 2;
+      this.velocities[i*3+2] = (Math.random() - 0.5) * 2;
+    }
+
     this.geo = createStarlingGeometry();
     const mat = createStarlingMaterial();
     this.material = mat.material;
@@ -119,26 +154,118 @@ export class Flock {
     scene.add(this.mesh);
 
     this._tmpObj = new THREE.Object3D();
-    this._tmpPos = new THREE.Vector3();
-    this._tmpTan = new THREE.Vector3();
+    this._target = new THREE.Vector3();
+    this._tmp    = new THREE.Vector3();
+  }
 
-    this.tOffsets = new Float32Array(count);
-    for (let i = 0; i < count; i++) this.tOffsets[i] = (i / count) * 0.08;
+  _buildGrid() {
+    const cell = Math.max(this.params.alignmentRadius, this.params.cohesionRadius);
+    const grid = new Map();
+    const invCell = 1 / cell;
+    for (let i = 0; i < this.count; i++) {
+      const x = Math.floor(this.positions[i*3+0] * invCell);
+      const y = Math.floor(this.positions[i*3+1] * invCell);
+      const z = Math.floor(this.positions[i*3+2] * invCell);
+      const key = x + ',' + y + ',' + z;
+      let bucket = grid.get(key);
+      if (!bucket) { bucket = []; grid.set(key, bucket); }
+      bucket.push(i);
+    }
+    return { grid, invCell };
+  }
+
+  _neighbors(i, grid, invCell, cb) {
+    const x = Math.floor(this.positions[i*3+0] * invCell);
+    const y = Math.floor(this.positions[i*3+1] * invCell);
+    const z = Math.floor(this.positions[i*3+2] * invCell);
+    for (let dx = -1; dx <= 1; dx++)
+      for (let dy = -1; dy <= 1; dy++)
+        for (let dz = -1; dz <= 1; dz++) {
+          const bucket = grid.get((x+dx)+','+(y+dy)+','+(z+dz));
+          if (!bucket) continue;
+          for (const j of bucket) if (j !== i) cb(j);
+        }
   }
 
   update(dt) {
     this.uniforms.uTime.value += dt;
+    const p = this.params;
     const length = this.curve.getLength();
-    this.t += (this.speed * dt) / Math.max(length, 0.001);
+    this.t += (p.speed * dt) / Math.max(length, 0.001);
     if (this.t > 1) this.t -= 1;
 
+    const { grid, invCell } = this._buildGrid();
+
+    const sepR2 = p.separationRadius * p.separationRadius;
+    const aliR2 = p.alignmentRadius * p.alignmentRadius;
+    const cohR2 = p.cohesionRadius * p.cohesionRadius;
+
     for (let i = 0; i < this.count; i++) {
+      const px = this.positions[i*3+0], py = this.positions[i*3+1], pz = this.positions[i*3+2];
+      let vx = this.velocities[i*3+0], vy = this.velocities[i*3+1], vz = this.velocities[i*3+2];
+
+      let sepX=0, sepY=0, sepZ=0, sepN=0;
+      let aliX=0, aliY=0, aliZ=0, aliN=0;
+      let cohX=0, cohY=0, cohZ=0, cohN=0;
+
+      this._neighbors(i, grid, invCell, (j) => {
+        const dx = px - this.positions[j*3+0];
+        const dy = py - this.positions[j*3+1];
+        const dz = pz - this.positions[j*3+2];
+        const d2 = dx*dx + dy*dy + dz*dz;
+        if (d2 < sepR2 && d2 > 1e-6) {
+          const inv = 1 / Math.sqrt(d2);
+          sepX += dx * inv; sepY += dy * inv; sepZ += dz * inv; sepN++;
+        }
+        if (d2 < aliR2) {
+          aliX += this.velocities[j*3+0];
+          aliY += this.velocities[j*3+1];
+          aliZ += this.velocities[j*3+2];
+          aliN++;
+        }
+        if (d2 < cohR2) {
+          cohX += this.positions[j*3+0];
+          cohY += this.positions[j*3+1];
+          cohZ += this.positions[j*3+2];
+          cohN++;
+        }
+      });
+
+      let ax = 0, ay = 0, az = 0;
+      if (sepN > 0) { ax += (sepX/sepN) * p.separationWeight; ay += (sepY/sepN) * p.separationWeight; az += (sepZ/sepN) * p.separationWeight; }
+      if (aliN > 0) { ax += (aliX/aliN - vx) * p.alignmentWeight; ay += (aliY/aliN - vy) * p.alignmentWeight; az += (aliZ/aliN - vz) * p.alignmentWeight; }
+      if (cohN > 0) { ax += (cohX/cohN - px) * p.cohesionWeight;  ay += (cohY/cohN - py) * p.cohesionWeight;  az += (cohZ/cohN - pz) * p.cohesionWeight; }
+
       let ti = this.t + this.tOffsets[i];
       ti = ti - Math.floor(ti);
-      this.curve.getPointAt(ti, this._tmpPos);
-      this.curve.getTangentAt(ti, this._tmpTan);
-      this._tmpObj.position.copy(this._tmpPos);
-      this._tmpObj.lookAt(this._tmpPos.clone().add(this._tmpTan));
+      this.curve.getPointAt(ti, this._target);
+      const lox = this.lateralOffsets[i*3+0];
+      const loy = this.lateralOffsets[i*3+1];
+      const loz = this.lateralOffsets[i*3+2];
+      ax += (this._target.x + lox - px) * p.pathWeight;
+      ay += (this._target.y + loy - py) * p.pathWeight;
+      az += (this._target.z + loz - pz) * p.pathWeight;
+
+      const aLen = Math.sqrt(ax*ax + ay*ay + az*az);
+      if (aLen > p.maxForce) { const s = p.maxForce / aLen; ax *= s; ay *= s; az *= s; }
+
+      vx += ax * dt; vy += ay * dt; vz += az * dt;
+
+      const sp = Math.sqrt(vx*vx + vy*vy + vz*vz);
+      if (sp > p.maxSpeed) { const s = p.maxSpeed / sp; vx *= s; vy *= s; vz *= s; }
+      else if (sp < p.minSpeed && sp > 1e-3) { const s = p.minSpeed / sp; vx *= s; vy *= s; vz *= s; }
+
+      this.velocities[i*3+0] = vx;
+      this.velocities[i*3+1] = vy;
+      this.velocities[i*3+2] = vz;
+
+      this.positions[i*3+0] = px + vx * dt;
+      this.positions[i*3+1] = py + vy * dt;
+      this.positions[i*3+2] = pz + vz * dt;
+
+      this._tmp.set(this.positions[i*3+0] + vx, this.positions[i*3+1] + vy, this.positions[i*3+2] + vz);
+      this._tmpObj.position.set(this.positions[i*3+0], this.positions[i*3+1], this.positions[i*3+2]);
+      this._tmpObj.lookAt(this._tmp);
       this._tmpObj.updateMatrix();
       this.mesh.setMatrixAt(i, this._tmpObj.matrix);
     }

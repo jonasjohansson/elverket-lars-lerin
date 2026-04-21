@@ -94,7 +94,7 @@ const curveGeo = new THREE.BufferGeometry().setFromPoints(curve.getPoints(200));
 const curveLine = new THREE.Line(curveGeo, new THREE.LineBasicMaterial({ color: 0x44aaff }));
 scene.add(curveLine);
 
-const flock = new Flock({ count: 30, curve, scene });
+const flock = new Flock({ count: 300, curve, scene });
 
 // Resize
 window.addEventListener('resize', () => {
