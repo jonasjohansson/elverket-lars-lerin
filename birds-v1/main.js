@@ -164,16 +164,22 @@ gltfLoader.load('assets/elverket_v3.glb', (gltf) => {
   model.traverse((child) => {
     if (!child.isMesh) return;
     child.receiveShadow = true;
-    if (child.material) {
+    if (SURFACE_NAMES.includes(child.name)) {
+      // Replace baked material — no grid texture, plain light diffuse wall
+      child.material = new THREE.MeshStandardMaterial({
+        color: new THREE.Color().setScalar(sceneParams.wallBrightness),
+        roughness: 1.0,
+        metalness: 0.0,
+        envMapIntensity: sceneParams.envIntensity,
+        side: THREE.DoubleSide,
+      });
+      surfaceMeshes.push(child);
+      surfaceMeshesRef.push(child);
+    } else if (child.material) {
       child.material = child.material.clone();
       child.material.metalness = 0;
       child.material.roughness = 1;
       child.material.envMapIntensity = sceneParams.envIntensity;
-      if (SURFACE_NAMES.includes(child.name)) {
-        child.material.color.setScalar(sceneParams.wallBrightness);
-        surfaceMeshes.push(child);
-        surfaceMeshesRef.push(child);
-      }
     }
   });
   scene.add(model);

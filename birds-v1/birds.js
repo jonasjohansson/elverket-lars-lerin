@@ -102,18 +102,18 @@ export class Flock {
     this.curve = curve;
 
     this.params = {
-      speed: 4.0,
+      speed: 1.5,
       separationRadius: 0.5,
       separationWeight: 1.6,
       alignmentRadius: 1.2,
       alignmentWeight: 1.0,
       cohesionRadius: 1.6,
       cohesionWeight: 0.8,
-      pathWeight: 2.5,
-      maxForce: 8.0,
-      maxSpeed: 6.0,
-      minSpeed: 2.5,
-      wander: 0.4,          // random acceleration strength
+      pathWeight: 2.0,
+      maxForce: 6.0,
+      maxSpeed: 2.5,
+      minSpeed: 0.8,
+      wander: 0.3,          // random acceleration strength
       size: 1.0,             // scales each instance (1.0 = ~40cm wingspan)
       lateralSpread: 2.0,    // how loose the cloud around the path is (applied at update time)
     };
