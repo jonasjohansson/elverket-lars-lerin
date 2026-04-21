@@ -5,6 +5,7 @@ import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { ROOM, SURFACE_NAMES, CAMERA_HEIGHT } from './config.js';
 import { Flock } from './birds.js';
 import { PathEditor } from './path-editor.js';
+import GUI from 'https://cdn.jsdelivr.net/npm/lil-gui@0.20/+esm';
 
 const info = document.getElementById('info');
 const canvas = document.getElementById('c');
@@ -56,6 +57,27 @@ scene.add(dir);
 
 let flock = null;
 let editor = null;
+let birdCount = 300;
+let flockParamCtrls = [];
+const gui = new GUI({ title: 'birds-v1' });
+const pathFolder = gui.addFolder('Path');
+const flockFolder = gui.addFolder('Flock');
+
+function rebuildFlock(curve) {
+  if (flock) { scene.remove(flock.mesh); flock = null; }
+  if (!curve) return;
+  flock = new Flock({ count: birdCount, curve, scene });
+  flockParamCtrls.forEach(c => c.destroy());
+  flockParamCtrls = [];
+  const p = flock.params;
+  flockParamCtrls.push(flockFolder.add(p, 'speed', 0.5, 12, 0.1));
+  flockParamCtrls.push(flockFolder.add(p, 'separationWeight', 0, 4, 0.05).name('separation'));
+  flockParamCtrls.push(flockFolder.add(p, 'alignmentWeight',  0, 4, 0.05).name('alignment'));
+  flockParamCtrls.push(flockFolder.add(p, 'cohesionWeight',   0, 4, 0.05).name('cohesion'));
+  flockParamCtrls.push(flockFolder.add(p, 'pathWeight',       0, 8, 0.05).name('path pull'));
+  flockParamCtrls.push(flockFolder.add(p, 'maxSpeed',         1, 15, 0.1).name('max speed'));
+  flockParamCtrls.push(flockFolder.add(flock.uniforms.uFlapRate, 'value', 2, 30, 0.5).name('flap rate'));
+}
 
 // Load room
 const dracoLoader = new DRACOLoader();
@@ -83,10 +105,7 @@ gltfLoader.load('assets/elverket_v3.glb', (gltf) => {
 
   editor = new PathEditor({
     scene, camera, renderer, orbitControls: controls, surfaceMeshes,
-    onChange: (curve) => {
-      if (flock) { scene.remove(flock.mesh); flock = null; }
-      if (curve) flock = new Flock({ count: 300, curve, scene });
-    },
+    onChange: rebuildFlock,
   });
 
   // Default path
@@ -94,6 +113,23 @@ gltfLoader.load('assets/elverket_v3.glb', (gltf) => {
   editor.addFreePoint(new THREE.Vector3(ROOM.xMax - 2, ROOM.floor + 6, ROOM.zMin + 10));
   editor.addFreePoint(new THREE.Vector3(ROOM.xMin + 2, ROOM.floor + 4, ROOM.zMax - 10));
   editor.addFreePoint(new THREE.Vector3(ROOM.xMax + 1, ROOM.floor + 5, ROOM.zMax - 5));
+
+  // GUI: Path controls (attached after editor exists)
+  pathFolder.add({ addFree: () => {
+    editor.addFreePoint(new THREE.Vector3(ROOM.centerX, ROOM.centerY, ROOM.centerZ));
+  } }, 'addFree').name('+ Free-space waypoint');
+  pathFolder.add({ clear: () => {
+    while (editor.points.length) { scene.remove(editor.points[0].helper); editor.points.shift(); }
+    editor._deselect();
+    editor._rebuildCurve();
+  } }, 'clear').name('Clear all');
+  pathFolder.add(editor.curveLine, 'visible').name('Show curve').listen();
+
+  // GUI: Flock count (rebuilds flock)
+  flockFolder.add({ count: birdCount }, 'count', 50, 800, 10).onFinishChange((v) => {
+    birdCount = v;
+    if (editor.curve) rebuildFlock(editor.curve);
+  });
 
   info.textContent = 'shift-click wall to add waypoint · click marker to drag · Del to remove';
 }, undefined, (err) => {
