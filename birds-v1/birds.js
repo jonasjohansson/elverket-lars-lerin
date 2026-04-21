@@ -253,10 +253,10 @@ export class Flock {
       let ti = this.t + this.tOffsets[i];
       if (ti > 1) ti = 1;
       this.curve.getPointAt(ti, this._target);
-      const sp = p.lateralSpread;
-      const lox = this.lateralOffsets[i*3+0] * sp;
-      const loy = this.lateralOffsets[i*3+1] * sp;
-      const loz = this.lateralOffsets[i*3+2] * sp;
+      const ls = p.lateralSpread;
+      const lox = this.lateralOffsets[i*3+0] * ls;
+      const loy = this.lateralOffsets[i*3+1] * ls;
+      const loz = this.lateralOffsets[i*3+2] * ls;
       ax += (this._target.x + lox - px) * p.pathWeight;
       ay += (this._target.y + loy - py) * p.pathWeight;
       az += (this._target.z + loz - pz) * p.pathWeight;
