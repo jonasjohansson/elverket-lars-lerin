@@ -65,13 +65,17 @@ const params = {
   cursorPull: 0.45,       // inward pull magnitude
   cursorSwirl: 0.55,      // tangential swirl around ray axis
   cursorVortexLerp: 0.06, // how fast vortex mix transitions
-  // Disintegration: each particle picks its own moment across `duration` and falls once.
+  // Disintegration: clustered rot-like decay — patches of particles crumble together
   disintegrateEnabled: true,
-  disintegrateDuration: 120.0,   // seconds to fully disintegrate the image
-  disintegrateFallDuration: 3.5, // seconds each individual particle spends falling
-  disintegrateFall: 1.8,         // world units each particle falls
-  disintegrateSway: 0.15,        // lateral drift during fall
-  disintegrateStrength: 1.0,     // master multiplier (0 = disabled / preserved)
+  disintegrateDuration: 140.0,     // seconds from first rot-spots to full decay
+  disintegrateFallDuration: 2.8,   // seconds each particle takes to crumble
+  disintegrateDispersal: 0.35,     // outward scatter amplitude
+  disintegrateGravity: 0.25,       // downward bias during crumble
+  disintegrateChaos: 0.18,         // turbulent jitter amplitude
+  disintegratePatchScale: 3.0,     // spatial patch frequency (higher = smaller patches)
+  disintegrateShrink: 0.85,        // how much a particle shrinks as it dies (1 = full shrink)
+  disintegrateDarken: 0.7,         // darkening factor applied during decay
+  disintegrateStrength: 1.0,       // master multiplier (0 = disabled / preserved)
   // Lights
   ambientLight: 0.85,
   light1Color: '#ffffff',
@@ -256,12 +260,16 @@ async function init() {
   const uVortexMix = uniform(0.0);
   const uCursorPull = uniform(params.cursorPull);
   const uCursorSwirl = uniform(params.cursorSwirl);
-  // Disintegration (one-shot slow decay, each particle dies once over uDisintDuration)
+  // Disintegration (clustered, rot-like — patches decay together rather than uniform snowfall)
   const uDisintStart = uniform(0.0);  // global timestamp when disintegration was (re)started
   const uDisintDuration = uniform(params.disintegrateDuration);
   const uDisintFallDur = uniform(params.disintegrateFallDuration);
-  const uDisintFall = uniform(params.disintegrateFall);
-  const uDisintSway = uniform(params.disintegrateSway);
+  const uDisintDispersal = uniform(params.disintegrateDispersal);
+  const uDisintGravity = uniform(params.disintegrateGravity);
+  const uDisintChaos = uniform(params.disintegrateChaos);
+  const uDisintPatchScale = uniform(params.disintegratePatchScale);
+  const uDisintShrink = uniform(params.disintegrateShrink);
+  const uDisintDarken = uniform(params.disintegrateDarken);
   const uDisintStrength = uniform(params.disintegrateEnabled ? params.disintegrateStrength : 0.0);
   const uWind = uniform(params.windStrength);
   const uGravity = uniform(params.gravity);
@@ -393,13 +401,31 @@ async function init() {
     const cy = cos(ct.mul(1.2).add(seedY.mul(4.0))).mul(uCursorChaos).mul(curFall);
     const cz = sin(ct.mul(0.8).add(seedX.add(seedY).mul(3.0))).mul(uCursorChaos.mul(0.6)).mul(curFall);
 
-    // ── Slow disintegration: each particle picks its own death moment once over uDisintDuration ──
-    const deathMoment = uDisintStart.add(delay.mul(uDisintDuration));
-    const dieRaw = t.sub(deathMoment).div(uDisintFallDur).clamp(0, 1);  // 0 alive → 1 fallen & gone
+    // ── Rot-like disintegration: clustered death via spatial noise + varied dispersion per particle ──
+    // Patch noise: slow-varying over XY → particles near each other share similar death moments.
+    const pf = uDisintPatchScale;
+    const patchA = sin(pos.x.mul(pf)).mul(sin(pos.y.mul(pf.mul(0.87)).add(1.3)));
+    const patchB = sin(pos.x.mul(pf.mul(2.1)).add(2.7)).mul(cos(pos.y.mul(pf.mul(1.7)).add(0.9)));
+    const patch = patchA.mul(0.55).add(patchB.mul(0.35)).mul(0.5).add(0.5);    // ~0.05..0.95
+    const jitter = delay.mul(0.15);                                             // small per-particle variation
+    const deathMoment = uDisintStart.add(patch.add(jitter).mul(uDisintDuration));
+    const dieRaw = t.sub(deathMoment).div(uDisintFallDur).clamp(0, 1);
     const dieProg = dieRaw.mul(uDisintStrength);
-    const ambFallY = dieProg.mul(dieProg).mul(uDisintFall).negate();    // accelerating downward
-    const ambSwayX = sin(t.mul(0.9).add(seedX.mul(6.0))).mul(uDisintSway).mul(dieProg).mul(seedY.mul(0.5).add(0.5));
-    const ambSwayZ = cos(t.mul(0.7).add(seedY.mul(5.0))).mul(uDisintSway.mul(0.3)).mul(dieProg);
+    const dieSlow = dieProg.mul(dieProg);                                       // quadratic ease-in
+
+    // Per-particle dispersion direction: varied, with weak downward gravity pull.
+    const dirX = seedX.mul(1.2).add(sin(seedY.mul(9.0)).mul(0.4));
+    const dirY = seedY.mul(0.4).sub(float(0.35));                               // weak -Y bias
+    const dirZ = cos(seedX.mul(7.0).add(seedY.mul(5.0))).mul(0.6).add(seedY.mul(0.3));
+    const disp = uDisintDispersal.mul(dieSlow);
+    const dispX = dirX.mul(disp);
+    const dispY = dirY.mul(disp).sub(dieSlow.mul(uDisintGravity));              // gravity piles on Y
+    const dispZ = dirZ.mul(disp);
+    // Chaotic turbulence on top — crumbling, not falling.
+    const chaos = uDisintChaos.mul(dieProg);
+    const ambSwayX = sin(t.mul(1.4).add(seedX.mul(7.0))).mul(chaos).add(dispX);
+    const ambFallY = cos(t.mul(1.1).add(seedY.mul(6.0))).mul(chaos.mul(0.7)).add(dispY);
+    const ambSwayZ = sin(t.mul(0.9).add(seedX.add(seedY).mul(5.0))).mul(chaos.mul(0.5)).add(dispZ);
 
     return pos.add(vec3(
       w1x.add(w2x).add(w3x).add(dx).add(morphTurbX).add(windX).add(dissolveTurbX).add(curlX).add(transX).add(cursorPushVec.x).add(cx).add(ambSwayX),
@@ -411,10 +437,20 @@ async function init() {
   // ─── Size: pulse with morph ───
   material.sizeNode = Fn(() => {
     const rnd = attribute('aRandom');
+    const pos = attribute('position');
+    const delay = rnd.z;
     const pulse = sin(uTime.mul(1.5).add(rnd.x.mul(6.28))).mul(0.1).add(1.0);
-    // Morph makes particles slightly bigger (turbulence = expansion)
     const morphSize = float(1.0).add(uMorph.mul(0.2));
-    return rnd.w.mul(uScale).mul(pulse).mul(morphSize);
+    // Shrink during decay — matches patchy death timing from positionNode.
+    const pf = uDisintPatchScale;
+    const patchA = sin(pos.x.mul(pf)).mul(sin(pos.y.mul(pf.mul(0.87)).add(1.3)));
+    const patchB = sin(pos.x.mul(pf.mul(2.1)).add(2.7)).mul(cos(pos.y.mul(pf.mul(1.7)).add(0.9)));
+    const patch = patchA.mul(0.55).add(patchB.mul(0.35)).mul(0.5).add(0.5);
+    const deathMoment = uDisintStart.add(patch.add(delay.mul(0.15)).mul(uDisintDuration));
+    const dieRaw = uTime.sub(deathMoment).div(uDisintFallDur).clamp(0, 1);
+    const dieProg = dieRaw.mul(uDisintStrength);
+    const shrink = float(1.0).sub(dieProg.mul(uDisintShrink));
+    return rnd.w.mul(uScale).mul(pulse).mul(morphSize).mul(shrink);
   })();
   material.sizeAttenuation = true;
 
@@ -469,13 +505,20 @@ async function init() {
     const cursorDark = float(1.0).sub(curFall.mul(uCursorDarken));
     const witheredCol = finalCol.mul(cursorDark);
 
-    // Disintegration alpha: once a particle's death moment passes, it fades out permanently.
-    const deathMoment = uDisintStart.add(delay.mul(uDisintDuration));
+    // Disintegration: patchy death + darkening + alpha fade. Matches position/size nodes.
+    const pf = uDisintPatchScale;
+    const patchA = sin(pos.x.mul(pf)).mul(sin(pos.y.mul(pf.mul(0.87)).add(1.3)));
+    const patchB = sin(pos.x.mul(pf.mul(2.1)).add(2.7)).mul(cos(pos.y.mul(pf.mul(1.7)).add(0.9)));
+    const patch = patchA.mul(0.55).add(patchB.mul(0.35)).mul(0.5).add(0.5);
+    const deathMoment = uDisintStart.add(patch.add(delay.mul(0.15)).mul(uDisintDuration));
     const dieRaw = uTime.sub(deathMoment).div(uDisintFallDur).clamp(0, 1);
     const dieProg = dieRaw.mul(uDisintStrength);
-    const ambAlpha = float(1.0).sub(smoothstep(float(0.05), float(0.9), dieProg));
+    const ambAlpha = float(1.0).sub(smoothstep(float(0.1), float(0.95), dieProg));
+    // Darken as it rots
+    const decayDark = float(1.0).sub(dieProg.mul(uDisintDarken));
+    const rottedCol = witheredCol.mul(decayDark);
 
-    return vec4(witheredCol, uOpacity.mul(dissolveFade).mul(transitionFade).mul(cursorAlpha).mul(ambAlpha));
+    return vec4(rottedCol, uOpacity.mul(dissolveFade).mul(transitionFade).mul(cursorAlpha).mul(ambAlpha));
   })();
 
   const points = new THREE.Points(geometry, material);
@@ -615,9 +658,13 @@ async function init() {
   fDis.add(params, 'disintegrateEnabled').name('Enabled').onChange(v => uDisintStrength.value = v ? params.disintegrateStrength : 0.0);
   fDis.add(params, 'disintegrateStrength', 0, 1, 0.01).name('Strength').onChange(v => uDisintStrength.value = params.disintegrateEnabled ? v : 0.0);
   fDis.add(params, 'disintegrateDuration', 10, 600, 1).name('Duration (s)').onChange(v => uDisintDuration.value = v);
-  fDis.add(params, 'disintegrateFallDuration', 0.5, 10, 0.1).name('Fall Time (s)').onChange(v => uDisintFallDur.value = v);
-  fDis.add(params, 'disintegrateFall', 0, 5, 0.05).name('Fall Depth').onChange(v => uDisintFall.value = v);
-  fDis.add(params, 'disintegrateSway', 0, 0.5, 0.01).name('Sway').onChange(v => uDisintSway.value = v);
+  fDis.add(params, 'disintegrateFallDuration', 0.3, 10, 0.1).name('Decay Time (s)').onChange(v => uDisintFallDur.value = v);
+  fDis.add(params, 'disintegratePatchScale', 0.5, 12, 0.1).name('Patch Scale').onChange(v => uDisintPatchScale.value = v);
+  fDis.add(params, 'disintegrateDispersal', 0, 2, 0.01).name('Dispersal').onChange(v => uDisintDispersal.value = v);
+  fDis.add(params, 'disintegrateGravity', 0, 1, 0.01).name('Gravity').onChange(v => uDisintGravity.value = v);
+  fDis.add(params, 'disintegrateChaos', 0, 0.6, 0.01).name('Chaos').onChange(v => uDisintChaos.value = v);
+  fDis.add(params, 'disintegrateShrink', 0, 1, 0.01).name('Shrink').onChange(v => uDisintShrink.value = v);
+  fDis.add(params, 'disintegrateDarken', 0, 1, 0.01).name('Darken').onChange(v => uDisintDarken.value = v);
 
 
   const fD = gui.addFolder('Dissolution');
