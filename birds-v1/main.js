@@ -4,6 +4,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { ROOM, SURFACE_NAMES, CAMERA_HEIGHT } from './config.js';
 import { Flock } from './birds.js';
+import { PathEditor } from './path-editor.js';
 
 const info = document.getElementById('info');
 const canvas = document.getElementById('c');
@@ -53,6 +54,9 @@ dir.shadow.bias = -0.001;
 dir.shadow.radius = 3;
 scene.add(dir);
 
+let flock = null;
+let editor = null;
+
 // Load room
 const dracoLoader = new DRACOLoader();
 dracoLoader.setDecoderPath('https://unpkg.com/three@0.170.0/examples/jsm/libs/draco/');
@@ -61,6 +65,7 @@ gltfLoader.setDRACOLoader(dracoLoader);
 
 gltfLoader.load('assets/elverket_v3.glb', (gltf) => {
   const model = gltf.scene;
+  const surfaceMeshes = [];
   model.traverse((child) => {
     if (!child.isMesh) return;
     child.receiveShadow = true;
@@ -70,31 +75,31 @@ gltfLoader.load('assets/elverket_v3.glb', (gltf) => {
       child.material.roughness = 1;
       if (SURFACE_NAMES.includes(child.name)) {
         child.material.color.set(0xbbbbbb);
+        surfaceMeshes.push(child);
       }
     }
   });
   scene.add(model);
-  info.textContent = `room loaded · ${SURFACE_NAMES.length} surfaces`;
+
+  editor = new PathEditor({
+    scene, camera, renderer, orbitControls: controls, surfaceMeshes,
+    onChange: (curve) => {
+      if (flock) { scene.remove(flock.mesh); flock = null; }
+      if (curve) flock = new Flock({ count: 300, curve, scene });
+    },
+  });
+
+  // Default path
+  editor.addFreePoint(new THREE.Vector3(ROOM.xMin - 1, ROOM.floor + 3, ROOM.zMin + 5));
+  editor.addFreePoint(new THREE.Vector3(ROOM.xMax - 2, ROOM.floor + 6, ROOM.zMin + 10));
+  editor.addFreePoint(new THREE.Vector3(ROOM.xMin + 2, ROOM.floor + 4, ROOM.zMax - 10));
+  editor.addFreePoint(new THREE.Vector3(ROOM.xMax + 1, ROOM.floor + 5, ROOM.zMax - 5));
+
+  info.textContent = 'shift-click wall to add waypoint · click marker to drag · Del to remove';
 }, undefined, (err) => {
   info.textContent = 'room load failed';
   console.error(err);
 });
-
-// Hardcoded path — 4 points across the room
-const pathPoints = [
-  new THREE.Vector3(ROOM.xMin - 1, ROOM.floor + 3, ROOM.zMin + 5),
-  new THREE.Vector3(ROOM.xMax - 2, ROOM.floor + 6, ROOM.zMin + 10),
-  new THREE.Vector3(ROOM.xMin + 2, ROOM.floor + 4, ROOM.zMax - 10),
-  new THREE.Vector3(ROOM.xMax + 1, ROOM.floor + 5, ROOM.zMax - 5),
-];
-const curve = new THREE.CatmullRomCurve3(pathPoints, false, 'catmullrom', 0.5);
-
-// Debug line visualization
-const curveGeo = new THREE.BufferGeometry().setFromPoints(curve.getPoints(200));
-const curveLine = new THREE.Line(curveGeo, new THREE.LineBasicMaterial({ color: 0x44aaff }));
-scene.add(curveLine);
-
-const flock = new Flock({ count: 300, curve, scene });
 
 // Resize
 window.addEventListener('resize', () => {
@@ -107,7 +112,7 @@ window.addEventListener('resize', () => {
 const clock = new THREE.Clock();
 renderer.setAnimationLoop(() => {
   const dt = clock.getDelta();
-  flock.update(dt);
+  if (flock) flock.update(dt);
   controls.update();
   renderer.render(scene, camera);
 });
