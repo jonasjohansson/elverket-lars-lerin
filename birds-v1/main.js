@@ -3,7 +3,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { ROOM, SURFACE_NAMES, CAMERA_HEIGHT } from './config.js';
-import { createStarlingGeometry, createStarlingMaterial } from './birds.js';
+import { Flock } from './birds.js';
 
 const info = document.getElementById('info');
 const canvas = document.getElementById('c');
@@ -80,19 +80,21 @@ gltfLoader.load('assets/elverket_v3.glb', (gltf) => {
   console.error(err);
 });
 
-// Single test bird at room center
-const birdGeo = createStarlingGeometry();
-const { material: birdMat, depthMaterial: birdDepth, uniforms: birdUniforms } = createStarlingMaterial();
-const testBird = new THREE.Mesh(birdGeo, birdMat);
-testBird.customDepthMaterial = birdDepth;
-testBird.castShadow = true;
-testBird.position.set(ROOM.centerX, ROOM.floor + 3, ROOM.centerZ);
-// aPhase attribute must be present even for non-instanced use
-birdGeo.setAttribute(
-  'aPhase',
-  new THREE.BufferAttribute(new Float32Array(birdGeo.attributes.position.count).fill(0), 1)
-);
-scene.add(testBird);
+// Hardcoded path — 4 points across the room
+const pathPoints = [
+  new THREE.Vector3(ROOM.xMin - 1, ROOM.floor + 3, ROOM.zMin + 5),
+  new THREE.Vector3(ROOM.xMax - 2, ROOM.floor + 6, ROOM.zMin + 10),
+  new THREE.Vector3(ROOM.xMin + 2, ROOM.floor + 4, ROOM.zMax - 10),
+  new THREE.Vector3(ROOM.xMax + 1, ROOM.floor + 5, ROOM.zMax - 5),
+];
+const curve = new THREE.CatmullRomCurve3(pathPoints, false, 'catmullrom', 0.5);
+
+// Debug line visualization
+const curveGeo = new THREE.BufferGeometry().setFromPoints(curve.getPoints(200));
+const curveLine = new THREE.Line(curveGeo, new THREE.LineBasicMaterial({ color: 0x44aaff }));
+scene.add(curveLine);
+
+const flock = new Flock({ count: 30, curve, scene });
 
 // Resize
 window.addEventListener('resize', () => {
@@ -104,8 +106,8 @@ window.addEventListener('resize', () => {
 // Loop
 const clock = new THREE.Clock();
 renderer.setAnimationLoop(() => {
-  const t = clock.getElapsedTime();
-  birdUniforms.uTime.value = t;
+  const dt = clock.getDelta();
+  flock.update(dt);
   controls.update();
   renderer.render(scene, camera);
 });

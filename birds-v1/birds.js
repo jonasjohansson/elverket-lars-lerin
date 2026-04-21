@@ -95,3 +95,53 @@ export function createStarlingMaterial() {
 
   return { material, depthMaterial, uniforms };
 }
+
+export class Flock {
+  constructor({ count, curve, scene }) {
+    this.count = count;
+    this.curve = curve;
+    this.speed = 2.0;
+    this.t = 0;
+    this.geo = createStarlingGeometry();
+    const mat = createStarlingMaterial();
+    this.material = mat.material;
+    this.depthMaterial = mat.depthMaterial;
+    this.uniforms = mat.uniforms;
+
+    const phases = new Float32Array(count);
+    for (let i = 0; i < count; i++) phases[i] = Math.random() * Math.PI * 2;
+    this.geo.setAttribute('aPhase', new THREE.InstancedBufferAttribute(phases, 1));
+
+    this.mesh = new THREE.InstancedMesh(this.geo, this.material, count);
+    this.mesh.castShadow = true;
+    this.mesh.customDepthMaterial = this.depthMaterial;
+    this.mesh.frustumCulled = false;
+    scene.add(this.mesh);
+
+    this._tmpObj = new THREE.Object3D();
+    this._tmpPos = new THREE.Vector3();
+    this._tmpTan = new THREE.Vector3();
+
+    this.tOffsets = new Float32Array(count);
+    for (let i = 0; i < count; i++) this.tOffsets[i] = (i / count) * 0.08;
+  }
+
+  update(dt) {
+    this.uniforms.uTime.value += dt;
+    const length = this.curve.getLength();
+    this.t += (this.speed * dt) / Math.max(length, 0.001);
+    if (this.t > 1) this.t -= 1;
+
+    for (let i = 0; i < this.count; i++) {
+      let ti = this.t + this.tOffsets[i];
+      ti = ti - Math.floor(ti);
+      this.curve.getPointAt(ti, this._tmpPos);
+      this.curve.getTangentAt(ti, this._tmpTan);
+      this._tmpObj.position.copy(this._tmpPos);
+      this._tmpObj.lookAt(this._tmpPos.clone().add(this._tmpTan));
+      this._tmpObj.updateMatrix();
+      this.mesh.setMatrixAt(i, this._tmpObj.matrix);
+    }
+    this.mesh.instanceMatrix.needsUpdate = true;
+  }
+}
