@@ -3,6 +3,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { ROOM, SURFACE_NAMES, CAMERA_HEIGHT } from './config.js';
+import { createStarlingGeometry, createStarlingMaterial } from './birds.js';
 
 const info = document.getElementById('info');
 const canvas = document.getElementById('c');
@@ -79,6 +80,20 @@ gltfLoader.load('assets/elverket_v3.glb', (gltf) => {
   console.error(err);
 });
 
+// Single test bird at room center
+const birdGeo = createStarlingGeometry();
+const { material: birdMat, depthMaterial: birdDepth, uniforms: birdUniforms } = createStarlingMaterial();
+const testBird = new THREE.Mesh(birdGeo, birdMat);
+testBird.customDepthMaterial = birdDepth;
+testBird.castShadow = true;
+testBird.position.set(ROOM.centerX, ROOM.floor + 3, ROOM.centerZ);
+// aPhase attribute must be present even for non-instanced use
+birdGeo.setAttribute(
+  'aPhase',
+  new THREE.BufferAttribute(new Float32Array(birdGeo.attributes.position.count).fill(0), 1)
+);
+scene.add(testBird);
+
 // Resize
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
@@ -87,7 +102,10 @@ window.addEventListener('resize', () => {
 });
 
 // Loop
+const clock = new THREE.Clock();
 renderer.setAnimationLoop(() => {
+  const t = clock.getElapsedTime();
+  birdUniforms.uTime.value = t;
   controls.update();
   renderer.render(scene, camera);
 });
