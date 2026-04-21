@@ -103,16 +103,35 @@ gltfLoader.load('assets/elverket_v3.glb', (gltf) => {
   });
   scene.add(model);
 
+  const STORAGE_KEY = 'birds-v1-path';
+  const autosave = (curve) => {
+    rebuildFlock(curve);
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(editor.exportJSON())); } catch {}
+  };
+
   editor = new PathEditor({
     scene, camera, renderer, orbitControls: controls, surfaceMeshes,
-    onChange: rebuildFlock,
+    onChange: autosave,
   });
 
-  // Default path
-  editor.addFreePoint(new THREE.Vector3(ROOM.xMin - 1, ROOM.floor + 3, ROOM.zMin + 5));
-  editor.addFreePoint(new THREE.Vector3(ROOM.xMax - 2, ROOM.floor + 6, ROOM.zMin + 10));
-  editor.addFreePoint(new THREE.Vector3(ROOM.xMin + 2, ROOM.floor + 4, ROOM.zMax - 10));
-  editor.addFreePoint(new THREE.Vector3(ROOM.xMax + 1, ROOM.floor + 5, ROOM.zMax - 5));
+  // Load saved path, else default
+  let loadedFromStorage = false;
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) {
+      const data = JSON.parse(raw);
+      if (data && Array.isArray(data.points) && data.points.length > 0) {
+        editor.importJSON(data);
+        loadedFromStorage = true;
+      }
+    }
+  } catch {}
+  if (!loadedFromStorage) {
+    editor.addFreePoint(new THREE.Vector3(ROOM.xMin - 1, ROOM.floor + 3, ROOM.zMin + 5));
+    editor.addFreePoint(new THREE.Vector3(ROOM.xMax - 2, ROOM.floor + 6, ROOM.zMin + 10));
+    editor.addFreePoint(new THREE.Vector3(ROOM.xMin + 2, ROOM.floor + 4, ROOM.zMax - 10));
+    editor.addFreePoint(new THREE.Vector3(ROOM.xMax + 1, ROOM.floor + 5, ROOM.zMax - 5));
+  }
 
   // GUI: Path controls (attached after editor exists)
   pathFolder.add({ addFree: () => {
@@ -124,6 +143,22 @@ gltfLoader.load('assets/elverket_v3.glb', (gltf) => {
     editor._rebuildCurve();
   } }, 'clear').name('Clear all');
   pathFolder.add(editor.curveLine, 'visible').name('Show curve').listen();
+  pathFolder.add({ exp: () => {
+    const blob = new Blob([JSON.stringify(editor.exportJSON(), null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'birds-path.json'; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+  } }, 'exp').name('Export JSON');
+  pathFolder.add({ imp: () => {
+    const input = document.createElement('input');
+    input.type = 'file'; input.accept = 'application/json';
+    input.onchange = () => {
+      const file = input.files[0]; if (!file) return;
+      file.text().then(t => editor.importJSON(JSON.parse(t)));
+    };
+    input.click();
+  } }, 'imp').name('Import JSON');
 
   // GUI: Flock count (rebuilds flock)
   flockFolder.add({ count: birdCount }, 'count', 50, 800, 10).onFinishChange((v) => {
