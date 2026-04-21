@@ -5,7 +5,8 @@ import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { ROOM, SURFACE_NAMES, CAMERA_HEIGHT } from './config.js';
 import { Flock } from './birds.js';
 import { PathEditor } from './path-editor.js';
-import GUI from 'https://cdn.jsdelivr.net/npm/lil-gui@0.20/+esm';
+import GUI from 'lil-gui';
+import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
 
 const info = document.getElementById('info');
 const canvas = document.getElementById('c');
@@ -32,8 +33,8 @@ controls.target.set(ROOM.centerX, ROOM.centerY, ROOM.centerZ);
 controls.update();
 
 // Lights
-const ambient = new THREE.AmbientLight(0xffffff, 0.15);
-scene.add(ambient);
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.15);
+scene.add(ambientLight);
 
 const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 0.2);
 scene.add(hemi);
@@ -59,29 +60,101 @@ let flock = null;
 let editor = null;
 let birdCount = 300;
 let flockParamCtrls = [];
+const surfaceMeshesRef = [];
 const gui = new GUI({ title: 'birds-v1' });
+const sceneFolder = gui.addFolder('Scene');
 const pathFolder = gui.addFolder('Path');
 const flockFolder = gui.addFolder('Flock');
+
+// HDRI environment
+const HDRIS = {
+  'Kloppenheim (overcast)': '../shared/hdri/kloppenheim_02_2k.hdr',
+  'Venice sunset':          '../shared/hdri/venice_sunset_2k.hdr',
+  'Moonless golf (night)':  '../shared/hdri/moonless_golf_2k.hdr',
+};
+const sceneParams = {
+  hdri: 'Kloppenheim (overcast)',
+  showBackground: true,
+  envIntensity: 1.0,
+  exposure: 1.0,
+  dirLight: 0.8,
+  ambient: 0.15,
+  wallBrightness: 0.7,
+};
+const hdrLoader = new HDRLoader();
+let currentEnvTex = null;
+function loadHDRI(url) {
+  hdrLoader.load(url, (tex) => {
+    tex.mapping = THREE.EquirectangularReflectionMapping;
+    if (currentEnvTex) currentEnvTex.dispose();
+    currentEnvTex = tex;
+    scene.environment = tex;
+    scene.background = sceneParams.showBackground ? tex : new THREE.Color(0x000000);
+  });
+}
+loadHDRI(HDRIS[sceneParams.hdri]);
+
+sceneFolder.add(sceneParams, 'hdri', Object.keys(HDRIS)).onChange(v => loadHDRI(HDRIS[v]));
+sceneFolder.add(sceneParams, 'showBackground').name('show HDRI as sky').onChange(v => {
+  scene.background = v && currentEnvTex ? currentEnvTex : new THREE.Color(0x000000);
+});
+sceneFolder.add(sceneParams, 'envIntensity', 0, 3, 0.05).name('env intensity').onChange(v => {
+  scene.traverse(o => { if (o.isMesh && o.material && 'envMapIntensity' in o.material) o.material.envMapIntensity = v; });
+});
+sceneFolder.add(sceneParams, 'exposure', 0.1, 3, 0.05).onChange(v => { renderer.toneMappingExposure = v; });
+sceneFolder.add(sceneParams, 'wallBrightness', 0, 2, 0.05).name('wall brightness').onChange(v => {
+  for (const m of surfaceMeshesRef) m.material.color.setScalar(v);
+});
+sceneFolder.add(sceneParams, 'dirLight', 0, 3, 0.05).name('key light').onChange(v => { dir.intensity = v; });
+sceneFolder.add(sceneParams, 'ambient', 0, 2, 0.05).name('ambient').onChange(v => { ambientLight.intensity = v; });
+
+const birdAppearance = {
+  color: '#222228',
+};
+flockFolder.add({ count: birdCount }, 'count', 50, 800, 10).onFinishChange((v) => {
+  birdCount = v;
+  if (editor && editor.curve) rebuildFlock(editor.curve);
+});
 
 function rebuildFlock(curve) {
   if (flock) { scene.remove(flock.mesh); flock = null; }
   if (!curve) return;
   flock = new Flock({ count: birdCount, curve, scene });
+  flock.material.color.set(birdAppearance.color);
   flockParamCtrls.forEach(c => c.destroy());
   flockParamCtrls = [];
   const p = flock.params;
-  flockParamCtrls.push(flockFolder.add(p, 'speed', 0.5, 12, 0.1));
-  flockParamCtrls.push(flockFolder.add(p, 'separationWeight', 0, 4, 0.05).name('separation'));
-  flockParamCtrls.push(flockFolder.add(p, 'alignmentWeight',  0, 4, 0.05).name('alignment'));
-  flockParamCtrls.push(flockFolder.add(p, 'cohesionWeight',   0, 4, 0.05).name('cohesion'));
-  flockParamCtrls.push(flockFolder.add(p, 'pathWeight',       0, 8, 0.05).name('path pull'));
-  flockParamCtrls.push(flockFolder.add(p, 'maxSpeed',         1, 15, 0.1).name('max speed'));
-  flockParamCtrls.push(flockFolder.add(flock.uniforms.uFlapRate, 'value', 2, 30, 0.5).name('flap rate'));
+  // Appearance
+  const app = flockFolder.addFolder('Appearance');
+  flockParamCtrls.push(app);
+  app.add(p, 'size', 0.3, 5.0, 0.05).name('size');
+  app.addColor(birdAppearance, 'color').name('color').onChange(v => flock.material.color.set(v));
+  app.add(flock.uniforms.uFlapRate, 'value', 2, 30, 0.5).name('flap rate');
+  app.add(flock.uniforms.uFlapAmplitude, 'value', 0, 2.5, 0.05).name('flap amplitude');
+  // Path motion
+  const mot = flockFolder.addFolder('Motion');
+  flockParamCtrls.push(mot);
+  mot.add(p, 'speed', 0.5, 12, 0.1).name('path speed');
+  mot.add(p, 'pathWeight', 0, 8, 0.05).name('path pull');
+  mot.add(p, 'lateralSpread', 0, 6, 0.05).name('lateral spread');
+  mot.add(p, 'wander', 0, 4, 0.05);
+  mot.add(p, 'maxSpeed', 1, 15, 0.1).name('max speed');
+  mot.add(p, 'minSpeed', 0, 10, 0.1).name('min speed');
+  mot.add(p, 'maxForce', 0, 30, 0.5).name('max force');
+  // Boids
+  const bo = flockFolder.addFolder('Boids');
+  flockParamCtrls.push(bo);
+  bo.add(p, 'separationRadius', 0.05, 3, 0.05).name('sep radius');
+  bo.add(p, 'separationWeight', 0, 4, 0.05).name('sep weight');
+  bo.add(p, 'alignmentRadius',  0.1, 5, 0.05).name('ali radius');
+  bo.add(p, 'alignmentWeight',  0, 4, 0.05).name('ali weight');
+  bo.add(p, 'cohesionRadius',   0.1, 5, 0.05).name('coh radius');
+  bo.add(p, 'cohesionWeight',   0, 4, 0.05).name('coh weight');
 }
 
 // Load room
 const dracoLoader = new DRACOLoader();
-dracoLoader.setDecoderPath('https://unpkg.com/three@0.170.0/examples/jsm/libs/draco/');
+dracoLoader.setDecoderPath('../shared/vendor/three/examples/jsm/libs/draco/');
 const gltfLoader = new GLTFLoader();
 gltfLoader.setDRACOLoader(dracoLoader);
 
@@ -95,9 +168,11 @@ gltfLoader.load('assets/elverket_v3.glb', (gltf) => {
       child.material = child.material.clone();
       child.material.metalness = 0;
       child.material.roughness = 1;
+      child.material.envMapIntensity = sceneParams.envIntensity;
       if (SURFACE_NAMES.includes(child.name)) {
-        child.material.color.set(0xbbbbbb);
+        child.material.color.setScalar(sceneParams.wallBrightness);
         surfaceMeshes.push(child);
+        surfaceMeshesRef.push(child);
       }
     }
   });
@@ -159,12 +234,6 @@ gltfLoader.load('assets/elverket_v3.glb', (gltf) => {
     };
     input.click();
   } }, 'imp').name('Import JSON');
-
-  // GUI: Flock count (rebuilds flock)
-  flockFolder.add({ count: birdCount }, 'count', 50, 800, 10).onFinishChange((v) => {
-    birdCount = v;
-    if (editor.curve) rebuildFlock(editor.curve);
-  });
 
   info.textContent = 'shift-click wall to add waypoint · click marker to drag · Del to remove';
 }, undefined, (err) => {

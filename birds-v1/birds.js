@@ -113,6 +113,9 @@ export class Flock {
       maxForce: 8.0,
       maxSpeed: 6.0,
       minSpeed: 2.5,
+      wander: 0.4,          // random acceleration strength
+      size: 1.0,             // scales each instance (1.0 = ~40cm wingspan)
+      lateralSpread: 2.0,    // how loose the cloud around the path is (applied at update time)
     };
 
     this.t = 0;
@@ -122,16 +125,17 @@ export class Flock {
     this.tOffsets       = new Float32Array(count);
     this.lateralOffsets = new Float32Array(count * 3);
 
-    const spread = 2.0;
+    // Unit-magnitude random offsets; scaled by params.lateralSpread at update time
     const start = curve.getPointAt(0);
     for (let i = 0; i < count; i++) {
       this.tOffsets[i] = (i / count) * 0.12;
-      this.lateralOffsets[i*3+0] = (Math.random() - 0.5) * spread;
-      this.lateralOffsets[i*3+1] = (Math.random() - 0.5) * spread;
-      this.lateralOffsets[i*3+2] = (Math.random() - 0.5) * spread;
-      this.positions[i*3+0] = start.x + this.lateralOffsets[i*3+0];
-      this.positions[i*3+1] = start.y + this.lateralOffsets[i*3+1];
-      this.positions[i*3+2] = start.z + this.lateralOffsets[i*3+2];
+      this.lateralOffsets[i*3+0] = Math.random() - 0.5;
+      this.lateralOffsets[i*3+1] = Math.random() - 0.5;
+      this.lateralOffsets[i*3+2] = Math.random() - 0.5;
+      const sp = this.params.lateralSpread;
+      this.positions[i*3+0] = start.x + this.lateralOffsets[i*3+0] * sp;
+      this.positions[i*3+1] = start.y + this.lateralOffsets[i*3+1] * sp;
+      this.positions[i*3+2] = start.z + this.lateralOffsets[i*3+2] * sp;
       this.velocities[i*3+0] = (Math.random() - 0.5) * 2;
       this.velocities[i*3+1] = (Math.random() - 0.5) * 2;
       this.velocities[i*3+2] = (Math.random() - 0.5) * 2;
@@ -249,12 +253,20 @@ export class Flock {
       let ti = this.t + this.tOffsets[i];
       if (ti > 1) ti = 1;
       this.curve.getPointAt(ti, this._target);
-      const lox = this.lateralOffsets[i*3+0];
-      const loy = this.lateralOffsets[i*3+1];
-      const loz = this.lateralOffsets[i*3+2];
+      const sp = p.lateralSpread;
+      const lox = this.lateralOffsets[i*3+0] * sp;
+      const loy = this.lateralOffsets[i*3+1] * sp;
+      const loz = this.lateralOffsets[i*3+2] * sp;
       ax += (this._target.x + lox - px) * p.pathWeight;
       ay += (this._target.y + loy - py) * p.pathWeight;
       az += (this._target.z + loz - pz) * p.pathWeight;
+
+      // Wander — small random acceleration
+      if (p.wander > 0) {
+        ax += (Math.random() - 0.5) * p.wander * 2;
+        ay += (Math.random() - 0.5) * p.wander * 2;
+        az += (Math.random() - 0.5) * p.wander * 2;
+      }
 
       const aLen = Math.sqrt(ax*ax + ay*ay + az*az);
       if (aLen > p.maxForce) { const s = p.maxForce / aLen; ax *= s; ay *= s; az *= s; }
@@ -276,6 +288,7 @@ export class Flock {
       this._tmp.set(this.positions[i*3+0] + vx, this.positions[i*3+1] + vy, this.positions[i*3+2] + vz);
       this._tmpObj.position.set(this.positions[i*3+0], this.positions[i*3+1], this.positions[i*3+2]);
       this._tmpObj.lookAt(this._tmp);
+      this._tmpObj.scale.setScalar(p.size);
       this._tmpObj.updateMatrix();
       this.mesh.setMatrixAt(i, this._tmpObj.matrix);
     }
