@@ -116,7 +116,15 @@ export class Flock {
       wander: 0.3,          // random acceleration strength
       size: 1.0,             // scales each instance (1.0 = ~40cm wingspan)
       lateralSpread: 2.0,    // how loose the cloud around the path is (applied at update time)
+      landSpread: 6.0,       // how far apart birds spread when landing
+      landDescentSpeed: 3.0, // how hard they pull toward the floor target
     };
+
+    // Mode: 'flying' | 'landing' | 'landed'
+    // Per-bird `landed` flag used so each bird settles independently when it arrives.
+    this.mode = 'flying';
+    this.landTargets = new Float32Array(count * 3);
+    this.landed = new Uint8Array(count);
 
     this.t = 0;
 
@@ -162,6 +170,31 @@ export class Flock {
     this._tmp    = new THREE.Vector3();
   }
 
+  // Switch to landing/flying. `floor` = y-coordinate of the ground plane.
+  // `bounds` = { xMin, xMax, zMin, zMax } inside which birds may land.
+  setMode(mode, { floor, bounds } = {}) {
+    if (mode === this.mode) return;
+    if (mode === 'landing') {
+      const spread = this.params.landSpread;
+      for (let i = 0; i < this.count; i++) {
+        // Uniform random inside provided bounds, with a little extra jitter
+        const jx = (Math.random() - 0.5) * spread;
+        const jz = (Math.random() - 0.5) * spread;
+        const cx = bounds ? (bounds.xMin + bounds.xMax) / 2 : 0;
+        const cz = bounds ? (bounds.zMin + bounds.zMax) / 2 : 0;
+        const xRange = bounds ? (bounds.xMax - bounds.xMin) / 2 - 0.5 : 5;
+        const zRange = bounds ? (bounds.zMax - bounds.zMin) / 2 - 0.5 : 5;
+        this.landTargets[i*3+0] = cx + (Math.random() - 0.5) * 2 * xRange + jx * 0.1;
+        this.landTargets[i*3+1] = floor;
+        this.landTargets[i*3+2] = cz + (Math.random() - 0.5) * 2 * zRange + jz * 0.1;
+        this.landed[i] = 0;
+      }
+    } else if (mode === 'flying') {
+      for (let i = 0; i < this.count; i++) this.landed[i] = 0;
+    }
+    this.mode = mode;
+  }
+
   _buildGrid() {
     const cell = Math.max(this.params.alignmentRadius, this.params.cohesionRadius);
     const grid = new Map();
@@ -194,17 +227,19 @@ export class Flock {
   update(dt) {
     this.uniforms.uTime.value += dt;
     const p = this.params;
-    const length = this.curve.getLength();
-    this.t += (p.speed * dt) / Math.max(length, 0.001);
-    // Respawn when the tail bird has passed the end of the curve
-    const slack = Math.max.apply(null, Array.from(this.tOffsets)) + 0.05;
-    if (this.t > 1 + slack) {
-      this.t = 0;
-      const start = this.curve.getPointAt(0);
-      for (let i = 0; i < this.count; i++) {
-        this.positions[i*3+0] = start.x + this.lateralOffsets[i*3+0];
-        this.positions[i*3+1] = start.y + this.lateralOffsets[i*3+1];
-        this.positions[i*3+2] = start.z + this.lateralOffsets[i*3+2];
+
+    if (this.mode === 'flying') {
+      const length = this.curve.getLength();
+      this.t += (p.speed * dt) / Math.max(length, 0.001);
+      const slack = Math.max.apply(null, Array.from(this.tOffsets)) + 0.05;
+      if (this.t > 1 + slack) {
+        this.t = 0;
+        const start = this.curve.getPointAt(0);
+        for (let i = 0; i < this.count; i++) {
+          this.positions[i*3+0] = start.x + this.lateralOffsets[i*3+0];
+          this.positions[i*3+1] = start.y + this.lateralOffsets[i*3+1];
+          this.positions[i*3+2] = start.z + this.lateralOffsets[i*3+2];
+        }
       }
     }
 
@@ -218,6 +253,19 @@ export class Flock {
       const px = this.positions[i*3+0], py = this.positions[i*3+1], pz = this.positions[i*3+2];
       let vx = this.velocities[i*3+0], vy = this.velocities[i*3+1], vz = this.velocities[i*3+2];
 
+      // Bird already landed — sit still and write a flat-pose matrix
+      if (this.landed[i]) {
+        this._tmpObj.position.set(px, py, pz);
+        this._tmpObj.rotation.set(0, this.lateralOffsets[i*3+0] * Math.PI * 2, 0); // random yaw per bird
+        this._tmpObj.scale.setScalar(p.size);
+        this._tmpObj.updateMatrix();
+        this.mesh.setMatrixAt(i, this._tmpObj.matrix);
+        continue;
+      }
+
+      let ax = 0, ay = 0, az = 0;
+
+      // Separation (useful in both modes — prevents overlap)
       let sepX=0, sepY=0, sepZ=0, sepN=0;
       let aliX=0, aliY=0, aliZ=0, aliN=0;
       let cohX=0, cohY=0, cohZ=0, cohN=0;
@@ -231,41 +279,59 @@ export class Flock {
           const inv = 1 / Math.sqrt(d2);
           sepX += dx * inv; sepY += dy * inv; sepZ += dz * inv; sepN++;
         }
-        if (d2 < aliR2) {
-          aliX += this.velocities[j*3+0];
-          aliY += this.velocities[j*3+1];
-          aliZ += this.velocities[j*3+2];
-          aliN++;
-        }
-        if (d2 < cohR2) {
-          cohX += this.positions[j*3+0];
-          cohY += this.positions[j*3+1];
-          cohZ += this.positions[j*3+2];
-          cohN++;
+        if (this.mode === 'flying') {
+          if (d2 < aliR2) {
+            aliX += this.velocities[j*3+0];
+            aliY += this.velocities[j*3+1];
+            aliZ += this.velocities[j*3+2];
+            aliN++;
+          }
+          if (d2 < cohR2) {
+            cohX += this.positions[j*3+0];
+            cohY += this.positions[j*3+1];
+            cohZ += this.positions[j*3+2];
+            cohN++;
+          }
         }
       });
 
-      let ax = 0, ay = 0, az = 0;
       if (sepN > 0) { ax += (sepX/sepN) * p.separationWeight; ay += (sepY/sepN) * p.separationWeight; az += (sepZ/sepN) * p.separationWeight; }
-      if (aliN > 0) { ax += (aliX/aliN - vx) * p.alignmentWeight; ay += (aliY/aliN - vy) * p.alignmentWeight; az += (aliZ/aliN - vz) * p.alignmentWeight; }
-      if (cohN > 0) { ax += (cohX/cohN - px) * p.cohesionWeight;  ay += (cohY/cohN - py) * p.cohesionWeight;  az += (cohZ/cohN - pz) * p.cohesionWeight; }
 
-      let ti = this.t + this.tOffsets[i];
-      if (ti > 1) ti = 1;
-      this.curve.getPointAt(ti, this._target);
-      const ls = p.lateralSpread;
-      const lox = this.lateralOffsets[i*3+0] * ls;
-      const loy = this.lateralOffsets[i*3+1] * ls;
-      const loz = this.lateralOffsets[i*3+2] * ls;
-      ax += (this._target.x + lox - px) * p.pathWeight;
-      ay += (this._target.y + loy - py) * p.pathWeight;
-      az += (this._target.z + loz - pz) * p.pathWeight;
+      if (this.mode === 'flying') {
+        if (aliN > 0) { ax += (aliX/aliN - vx) * p.alignmentWeight; ay += (aliY/aliN - vy) * p.alignmentWeight; az += (aliZ/aliN - vz) * p.alignmentWeight; }
+        if (cohN > 0) { ax += (cohX/cohN - px) * p.cohesionWeight;  ay += (cohY/cohN - py) * p.cohesionWeight;  az += (cohZ/cohN - pz) * p.cohesionWeight; }
 
-      // Wander — small random acceleration
-      if (p.wander > 0) {
-        ax += (Math.random() - 0.5) * p.wander * 2;
-        ay += (Math.random() - 0.5) * p.wander * 2;
-        az += (Math.random() - 0.5) * p.wander * 2;
+        let ti = this.t + this.tOffsets[i];
+        if (ti > 1) ti = 1;
+        this.curve.getPointAt(ti, this._target);
+        const ls = p.lateralSpread;
+        const lox = this.lateralOffsets[i*3+0] * ls;
+        const loy = this.lateralOffsets[i*3+1] * ls;
+        const loz = this.lateralOffsets[i*3+2] * ls;
+        ax += (this._target.x + lox - px) * p.pathWeight;
+        ay += (this._target.y + loy - py) * p.pathWeight;
+        az += (this._target.z + loz - pz) * p.pathWeight;
+
+        if (p.wander > 0) {
+          ax += (Math.random() - 0.5) * p.wander * 2;
+          ay += (Math.random() - 0.5) * p.wander * 2;
+          az += (Math.random() - 0.5) * p.wander * 2;
+        }
+      } else if (this.mode === 'landing') {
+        // Strong pull toward this bird's floor target; slight velocity damping
+        const tx = this.landTargets[i*3+0];
+        const ty = this.landTargets[i*3+1];
+        const tz = this.landTargets[i*3+2];
+        ax += (tx - px) * p.landDescentSpeed;
+        ay += (ty - py) * p.landDescentSpeed;
+        az += (tz - pz) * p.landDescentSpeed;
+        // Air brake — damp horizontal velocity near the ground
+        const heightAbove = py - ty;
+        if (heightAbove < 1.5) {
+          const brake = Math.max(0, 1 - heightAbove / 1.5);
+          ax -= vx * brake * 3;
+          az -= vz * brake * 3;
+        }
       }
 
       const aLen = Math.sqrt(ax*ax + ay*ay + az*az);
@@ -273,9 +339,12 @@ export class Flock {
 
       vx += ax * dt; vy += ay * dt; vz += az * dt;
 
+      // Speed clamp — skip minSpeed during landing so birds can fully stop
       const sp = Math.sqrt(vx*vx + vy*vy + vz*vz);
       if (sp > p.maxSpeed) { const s = p.maxSpeed / sp; vx *= s; vy *= s; vz *= s; }
-      else if (sp < p.minSpeed && sp > 1e-3) { const s = p.minSpeed / sp; vx *= s; vy *= s; vz *= s; }
+      else if (this.mode === 'flying' && sp < p.minSpeed && sp > 1e-3) {
+        const s = p.minSpeed / sp; vx *= s; vy *= s; vz *= s;
+      }
 
       this.velocities[i*3+0] = vx;
       this.velocities[i*3+1] = vy;
@@ -284,6 +353,20 @@ export class Flock {
       this.positions[i*3+0] = px + vx * dt;
       this.positions[i*3+1] = py + vy * dt;
       this.positions[i*3+2] = pz + vz * dt;
+
+      // Landing settle — snap when close enough
+      if (this.mode === 'landing') {
+        const dx = this.positions[i*3+0] - this.landTargets[i*3+0];
+        const dy = this.positions[i*3+1] - this.landTargets[i*3+1];
+        const dz = this.positions[i*3+2] - this.landTargets[i*3+2];
+        if (dx*dx + dy*dy + dz*dz < 0.04) { // ~20cm
+          this.positions[i*3+0] = this.landTargets[i*3+0];
+          this.positions[i*3+1] = this.landTargets[i*3+1];
+          this.positions[i*3+2] = this.landTargets[i*3+2];
+          this.velocities[i*3+0] = 0; this.velocities[i*3+1] = 0; this.velocities[i*3+2] = 0;
+          this.landed[i] = 1;
+        }
+      }
 
       this._tmp.set(this.positions[i*3+0] + vx, this.positions[i*3+1] + vy, this.positions[i*3+2] + vz);
       this._tmpObj.position.set(this.positions[i*3+0], this.positions[i*3+1], this.positions[i*3+2]);

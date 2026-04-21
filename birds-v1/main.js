@@ -147,9 +147,21 @@ sceneFolder.add(moveParams, 'speed', 0.5, 15, 0.1).name('move speed (WASD)');
 const birdAppearance = {
   color: '#222228',
 };
+const landingCtl = { landed: false };
 flockFolder.add({ count: birdCount }, 'count', 50, 800, 10).onFinishChange((v) => {
   birdCount = v;
   if (editor && editor.curve) rebuildFlock(editor.curve);
+});
+flockFolder.add(landingCtl, 'landed').name('land on floor').onChange(v => {
+  if (!flock) return;
+  if (v) {
+    flock.setMode('landing', {
+      floor: ROOM.floor + 0.05,
+      bounds: { xMin: ROOM.xMin + 0.5, xMax: ROOM.xMax - 0.5, zMin: ROOM.zMin + 0.5, zMax: ROOM.zMax - 0.5 },
+    });
+  } else {
+    flock.setMode('flying');
+  }
 });
 
 function rebuildFlock(curve) {
@@ -157,6 +169,12 @@ function rebuildFlock(curve) {
   if (!curve) return;
   flock = new Flock({ count: birdCount, curve, scene });
   flock.material.color.set(birdAppearance.color);
+  if (landingCtl.landed) {
+    flock.setMode('landing', {
+      floor: ROOM.floor + 0.05,
+      bounds: { xMin: ROOM.xMin + 0.5, xMax: ROOM.xMax - 0.5, zMin: ROOM.zMin + 0.5, zMax: ROOM.zMax - 0.5 },
+    });
+  }
   flockParamCtrls.forEach(c => c.destroy());
   flockParamCtrls = [];
   const p = flock.params;
