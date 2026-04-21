@@ -32,6 +32,41 @@ const controls = new OrbitControls(camera, canvas);
 controls.target.set(ROOM.centerX, ROOM.centerY, ROOM.centerZ);
 controls.update();
 
+// WASD + QE movement
+const keys = {};
+const moveParams = { speed: 3.0 }; // units/sec; Shift doubles
+window.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  keys[e.code] = true;
+});
+window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+window.addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
+
+const _fwd = new THREE.Vector3();
+const _right = new THREE.Vector3();
+const _move = new THREE.Vector3();
+function updateCameraMovement(dt) {
+  _move.set(0, 0, 0);
+  const forward = (keys['KeyW'] ? 1 : 0) - (keys['KeyS'] ? 1 : 0);
+  const strafe  = (keys['KeyD'] ? 1 : 0) - (keys['KeyA'] ? 1 : 0);
+  const vert    = (keys['KeyE'] ? 1 : 0) - (keys['KeyQ'] ? 1 : 0);
+  if (!forward && !strafe && !vert) return;
+
+  camera.getWorldDirection(_fwd);
+  _fwd.y = 0; _fwd.normalize();             // project to XZ so W doesn't dive
+  _right.set(_fwd.z, 0, -_fwd.x);            // horizontal right = fwd rotated -90 around Y
+
+  _move.addScaledVector(_fwd, forward);
+  _move.addScaledVector(_right, strafe);
+  _move.y += vert;
+
+  const boost = keys['ShiftLeft'] || keys['ShiftRight'] ? 2.5 : 1.0;
+  _move.multiplyScalar(moveParams.speed * boost * dt);
+
+  camera.position.add(_move);
+  controls.target.add(_move);
+}
+
 // Lights
 const ambientLight = new THREE.AmbientLight(0xffffff, 0.15);
 scene.add(ambientLight);
@@ -107,6 +142,7 @@ sceneFolder.add(sceneParams, 'wallBrightness', 0, 2, 0.05).name('wall brightness
 });
 sceneFolder.add(sceneParams, 'dirLight', 0, 3, 0.05).name('key light').onChange(v => { dir.intensity = v; });
 sceneFolder.add(sceneParams, 'ambient', 0, 2, 0.05).name('ambient').onChange(v => { ambientLight.intensity = v; });
+sceneFolder.add(moveParams, 'speed', 0.5, 15, 0.1).name('move speed (WASD)');
 
 const birdAppearance = {
   color: '#222228',
@@ -241,7 +277,7 @@ gltfLoader.load('assets/elverket_v3.glb', (gltf) => {
     input.click();
   } }, 'imp').name('Import JSON');
 
-  info.textContent = 'shift-click wall to add waypoint · click marker to drag · Del to remove';
+  info.textContent = 'WASD + QE to move · drag to orbit · shift-click wall to add waypoint · Del to remove';
 }, undefined, (err) => {
   info.textContent = 'room load failed';
   console.error(err);
@@ -258,6 +294,7 @@ window.addEventListener('resize', () => {
 const clock = new THREE.Clock();
 renderer.setAnimationLoop(() => {
   const dt = clock.getDelta();
+  updateCameraMovement(dt);
   if (flock) flock.update(dt);
   controls.update();
   renderer.render(scene, camera);
