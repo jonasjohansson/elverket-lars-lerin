@@ -192,7 +192,17 @@ export class Flock {
     const p = this.params;
     const length = this.curve.getLength();
     this.t += (p.speed * dt) / Math.max(length, 0.001);
-    if (this.t > 1) this.t -= 1;
+    // Respawn when the tail bird has passed the end of the curve
+    const slack = Math.max.apply(null, Array.from(this.tOffsets)) + 0.05;
+    if (this.t > 1 + slack) {
+      this.t = 0;
+      const start = this.curve.getPointAt(0);
+      for (let i = 0; i < this.count; i++) {
+        this.positions[i*3+0] = start.x + this.lateralOffsets[i*3+0];
+        this.positions[i*3+1] = start.y + this.lateralOffsets[i*3+1];
+        this.positions[i*3+2] = start.z + this.lateralOffsets[i*3+2];
+      }
+    }
 
     const { grid, invCell } = this._buildGrid();
 
@@ -237,7 +247,7 @@ export class Flock {
       if (cohN > 0) { ax += (cohX/cohN - px) * p.cohesionWeight;  ay += (cohY/cohN - py) * p.cohesionWeight;  az += (cohZ/cohN - pz) * p.cohesionWeight; }
 
       let ti = this.t + this.tOffsets[i];
-      ti = ti - Math.floor(ti);
+      if (ti > 1) ti = 1;
       this.curve.getPointAt(ti, this._target);
       const lox = this.lateralOffsets[i*3+0];
       const loy = this.lateralOffsets[i*3+1];
