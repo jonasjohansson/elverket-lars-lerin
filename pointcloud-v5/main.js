@@ -24,6 +24,8 @@ controls.target.set(0, 0, 0);
 const PARTICLE_COUNT = 800_000;
 const PAINTING_HEIGHT = 2.0;
 const ALPHA_THRESHOLD = 0.5 * 255;
+const PARTICLES_PER_ROW = 1024;
+const ROWS_PER_PAINTING = Math.ceil(PARTICLE_COUNT / PARTICLES_PER_ROW);
 
 const PAINTING_IDS = ['0012', '0013', '0018', '0020', '0022', '0029', '0031', '0032', '0038'];
 const PAINTINGS = PAINTING_IDS.map(n => `../shared/images/series-1/17_RESAN_OCH_ORIENTEN_LL_${n}-trim.png`);
@@ -89,36 +91,45 @@ function samplePainting(pixels, count) {
   return { pos, col, worldW, worldH };
 }
 
-// Pack per-painting address arrays into (9 × N) DataTextures.
-// Layout: column = painting index, row = particle index.
+// Pack per-painting address arrays into a 1024-wide atlas texture.
+// Layout: 1024 particles per row, 9 paintings stacked vertically.
+// For particle i in painting p:
+//   x = i % PARTICLES_PER_ROW
+//   y = p * ROWS_PER_PAINTING + floor(i / PARTICLES_PER_ROW)
+// posTex is RG float; colTex is RGBA float (alpha=1, unused but RGB-float is deprecated).
 function packAddressTextures(samples) {
   const N = PARTICLE_COUNT;
   const cols = samples.length;
+  const texW = PARTICLES_PER_ROW;
+  const texH = cols * ROWS_PER_PAINTING;
 
-  const posData = new Float32Array(cols * N * 2);
-  const colData = new Float32Array(cols * N * 3);
+  const posData = new Float32Array(texW * texH * 2);
+  const colData = new Float32Array(texW * texH * 4);
 
   for (let p = 0; p < cols; p++) {
     const s = samples[p];
+    const yOffset = p * ROWS_PER_PAINTING;
     for (let i = 0; i < N; i++) {
-      // texel (col=p, row=i) → data index = (i * cols + p)
-      const texelIdx = i * cols + p;
+      const x = i % texW;
+      const y = yOffset + ((i / texW) | 0);
+      const texelIdx = y * texW + x;
       posData[texelIdx * 2]     = s.pos[i * 2];
       posData[texelIdx * 2 + 1] = s.pos[i * 2 + 1];
-      colData[texelIdx * 3]     = s.col[i * 3];
-      colData[texelIdx * 3 + 1] = s.col[i * 3 + 1];
-      colData[texelIdx * 3 + 2] = s.col[i * 3 + 2];
+      colData[texelIdx * 4]     = s.col[i * 3];
+      colData[texelIdx * 4 + 1] = s.col[i * 3 + 1];
+      colData[texelIdx * 4 + 2] = s.col[i * 3 + 2];
+      colData[texelIdx * 4 + 3] = 1.0;
     }
   }
 
-  const posTex = new THREE.DataTexture(posData, cols, N, THREE.RGFormat, THREE.FloatType);
+  const posTex = new THREE.DataTexture(posData, texW, texH, THREE.RGFormat, THREE.FloatType);
   posTex.minFilter = THREE.NearestFilter;
   posTex.magFilter = THREE.NearestFilter;
   posTex.wrapS = THREE.ClampToEdgeWrapping;
   posTex.wrapT = THREE.ClampToEdgeWrapping;
   posTex.needsUpdate = true;
 
-  const colTex = new THREE.DataTexture(colData, cols, N, THREE.RGBFormat, THREE.FloatType);
+  const colTex = new THREE.DataTexture(colData, texW, texH, THREE.RGBAFormat, THREE.FloatType);
   colTex.minFilter = THREE.NearestFilter;
   colTex.magFilter = THREE.NearestFilter;
   colTex.wrapS = THREE.ClampToEdgeWrapping;
@@ -140,7 +151,7 @@ async function init() {
 
   const samples = pixels.map(px => samplePainting(px, PARTICLE_COUNT));
   const { posTex, colTex } = packAddressTextures(samples);
-  console.log('packed:', posTex.image.width, '×', posTex.image.height, 'pos +', colTex.image.width, '×', colTex.image.height, 'col');
+  console.log(`packed: ${posTex.image.width}×${posTex.image.height} atlas · ${PARTICLES_PER_ROW}/row · ${ROWS_PER_PAINTING}rows/painting × ${NUM_PAINTINGS}`);
 
   info.textContent = `${NUM_PAINTINGS} paintings · ${(PARTICLE_COUNT / 1e6).toFixed(2)}M particles · WebGPU`;
   renderer.setAnimationLoop(() => {
