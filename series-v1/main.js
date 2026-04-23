@@ -40,14 +40,14 @@ const params = {
   wave2Speed: 0.18,
   wave2Frequency: 3.5,
   microDrift: 0.0015,
-  particleSize: 3.0,
+  particleSize: 2.0,
   alphaDip: 0.2,
   // Flow-field transition knobs (Anadol-style)
   curlAmp: 0.28,
   curlFreq: 1.8,
   curlSpeed: 0.4,
   coreFlow: 0.3,
-  trailStrength: 0.88,
+  trailStrength: 0.75,
   chaosAmp: 0.18,
   chaosSpeed: 0.6,
 };
@@ -385,6 +385,8 @@ async function init() {
 
   renderer.setAnimationLoop(() => {
     uTime.value = performance.now() / 1000;
+    // Trails only contribute during a transition; idle = clean paintings.
+    uTrailStrength.value = params.trailStrength * uWindGust.value;
     if (transitioning) {
       const progress = Math.min(1, (performance.now() - transitionStart) / (TRANSITION_DURATION_ref.value * 1000));
       uWindGust.value = Math.sin(progress * Math.PI); // 0 → 1 → 0 over the transition
