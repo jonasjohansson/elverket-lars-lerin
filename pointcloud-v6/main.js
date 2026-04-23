@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { attribute, uniform, float, vec2, vec3, vec4, Fn, mix, sin, cos, smoothstep, clamp } from 'three/tsl';
 
 const canvas = document.getElementById('c');
 const info = document.getElementById('info');
@@ -97,6 +98,71 @@ async function init() {
   console.log(`A ${sA.worldW.toFixed(2)}×${sA.worldH.toFixed(2)}, B ${sB.worldW.toFixed(2)}×${sB.worldH.toFixed(2)}`);
 
   info.textContent = `${(PARTICLE_COUNT / 1e6).toFixed(2)}M particles sampled`;
+
+  const positions = new Float32Array(PARTICLE_COUNT * 3);  // placeholder
+  const aPosA = new Float32Array(PARTICLE_COUNT * 2);
+  const aColA = new Float32Array(PARTICLE_COUNT * 3);
+  const aPosB = new Float32Array(PARTICLE_COUNT * 2);
+  const aColB = new Float32Array(PARTICLE_COUNT * 3);
+  const aZ    = new Float32Array(PARTICLE_COUNT);
+  const aSeed = new Float32Array(PARTICLE_COUNT * 4);
+
+  for (let i = 0; i < PARTICLE_COUNT; i++) {
+    aPosA[i * 2]     = sA.pos[i * 2];
+    aPosA[i * 2 + 1] = sA.pos[i * 2 + 1];
+    aColA[i * 3]     = sA.col[i * 3];
+    aColA[i * 3 + 1] = sA.col[i * 3 + 1];
+    aColA[i * 3 + 2] = sA.col[i * 3 + 2];
+
+    aPosB[i * 2]     = sB.pos[i * 2];
+    aPosB[i * 2 + 1] = sB.pos[i * 2 + 1];
+    aColB[i * 3]     = sB.col[i * 3];
+    aColB[i * 3 + 1] = sB.col[i * 3 + 1];
+    aColB[i * 3 + 2] = sB.col[i * 3 + 2];
+
+    aZ[i] = 0.0;  // will become scatter in Task 4
+
+    aSeed[i * 4]     = (Math.random() - 0.5) * 2;
+    aSeed[i * 4 + 1] = (Math.random() - 0.5) * 2;
+    aSeed[i * 4 + 2] = Math.random();
+    aSeed[i * 4 + 3] = 0.3 + Math.random() * 0.7;
+  }
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute('aPosA', new THREE.BufferAttribute(aPosA, 2));
+  geometry.setAttribute('aColA', new THREE.BufferAttribute(aColA, 3));
+  geometry.setAttribute('aPosB', new THREE.BufferAttribute(aPosB, 2));
+  geometry.setAttribute('aColB', new THREE.BufferAttribute(aColB, 3));
+  geometry.setAttribute('aZ',    new THREE.BufferAttribute(aZ, 1));
+  geometry.setAttribute('aSeed', new THREE.BufferAttribute(aSeed, 4));
+  geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 0), 100);
+
+  const uSize = uniform(4.0);
+
+  const material = new THREE.PointsNodeMaterial({
+    transparent: true,
+    blending: THREE.NormalBlending,
+    depthWrite: false,
+  });
+
+  material.positionNode = Fn(() => {
+    const pA = attribute('aPosA');
+    return vec3(pA.x, pA.y, float(0.0));
+  })();
+
+  material.colorNode = Fn(() => {
+    const cA = attribute('aColA');
+    return vec4(cA.x, cA.y, cA.z, 1.0);
+  })();
+
+  material.sizeNode = uSize;
+  material.sizeAttenuation = true;
+
+  const points = new THREE.Points(geometry, material);
+  scene.add(points);
+
+  info.textContent = 'painting A';
 
   renderer.setAnimationLoop(() => {
     controls.update();
