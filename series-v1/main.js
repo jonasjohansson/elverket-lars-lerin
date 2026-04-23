@@ -213,10 +213,21 @@ async function init() {
       const dx = sin(t.mul(0.13).add(seedX.mul(7.0))).mul(uMicroDrift);
       const dy = cos(t.mul(0.11).add(seedY.mul(5.0))).mul(uMicroDrift);
 
+      const edge = attribute('aEdge');
+      const detach = float(1.0).sub(smoothstep(float(0.0), float(0.6), edge)).mul(uWindGust).mul(uPaintingGust);
+
+      // Wind X: outgoing/incoming both drift in +windDir. Travel amplitude = half a stride at peak gust.
+      const windX = uWindDir.mul(uStride).mul(detach).mul(0.5);
+
+      // Cross-wind Y and swirl Z from v2's transition scatter pattern
+      const tw = t.mul(0.25);
+      const windY = sin(tw.add(seedX.mul(3.0))).mul(detach).mul(0.1);
+      const windZ = cos(tw.mul(0.7).add(seedX.add(seedY).mul(2.0))).mul(detach).mul(0.08);
+
       return pos.add(vec3(
-        w1x.add(w2x).add(dx),
-        w1y.add(w2y).add(dy),
-        w1z.add(w2z),
+        w1x.add(w2x).add(dx).add(windX),
+        w1y.add(w2y).add(dy).add(windY),
+        w1z.add(w2z).add(windZ),
       ));
     })();
     return m;
