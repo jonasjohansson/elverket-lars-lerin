@@ -195,7 +195,7 @@ async function init() {
 
   // Uniforms. Only from-index is wired up in this task.
   const uFromIdx      = uniform(0.0);
-  const uToIdx        = uniform(1.0);
+  const uToIdx        = uniform(0.0);
   const uT            = uniform(0.0);
   const uSize         = uniform(params.splatScale);
   const uAtlasW       = uniform(PARTICLES_PER_ROW);                        // 1024
@@ -324,16 +324,52 @@ async function init() {
   const points = new THREE.Points(geometry, material);
   scene.add(points);
 
-  // Debug GUI — removed in Task 10 when the real state machine takes over.
-  const debugParams = { fromIdx: 0, toIdx: 1, t: 0 };
-  const gui = new GUI({ title: 'pointcloud-v5 (debug)' });
-  gui.add(debugParams, 'fromIdx', 0, NUM_PAINTINGS - 1, 1).name('From').onChange(v => uFromIdx.value = v);
-  gui.add(debugParams, 'toIdx',   0, NUM_PAINTINGS - 1, 1).name('To').onChange(v => uToIdx.value = v);
-  gui.add(debugParams, 't', 0, 1, 0.001).name('t').onChange(v => uT.value = v);
+  const transition = {
+    duration: 12.0,  // seconds
+    from: 0,
+    to: 0,
+    start: 0,
+    active: false,
+  };
+
+  function startTransition(toIdx) {
+    if (transition.active) return;  // ignore input mid-storm
+    const clamped = Math.max(0, Math.min(NUM_PAINTINGS - 1, toIdx));
+    if (clamped === transition.to) return;
+    transition.from = transition.to;
+    transition.to = clamped;
+    transition.start = performance.now();
+    transition.active = true;
+    uFromIdx.value = transition.from;
+    uToIdx.value   = transition.to;
+    uT.value = 0;
+  }
+
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowRight') startTransition(transition.to + 1);
+    if (e.key === 'ArrowLeft')  startTransition(transition.to - 1);
+    if (e.key === 'f' || e.key === 'F') {
+      if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(() => {});
+      else document.exitFullscreen().catch(() => {});
+    }
+    if (e.code === 'Space') { e.preventDefault(); controls.enabled = !controls.enabled; }
+  });
 
   info.textContent = `${NUM_PAINTINGS} paintings · ${(PARTICLE_COUNT / 1e6).toFixed(2)}M particles · WebGPU`;
   renderer.setAnimationLoop(() => {
     uTime.value = performance.now() / 1000;
+    if (transition.active) {
+      const elapsed = (performance.now() - transition.start) / 1000;
+      const t = Math.min(1, elapsed / transition.duration);
+      uT.value = t;
+      if (t >= 1) {
+        // Settle: from = to so subsequent transitions start from the current resting painting
+        uFromIdx.value = transition.to;
+        uT.value = 0;
+        transition.from = transition.to;
+        transition.active = false;
+      }
+    }
     controls.update();
     renderer.render(scene, camera);
   });
