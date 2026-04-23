@@ -140,6 +140,23 @@ async function init() {
 
   const uSize = uniform(4.0);
   const uPhase = uniform(0.0);
+  const uPatchScale = uniform(3.0);
+  const uFadeWindow = uniform(0.08);
+
+  // Clustered death moment dM ∈ [0,1] from position — neighbors share similar dM.
+  const dieMoment = (posXY, delay) => {
+    const pf = uPatchScale;
+    const a = sin(posXY.x.mul(pf)).mul(sin(posXY.y.mul(pf.mul(0.87)).add(1.3)));
+    const b = sin(posXY.x.mul(pf.mul(2.1)).add(2.7)).mul(cos(posXY.y.mul(pf.mul(1.7)).add(0.9)));
+    const patch = a.mul(0.55).add(b.mul(0.35)).mul(0.5).add(0.5); // ~[0.05, 0.95]
+    return clamp(patch.add(delay.mul(0.15)), 0.0, 1.0);
+  };
+
+  // Per-particle transition progress: 0 = fully A, 1 = fully B.
+  const dieProgress = (posXY, delay) => {
+    const dM = dieMoment(posXY, delay);
+    return smoothstep(dM.sub(uFadeWindow), dM.add(uFadeWindow), uPhase);
+  };
 
   const material = new THREE.PointsNodeMaterial({
     transparent: true,
@@ -151,14 +168,22 @@ async function init() {
     const pA = attribute('aPosA');
     const pB = attribute('aPosB');
     const z  = attribute('aZ');
-    const xy = mix(pA, pB, uPhase);
+    const seed = attribute('aSeed');
+    const delay = seed.z;
+    // Patch is anchored in A-space so clusters are stable.
+    const d = dieProgress(pA, delay);
+    const xy = mix(pA, pB, d);
     return vec3(xy.x, xy.y, z);
   })();
 
   material.colorNode = Fn(() => {
     const cA = attribute('aColA');
     const cB = attribute('aColB');
-    const c  = mix(cA, cB, uPhase);
+    const pA = attribute('aPosA');
+    const seed = attribute('aSeed');
+    const delay = seed.z;
+    const d = dieProgress(pA, delay);
+    const c = mix(cA, cB, d);
     return vec4(c.x, c.y, c.z, 1.0);
   })();
 
@@ -170,7 +195,7 @@ async function init() {
 
   info.textContent = 'painting A';
 
-  window.__u = { uPhase };
+  window.__u = { uPhase, uPatchScale, uFadeWindow };
 
   renderer.setAnimationLoop(() => {
     controls.update();
