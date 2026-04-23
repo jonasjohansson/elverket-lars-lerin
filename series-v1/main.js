@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { attribute, vec3, vec4, float, Fn, sin, cos, uniform } from 'three/tsl';
+import { attribute, vec3, vec4, float, Fn, sin, cos, uniform, smoothstep } from 'three/tsl';
 
 const canvas = document.getElementById('c');
 const info = document.getElementById('info');
@@ -50,6 +50,11 @@ const uWave2Spd  = uniform(params.wave2Speed);
 const uWave2Freq = uniform(params.wave2Frequency);
 const uMicroDrift = uniform(params.microDrift);
 const uSize = uniform(params.particleSize);
+
+const uWindDir  = uniform(0.0);   // +1 / -1 while transitioning
+const uWindGust = uniform(0.0);   // 0..1 envelope over transition
+const uStride   = uniform(1.0);   // set from avgW + gap inside init()
+let uPaintingGusts = [];
 
 function loadImage(src) {
   return new Promise((resolve, reject) => {
@@ -170,6 +175,7 @@ async function init() {
   const GAP_FACTOR = 0.6;
   const avgW = builds.reduce((s, b) => s + b.worldW, 0) / builds.length;
   const gap = avgW * GAP_FACTOR;
+  uStride.value = avgW + gap;
   let runningX = 0;
   const paintingXs = [];
   for (let i = 0; i < builds.length; i++) {
@@ -178,40 +184,43 @@ async function init() {
     paintingXs.push(runningX);
   }
 
-  const mat = new THREE.PointsNodeMaterial({
-    transparent: true,
-    blending: THREE.NormalBlending,
-    depthWrite: true,
-  });
-  mat.colorNode = Fn(() => vec4(attribute('aColor'), 1.0))();
-  mat.sizeNode = uSize;
-  mat.sizeAttenuation = true;
+  uPaintingGusts = builds.map(() => uniform(0.0));
 
-  mat.positionNode = Fn(() => {
-    const pos = attribute('position');
-    const seed = attribute('aSeed');
-    const seedX = seed.x, seedY = seed.y;
-    const t = uTime;
+  function makeMaterial(uPaintingGust) {
+    const m = new THREE.PointsNodeMaterial({
+      transparent: true,
+      blending: THREE.NormalBlending,
+      depthWrite: true,
+    });
+    m.colorNode = Fn(() => vec4(attribute('aColor'), 1.0))();
+    m.sizeNode = uSize;
+    m.sizeAttenuation = true;
+    m.positionNode = Fn(() => {
+      const pos = attribute('position');
+      const seed = attribute('aSeed');
+      const seedX = seed.x, seedY = seed.y;
+      const t = uTime;
 
-    const wave1Phase = pos.x.mul(uWaveFreq).add(pos.y.mul(1.5)).add(t.mul(uWaveSpd));
-    const w1x = sin(wave1Phase).mul(uWaveAmp);
-    const w1y = cos(wave1Phase.mul(0.7)).mul(uWaveAmp.mul(0.8));
-    const w1z = sin(wave1Phase.mul(0.5).add(1.0)).mul(uWaveAmp.mul(0.6));
+      // Ambient waves (unchanged from Task 7)
+      const wave1Phase = pos.x.mul(uWaveFreq).add(pos.y.mul(1.5)).add(t.mul(uWaveSpd));
+      const w1x = sin(wave1Phase).mul(uWaveAmp);
+      const w1y = cos(wave1Phase.mul(0.7)).mul(uWaveAmp.mul(0.8));
+      const w1z = sin(wave1Phase.mul(0.5).add(1.0)).mul(uWaveAmp.mul(0.6));
+      const wave2Phase = pos.y.mul(uWave2Freq).add(pos.z.mul(2.0)).add(t.mul(uWave2Spd));
+      const w2x = cos(wave2Phase).mul(uWave2Amp.mul(0.5));
+      const w2y = sin(wave2Phase).mul(uWave2Amp);
+      const w2z = cos(wave2Phase.mul(1.3)).mul(uWave2Amp.mul(0.7));
+      const dx = sin(t.mul(0.13).add(seedX.mul(7.0))).mul(uMicroDrift);
+      const dy = cos(t.mul(0.11).add(seedY.mul(5.0))).mul(uMicroDrift);
 
-    const wave2Phase = pos.y.mul(uWave2Freq).add(pos.z.mul(2.0)).add(t.mul(uWave2Spd));
-    const w2x = cos(wave2Phase).mul(uWave2Amp.mul(0.5));
-    const w2y = sin(wave2Phase).mul(uWave2Amp);
-    const w2z = cos(wave2Phase.mul(1.3)).mul(uWave2Amp.mul(0.7));
-
-    const dx = sin(t.mul(0.13).add(seedX.mul(7.0))).mul(uMicroDrift);
-    const dy = cos(t.mul(0.11).add(seedY.mul(5.0))).mul(uMicroDrift);
-
-    return pos.add(vec3(
-      w1x.add(w2x).add(dx),
-      w1y.add(w2y).add(dy),
-      w1z.add(w2z),
-    ));
-  })();
+      return pos.add(vec3(
+        w1x.add(w2x).add(dx),
+        w1y.add(w2y).add(dy),
+        w1z.add(w2z),
+      ));
+    })();
+    return m;
+  }
 
   const meshes = [];
   for (let i = 0; i < builds.length; i++) {
@@ -222,7 +231,7 @@ async function init() {
     g.setAttribute('aSeed',    new THREE.BufferAttribute(b.seeds, 4));
     g.setAttribute('aEdge',    new THREE.BufferAttribute(b.edgeDist, 1));
     g.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 0), 100);
-    const m = new THREE.Points(g, mat);
+    const m = new THREE.Points(g, makeMaterial(uPaintingGusts[i]));
     m.position.x = paintingXs[i];
     scene.add(m);
     meshes.push(m);
