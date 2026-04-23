@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { attribute, uniform, texture, vec2, vec3, vec4, float, Fn, sin, cos, mix, smoothstep, clamp, uv } from 'three/tsl';
+import { attribute, uniform, texture, vec2, vec3, vec4, float, Fn, sin, cos, mix, smoothstep, clamp, uv, pointUV } from 'three/tsl';
 import GUI from 'https://cdn.jsdelivr.net/npm/lil-gui@0.20/+esm';
 
 const canvas = document.getElementById('c');
@@ -335,8 +335,8 @@ async function init() {
 
     const col = mix(colInterp, uDustColor, dustEnv.mul(uDustMix));
 
-    // Soft radial alpha from disc texture — uv() of a point is the point-sprite UV (0..1).
-    const discAlpha = texture(softDisc, uv()).w;
+    // Soft radial alpha from disc texture — pointUV is the point-sprite UV (0..1 across the quad).
+    const discAlpha = texture(softDisc, pointUV).w;
 
     return vec4(col, uOpacity.mul(discAlpha));
   })();
