@@ -16,7 +16,7 @@ renderer.toneMappingExposure = 1.2;
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.01, 100);
-camera.position.set(0, 0, 5.5);
+camera.position.set(0, 0, 8.0);
 
 const controls = new OrbitControls(camera, canvas);
 controls.enableDamping = true;
@@ -42,7 +42,7 @@ const params = {
   microDrift: 0.0015,
   particleSize: 2.0,
   alphaDip: 0.2,
-  cameraZ: 5.5,
+  cameraZ: 8.0,
   // Flow-field transition knobs (Anadol-style)
   curlAmp: 0.28,
   curlFreq: 1.8,
