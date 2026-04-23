@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { attribute, uniform, texture, vec2, vec3, vec4, float, Fn, sin, cos } from 'three/tsl';
+import { attribute, uniform, texture, vec2, vec3, vec4, float, Fn, sin, cos, mix, smoothstep } from 'three/tsl';
+import GUI from 'https://cdn.jsdelivr.net/npm/lil-gui@0.20/+esm';
 
 const canvas = document.getElementById('c');
 const info = document.getElementById('info');
@@ -188,6 +189,8 @@ async function init() {
 
   // Uniforms. Only from-index is wired up in this task.
   const uFromIdx      = uniform(0.0);
+  const uToIdx        = uniform(1.0);
+  const uT            = uniform(0.0);
   const uSize         = uniform(params.splatScale);
   const uAtlasW       = uniform(PARTICLES_PER_ROW);                        // 1024
   const uAtlasH       = uniform(NUM_PAINTINGS * ROWS_PER_PAINTING);        // 7038
@@ -225,8 +228,14 @@ async function init() {
     const t = uTime;
 
     const uvFrom = atlasUV(uFromIdx, idx);
+    const uvTo   = atlasUV(uToIdx,   idx);
     const posFrom = texture(posTex, uvFrom).xy;
-    const pos = vec3(posFrom.x, posFrom.y, float(0.0));
+    const posTo   = texture(posTex, uvTo).xy;
+
+    // Ease the lerp so ends are calm, middle is fastest
+    const tEased = smoothstep(float(0.0), float(1.0), uT);
+    const posXY = mix(posFrom, posTo, tEased);
+    const pos = vec3(posXY.x, posXY.y, float(0.0));
 
     const wave1Phase = pos.x.mul(uWaveFreq).add(pos.y.mul(1.5)).add(t.mul(uWaveSpd));
     const w1x = sin(wave1Phase).mul(uWaveAmp);
@@ -251,8 +260,11 @@ async function init() {
   material.colorNode = Fn(() => {
     const idx = attribute('aIndex');
     const uvFrom = atlasUV(uFromIdx, idx);
+    const uvTo   = atlasUV(uToIdx,   idx);
     const colFrom = texture(colTex, uvFrom).xyz;
-    return vec4(colFrom, 1.0);
+    const colTo   = texture(colTex, uvTo).xyz;
+    const col = mix(colFrom, colTo, uT);
+    return vec4(col, 1.0);
   })();
 
   material.sizeNode = uSize;
@@ -261,8 +273,12 @@ async function init() {
   const points = new THREE.Points(geometry, material);
   scene.add(points);
 
-  // Debug handle for manually changing the rendered painting (removed in Task 6).
-  window.__u = { uFromIdx };
+  // Debug GUI — removed in Task 10 when the real state machine takes over.
+  const debugParams = { fromIdx: 0, toIdx: 1, t: 0 };
+  const gui = new GUI({ title: 'pointcloud-v5 (debug)' });
+  gui.add(debugParams, 'fromIdx', 0, NUM_PAINTINGS - 1, 1).name('From').onChange(v => uFromIdx.value = v);
+  gui.add(debugParams, 'toIdx',   0, NUM_PAINTINGS - 1, 1).name('To').onChange(v => uToIdx.value = v);
+  gui.add(debugParams, 't', 0, 1, 0.001).name('t').onChange(v => uT.value = v);
 
   info.textContent = `${NUM_PAINTINGS} paintings · ${(PARTICLE_COUNT / 1e6).toFixed(2)}M particles · WebGPU`;
   renderer.setAnimationLoop(() => {
