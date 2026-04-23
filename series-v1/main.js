@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { attribute, vec3, vec4, float, Fn, sin, cos, uniform, smoothstep } from 'three/tsl';
+import { attribute, vec3, vec4, float, Fn, sin, cos, uniform, smoothstep, mix, pass } from 'three/tsl';
+import { afterImage } from 'three/addons/tsl/display/AfterImageNode.js';
 import GUI from 'https://cdn.jsdelivr.net/npm/lil-gui@0.20/+esm';
 
 const canvas = document.getElementById('c');
@@ -40,6 +41,12 @@ const params = {
   wave2Frequency: 3.5,
   microDrift: 0.0015,
   particleSize: 2.5,
+  // Flow-field transition knobs (Anadol-style)
+  curlAmp: 0.28,
+  curlFreq: 1.8,
+  curlSpeed: 0.4,
+  coreFlow: 0.3,
+  trailStrength: 0.88,
 };
 
 const uTime     = uniform(0.0);
@@ -55,6 +62,11 @@ const uSize = uniform(params.particleSize);
 const uWindDir  = uniform(0.0);   // +1 / -1 while transitioning
 const uWindGust = uniform(0.0);   // 0..1 envelope over transition
 const uStride   = uniform(1.0);   // set from avgW + gap inside init()
+const uCurlAmp   = uniform(params.curlAmp);
+const uCurlFreq  = uniform(params.curlFreq);
+const uCurlSpeed = uniform(params.curlSpeed);
+const uCoreFlow  = uniform(params.coreFlow);       // 0 = edges only, 1 = whole painting
+const uTrailStrength = uniform(params.trailStrength);
 let uPaintingGusts = [];
 
 function loadImage(src) {
@@ -193,8 +205,13 @@ async function init() {
       blending: THREE.NormalBlending,
       depthWrite: true,
     });
-    const computeDetach = (edge) =>
-      float(1.0).sub(smoothstep(float(0.0), float(0.6), edge)).mul(uWindGust).mul(uPaintingGust);
+    // Edge weight: 1 at silhouette, 0 at core. With uCoreFlow > 0, the core still
+    // participates at a reduced weight so the whole painting breathes into the storm.
+    const computeDetach = (edge) => {
+      const edgeWeight = float(1.0).sub(smoothstep(float(0.0), float(0.6), edge));
+      const combined = mix(uCoreFlow, float(1.0), edgeWeight);
+      return combined.mul(uWindGust).mul(uPaintingGust);
+    };
 
     m.colorNode = Fn(() => {
       const col = attribute('aColor');
@@ -232,10 +249,19 @@ async function init() {
       const windY = sin(tw.add(seedX.mul(3.0))).mul(detach).mul(0.1);
       const windZ = cos(tw.mul(0.7).add(seedX.add(seedY).mul(2.0))).mul(detach).mul(0.08);
 
+      // Pseudo-curl noise: three lobes with swapped axes → divergence-free-ish tumble.
+      // Sampled at world position so neighboring particles swirl coherently.
+      const cf = uCurlFreq;
+      const ct = time.mul(uCurlSpeed);
+      const curlX = sin(pos.y.mul(cf).add(ct)).mul(cos(pos.z.mul(cf).add(ct.mul(1.3))));
+      const curlY = sin(pos.z.mul(cf).add(ct.mul(1.7))).mul(cos(pos.x.mul(cf).add(ct)));
+      const curlZ = sin(pos.x.mul(cf).add(ct.mul(0.7))).mul(cos(pos.y.mul(cf).add(ct.mul(1.3))));
+      const curlMag = uCurlAmp.mul(detach);
+
       return pos.add(vec3(
-        w1x.add(w2x).add(dx).add(windX),
-        w1y.add(w2y).add(dy).add(windY),
-        w1z.add(w2z).add(windZ),
+        w1x.add(w2x).add(dx).add(windX).add(curlX.mul(curlMag)),
+        w1y.add(w2y).add(dy).add(windY).add(curlY.mul(curlMag)),
+        w1z.add(w2z).add(windZ).add(curlZ.mul(curlMag)),
       ));
     })();
     return m;
@@ -260,6 +286,12 @@ async function init() {
 
   camera.position.x = paintingXs[0];
   controls.target.x = paintingXs[0];
+
+  // Post-processing: afterimage feedback for flowing streak trails
+  const postProcessing = new THREE.PostProcessing(renderer);
+  const scenePass = pass(scene, camera);
+  const sceneColor = scenePass.getTextureNode('output');
+  postProcessing.outputNode = afterImage(sceneColor, uTrailStrength);
 
   const TRANSITION_DURATION_ref = { value: 2.5 };  // seconds (mutable for GUI later)
   let currentIndex = 0;
@@ -310,6 +342,13 @@ async function init() {
   fT.add(transitionParams, 'duration', 0.5, 8, 0.1).name('Duration (s)').onChange(v => TRANSITION_DURATION_ref.value = v);
   fT.add(transitionParams, 'stride', 1, 8, 0.1).name('Stride').onChange(v => uStride.value = v);
 
+  const fF = gui.addFolder('Flow');
+  fF.add(params, 'curlAmp', 0, 1.5, 0.01).name('Curl Amp').onChange(v => uCurlAmp.value = v);
+  fF.add(params, 'curlFreq', 0.1, 8, 0.1).name('Curl Freq').onChange(v => uCurlFreq.value = v);
+  fF.add(params, 'curlSpeed', 0, 2, 0.05).name('Curl Speed').onChange(v => uCurlSpeed.value = v);
+  fF.add(params, 'coreFlow', 0, 1, 0.02).name('Core Flow').onChange(v => uCoreFlow.value = v);
+  fF.add(params, 'trailStrength', 0, 0.98, 0.01).name('Trails').onChange(v => uTrailStrength.value = v);
+
   const actions = {
     next: () => snapTo(currentIndex + 1),
     prev: () => snapTo(currentIndex - 1),
@@ -337,7 +376,7 @@ async function init() {
       }
     }
     controls.update();
-    renderer.render(scene, camera);
+    postProcessing.render();
   });
 }
 
