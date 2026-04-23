@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { attribute, vec4, float, Fn } from 'three/tsl';
 
 const canvas = document.getElementById('c');
 const info = document.getElementById('info');
@@ -101,7 +102,52 @@ function buildPaintingParticles(pixels, count) {
 
 async function init() {
   await renderer.init();
-  info.textContent = 'Ribbon ready (empty) · WebGPU';
+
+  info.textContent = `Loading ${PAINTINGS.length} paintings...`;
+  const images = await Promise.all(PAINTINGS.map(loadImage));
+  const pixels = images.map(img => getPixels(img));
+  const builds = pixels.map(px => buildPaintingParticles(px, PARTICLES_PER_PAINTING));
+
+  const GAP_FACTOR = 0.6;
+  const avgW = builds.reduce((s, b) => s + b.worldW, 0) / builds.length;
+  const gap = avgW * GAP_FACTOR;
+  let runningX = 0;
+  const paintingXs = [];
+  for (let i = 0; i < builds.length; i++) {
+    const halfW = builds[i].worldW / 2;
+    if (i > 0) runningX += builds[i - 1].worldW / 2 + gap + halfW;
+    paintingXs.push(runningX);
+  }
+
+  const mat = new THREE.PointsNodeMaterial({
+    transparent: true,
+    blending: THREE.NormalBlending,
+    depthWrite: true,
+  });
+  mat.colorNode = Fn(() => vec4(attribute('aColor'), 1.0))();
+  mat.sizeNode = float(2.5);
+  mat.sizeAttenuation = true;
+
+  const meshes = [];
+  for (let i = 0; i < builds.length; i++) {
+    const b = builds[i];
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(b.positions, 3));
+    g.setAttribute('aColor',   new THREE.BufferAttribute(b.colors, 3));
+    g.setAttribute('aSeed',    new THREE.BufferAttribute(b.seeds, 4));
+    g.setAttribute('aEdge',    new THREE.BufferAttribute(b.edgeDist, 1));
+    g.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 0), 100);
+    const m = new THREE.Points(g, mat);
+    m.position.x = paintingXs[i];
+    scene.add(m);
+    meshes.push(m);
+  }
+
+  info.textContent = `${PAINTINGS.length} paintings · ${((PARTICLES_PER_PAINTING*PAINTINGS.length)/1e6).toFixed(2)}M · WebGPU`;
+
+  camera.position.x = paintingXs[0];
+  controls.target.x = paintingXs[0];
+
   renderer.setAnimationLoop(() => {
     controls.update();
     renderer.render(scene, camera);
