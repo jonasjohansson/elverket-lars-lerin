@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { attribute, uniform, texture, vec2, vec3, vec4, float, Fn } from 'three/tsl';
+import { attribute, uniform, texture, vec2, vec3, vec4, float, Fn, sin, cos } from 'three/tsl';
 
 const canvas = document.getElementById('c');
 const info = document.getElementById('info');
@@ -31,6 +31,19 @@ const ROWS_PER_PAINTING = Math.ceil(PARTICLE_COUNT / PARTICLES_PER_ROW);
 const PAINTING_IDS = ['0012', '0013', '0018', '0020', '0022', '0029', '0031', '0032', '0038'];
 const PAINTINGS = PAINTING_IDS.map(n => `../shared/images/series-1/17_RESAN_OCH_ORIENTEN_LL_${n}-trim.png`);
 const NUM_PAINTINGS = PAINTINGS.length;
+
+const params = {
+  splatScale: 5.0,
+  opacity: 0.9,
+  bgColor: '#000000',
+  waveAmplitude: 0.015,
+  waveSpeed: 0.25,
+  waveFrequency: 2.0,
+  wave2Amplitude: 0.008,
+  wave2Speed: 0.18,
+  wave2Frequency: 3.5,
+  microDrift: 0.0015,
+};
 
 function loadImage(src) {
   return new Promise((resolve, reject) => {
@@ -175,10 +188,18 @@ async function init() {
 
   // Uniforms. Only from-index is wired up in this task.
   const uFromIdx      = uniform(0.0);
-  const uSize         = uniform(5.0);
+  const uSize         = uniform(params.splatScale);
   const uAtlasW       = uniform(PARTICLES_PER_ROW);                        // 1024
   const uAtlasH       = uniform(NUM_PAINTINGS * ROWS_PER_PAINTING);        // 7038
   const uRowsPerPaint = uniform(ROWS_PER_PAINTING);                        // 782
+  const uTime         = uniform(0.0);
+  const uWaveAmp      = uniform(params.waveAmplitude);
+  const uWaveSpd      = uniform(params.waveSpeed);
+  const uWaveFreq     = uniform(params.waveFrequency);
+  const uWave2Amp     = uniform(params.wave2Amplitude);
+  const uWave2Spd     = uniform(params.wave2Speed);
+  const uWave2Freq    = uniform(params.wave2Frequency);
+  const uMicroDrift   = uniform(params.microDrift);
 
   // Returns vec2 uv into the 1024-wide atlas for (paintingIdx, particleIdx).
   // x = particleIdx % ATLAS_W
@@ -198,10 +219,33 @@ async function init() {
   });
 
   material.positionNode = Fn(() => {
-    const idx = attribute('aIndex');
+    const idx  = attribute('aIndex');
+    const seed = attribute('aSeed');
+    const seedX = seed.x, seedY = seed.y;
+    const t = uTime;
+
     const uvFrom = atlasUV(uFromIdx, idx);
     const posFrom = texture(posTex, uvFrom).xy;
-    return vec3(posFrom.x, posFrom.y, float(0.0));
+    const pos = vec3(posFrom.x, posFrom.y, float(0.0));
+
+    const wave1Phase = pos.x.mul(uWaveFreq).add(pos.y.mul(1.5)).add(t.mul(uWaveSpd));
+    const w1x = sin(wave1Phase).mul(uWaveAmp);
+    const w1y = cos(wave1Phase.mul(0.7)).mul(uWaveAmp.mul(0.8));
+    const w1z = sin(wave1Phase.mul(0.5).add(1.0)).mul(uWaveAmp.mul(0.6));
+
+    const wave2Phase = pos.y.mul(uWave2Freq).add(pos.z.mul(2.0)).add(t.mul(uWave2Spd));
+    const w2x = cos(wave2Phase).mul(uWave2Amp.mul(0.5));
+    const w2y = sin(wave2Phase).mul(uWave2Amp);
+    const w2z = cos(wave2Phase.mul(1.3)).mul(uWave2Amp.mul(0.7));
+
+    const dx = sin(t.mul(0.13).add(seedX.mul(7.0))).mul(uMicroDrift);
+    const dy = cos(t.mul(0.11).add(seedY.mul(5.0))).mul(uMicroDrift);
+
+    return pos.add(vec3(
+      w1x.add(w2x).add(dx),
+      w1y.add(w2y).add(dy),
+      w1z.add(w2z),
+    ));
   })();
 
   material.colorNode = Fn(() => {
@@ -222,6 +266,7 @@ async function init() {
 
   info.textContent = `${NUM_PAINTINGS} paintings · ${(PARTICLE_COUNT / 1e6).toFixed(2)}M particles · WebGPU`;
   renderer.setAnimationLoop(() => {
+    uTime.value = performance.now() / 1000;
     controls.update();
     renderer.render(scene, camera);
   });
