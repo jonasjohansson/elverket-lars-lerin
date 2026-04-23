@@ -148,6 +148,7 @@ async function init() {
   const uChaosAmp = uniform(0.18);
   const uDarken = uniform(0.7);
   const uOpacity = uniform(0.9);
+  const uShrink = uniform(0.85);
 
   // Clustered death moment dM ∈ [0,1] from position — neighbors share similar dM.
   const dieMoment = (posXY, delay) => {
@@ -220,7 +221,15 @@ async function init() {
     return vec4(litCol.x, litCol.y, litCol.z, alpha);
   })();
 
-  material.sizeNode = uSize;
+  material.sizeNode = Fn(() => {
+    const pA = attribute('aPosA');
+    const seed = attribute('aSeed');
+    const delay = seed.z;
+    const d = dieProgress(pA, delay);
+    const crumble = float(1.0).sub(smoothstep(0.0, 1.0, d.sub(0.5).abs().mul(2.0)));
+    const shrink = float(1.0).sub(crumble.mul(uShrink));
+    return uSize.mul(seed.w).mul(shrink);
+  })();
   material.sizeAttenuation = true;
 
   const points = new THREE.Points(geometry, material);
