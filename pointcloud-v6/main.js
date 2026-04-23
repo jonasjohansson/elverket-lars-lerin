@@ -142,6 +142,10 @@ async function init() {
   const uPhase = uniform(0.0);
   const uPatchScale = uniform(3.0);
   const uFadeWindow = uniform(0.08);
+  const uTime = uniform(0.0);
+  const uDispersalAmp = uniform(0.35);
+  const uGravity = uniform(0.25);
+  const uChaosAmp = uniform(0.18);
 
   // Clustered death moment dM ∈ [0,1] from position — neighbors share similar dM.
   const dieMoment = (posXY, delay) => {
@@ -170,10 +174,30 @@ async function init() {
     const z  = attribute('aZ');
     const seed = attribute('aSeed');
     const delay = seed.z;
-    // Patch is anchored in A-space so clusters are stable.
+
     const d = dieProgress(pA, delay);
     const xy = mix(pA, pB, d);
-    return vec3(xy.x, xy.y, z);
+
+    // crumble peaks at d=0.5, zero at both ends
+    const crumble = float(1.0).sub(smoothstep(0.0, 1.0, d.sub(0.5).abs().mul(2.0)));
+
+    // per-particle dispersion direction
+    const dirX = seed.x.mul(1.2).add(sin(seed.y.mul(9.0)).mul(0.4));
+    const dirY = seed.y.mul(0.4).sub(float(0.35));
+    const dirZ = cos(seed.x.mul(7.0).add(seed.y.mul(5.0))).mul(0.6).add(seed.y.mul(0.3));
+    const disp = uDispersalAmp.mul(crumble);
+
+    // chaos: turbulent jitter during crumble
+    const t = uTime;
+    const chX = sin(t.mul(1.4).add(seed.x.mul(7.0))).mul(uChaosAmp).mul(crumble);
+    const chY = cos(t.mul(1.1).add(seed.y.mul(6.0))).mul(uChaosAmp.mul(0.7)).mul(crumble);
+    const chZ = sin(t.mul(0.9).add(seed.x.add(seed.y).mul(5.0))).mul(uChaosAmp.mul(0.5)).mul(crumble);
+
+    const dx = dirX.mul(disp).add(chX);
+    const dy = dirY.mul(disp).sub(crumble.mul(uGravity)).add(chY);
+    const dz = dirZ.mul(disp).add(chZ);
+
+    return vec3(xy.x.add(dx), xy.y.add(dy), z.add(dz));
   })();
 
   material.colorNode = Fn(() => {
@@ -197,7 +221,10 @@ async function init() {
 
   window.__u = { uPhase, uPatchScale, uFadeWindow };
 
+  const clock = new THREE.Clock();
   renderer.setAnimationLoop(() => {
+    const t = clock.getElapsedTime();
+    uTime.value = t;
     controls.update();
     renderer.render(scene, camera);
   });
