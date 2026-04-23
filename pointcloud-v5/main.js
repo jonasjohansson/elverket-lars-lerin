@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { attribute, uniform, texture, vec2, vec3, vec4, float, Fn } from 'three/tsl';
 
 const canvas = document.getElementById('c');
 const info = document.getElementById('info');
@@ -152,6 +153,72 @@ async function init() {
   const samples = pixels.map(px => samplePainting(px, PARTICLE_COUNT));
   const { posTex, colTex } = packAddressTextures(samples);
   console.log(`packed: ${posTex.image.width}×${posTex.image.height} atlas · ${PARTICLES_PER_ROW}/row · ${ROWS_PER_PAINTING}rows/painting × ${NUM_PAINTINGS}`);
+
+  // Geometry: one vertex per particle. position attr is a placeholder (zeroes);
+  // real position is fetched from posTex in the vertex node.
+  const positions = new Float32Array(PARTICLE_COUNT * 3);
+  const indices = new Float32Array(PARTICLE_COUNT);
+  const seeds = new Float32Array(PARTICLE_COUNT * 4);
+  for (let i = 0; i < PARTICLE_COUNT; i++) {
+    indices[i] = i;
+    seeds[i * 4]     = (Math.random() - 0.5) * 2;
+    seeds[i * 4 + 1] = (Math.random() - 0.5) * 2;
+    seeds[i * 4 + 2] = Math.random();              // delay 0..1
+    seeds[i * 4 + 3] = 0.3 + Math.random() * 0.7;  // size jitter
+  }
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute('aIndex',   new THREE.BufferAttribute(indices, 1));
+  geometry.setAttribute('aSeed',    new THREE.BufferAttribute(seeds, 4));
+  geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 0), 100);
+
+  // Uniforms. Only from-index is wired up in this task.
+  const uFromIdx      = uniform(0.0);
+  const uSize         = uniform(5.0);
+  const uAtlasW       = uniform(PARTICLES_PER_ROW);                        // 1024
+  const uAtlasH       = uniform(NUM_PAINTINGS * ROWS_PER_PAINTING);        // 7038
+  const uRowsPerPaint = uniform(ROWS_PER_PAINTING);                        // 782
+
+  // Returns vec2 uv into the 1024-wide atlas for (paintingIdx, particleIdx).
+  // x = particleIdx % ATLAS_W
+  // y = paintingIdx * ROWS_PER_PAINTING + floor(particleIdx / ATLAS_W)
+  // uv = ((x + 0.5) / ATLAS_W, (y + 0.5) / ATLAS_H)
+  function atlasUV(paintingIdx, particleIdx) {
+    const row = particleIdx.div(uAtlasW).floor();
+    const col = particleIdx.sub(row.mul(uAtlasW));      // = particleIdx mod ATLAS_W
+    const y   = paintingIdx.mul(uRowsPerPaint).add(row);
+    return vec2(col.add(0.5).div(uAtlasW), y.add(0.5).div(uAtlasH));
+  }
+
+  const material = new THREE.PointsNodeMaterial({
+    transparent: true,
+    blending: THREE.NormalBlending,
+    depthWrite: false,
+  });
+
+  material.positionNode = Fn(() => {
+    const idx = attribute('aIndex');
+    const uvFrom = atlasUV(uFromIdx, idx);
+    const posFrom = texture(posTex, uvFrom).xy;
+    return vec3(posFrom.x, posFrom.y, float(0.0));
+  })();
+
+  material.colorNode = Fn(() => {
+    const idx = attribute('aIndex');
+    const uvFrom = atlasUV(uFromIdx, idx);
+    const colFrom = texture(colTex, uvFrom).xyz;
+    return vec4(colFrom, 1.0);
+  })();
+
+  material.sizeNode = uSize;
+  material.sizeAttenuation = true;
+
+  const points = new THREE.Points(geometry, material);
+  scene.add(points);
+
+  // Debug handle for manually changing the rendered painting (removed in Task 6).
+  window.__u = { uFromIdx };
 
   info.textContent = `${NUM_PAINTINGS} paintings · ${(PARTICLE_COUNT / 1e6).toFixed(2)}M particles · WebGPU`;
   renderer.setAnimationLoop(() => {
