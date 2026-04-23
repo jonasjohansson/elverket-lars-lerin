@@ -24,6 +24,7 @@ controls.target.set(0, 0, -0.3);
 const PARTICLES_PER_PAINTING = 250_000;
 const PAINTING_HEIGHT = 2.0;
 const ALPHA_THRESHOLD = 0.5 * 255;
+const EDGE_BAND_PX = 40;
 
 const PAINTINGS = [
   '0012', '0013', '0018', '0020', '0022', '0029', '0031', '0032', '0038',
@@ -70,6 +71,40 @@ function getPixels(img, maxW = 1600) {
   return ctx.getImageData(0, 0, w, h);
 }
 
+// Chamfer distance transform on alpha. Returns Float32Array length iw*ih:
+// 0 at transparent pixels, larger = deeper inside. Not true Euclidean; close enough.
+function alphaDistanceField(pixels) {
+  const { data, width: iw, height: ih } = pixels;
+  const INF = 1e9;
+  const d = new Float32Array(iw * ih);
+  for (let i = 0; i < d.length; i++) {
+    d[i] = data[i * 4 + 3] > ALPHA_THRESHOLD ? INF : 0;
+  }
+  // Forward pass
+  for (let y = 0; y < ih; y++) {
+    for (let x = 0; x < iw; x++) {
+      const i = y * iw + x;
+      if (d[i] === 0) continue;
+      if (x > 0)             d[i] = Math.min(d[i], d[i - 1] + 1);
+      if (y > 0)             d[i] = Math.min(d[i], d[i - iw] + 1);
+      if (x > 0 && y > 0)    d[i] = Math.min(d[i], d[i - iw - 1] + 1.41421);
+      if (x < iw - 1 && y>0) d[i] = Math.min(d[i], d[i - iw + 1] + 1.41421);
+    }
+  }
+  // Backward pass
+  for (let y = ih - 1; y >= 0; y--) {
+    for (let x = iw - 1; x >= 0; x--) {
+      const i = y * iw + x;
+      if (d[i] === 0) continue;
+      if (x < iw - 1)             d[i] = Math.min(d[i], d[i + 1] + 1);
+      if (y < ih - 1)             d[i] = Math.min(d[i], d[i + iw] + 1);
+      if (x < iw-1 && y < ih-1)   d[i] = Math.min(d[i], d[i + iw + 1] + 1.41421);
+      if (x > 0 && y < ih - 1)    d[i] = Math.min(d[i], d[i + iw - 1] + 1.41421);
+    }
+  }
+  return d;
+}
+
 // Build per-painting particle arrays. Returns { positions, colors, seeds, edgeDist, worldW, worldH }.
 // worldW/worldH are world-space dimensions of the painting (aspect-preserved, height = PAINTING_HEIGHT).
 function buildPaintingParticles(pixels, count) {
@@ -77,6 +112,8 @@ function buildPaintingParticles(pixels, count) {
   const aspect = iw / ih;
   const worldH = PAINTING_HEIGHT;
   const worldW = worldH * aspect;
+
+  const dist = alphaDistanceField(pixels);
 
   // Collect all opaque pixel indices first (for uniform sampling)
   const opaque = [];
@@ -91,8 +128,7 @@ function buildPaintingParticles(pixels, count) {
   const positions = new Float32Array(count * 3);
   const colors = new Float32Array(count * 3);
   const seeds = new Float32Array(count * 4);
-  // edgeDist computed in a later task; fill with 1.0 (all "interior") for now
-  const edgeDist = new Float32Array(count).fill(1.0);
+  const edgeDist = new Float32Array(count);
 
   for (let p = 0; p < count; p++) {
     const pixelIdx = opaque[Math.floor(Math.random() * opaque.length)];
@@ -116,6 +152,8 @@ function buildPaintingParticles(pixels, count) {
     seeds[p * 4 + 1] = (Math.random() - 0.5) * 2;
     seeds[p * 4 + 2] = Math.random();
     seeds[p * 4 + 3] = 0.3 + Math.random() * 0.7;
+
+    edgeDist[p] = Math.min(1.0, dist[pixelIdx] / EDGE_BAND_PX);
   }
 
   return { positions, colors, seeds, edgeDist, worldW, worldH };
