@@ -192,10 +192,12 @@ async function init() {
       blending: THREE.NormalBlending,
       depthWrite: true,
     });
+    const computeDetach = (edge) =>
+      float(1.0).sub(smoothstep(float(0.0), float(0.6), edge)).mul(uWindGust).mul(uPaintingGust);
+
     m.colorNode = Fn(() => {
       const col = attribute('aColor');
-      const edge = attribute('aEdge');
-      const detach = float(1.0).sub(smoothstep(float(0.0), float(0.6), edge)).mul(uWindGust).mul(uPaintingGust);
+      const detach = computeDetach(attribute('aEdge'));
       const alpha = float(1.0).sub(detach.mul(0.3));
       return vec4(col, alpha);
     })();
@@ -205,28 +207,27 @@ async function init() {
       const pos = attribute('position');
       const seed = attribute('aSeed');
       const seedX = seed.x, seedY = seed.y;
-      const t = uTime;
+      const time = uTime;
 
       // Ambient waves (unchanged from Task 7)
-      const wave1Phase = pos.x.mul(uWaveFreq).add(pos.y.mul(1.5)).add(t.mul(uWaveSpd));
+      const wave1Phase = pos.x.mul(uWaveFreq).add(pos.y.mul(1.5)).add(time.mul(uWaveSpd));
       const w1x = sin(wave1Phase).mul(uWaveAmp);
       const w1y = cos(wave1Phase.mul(0.7)).mul(uWaveAmp.mul(0.8));
       const w1z = sin(wave1Phase.mul(0.5).add(1.0)).mul(uWaveAmp.mul(0.6));
-      const wave2Phase = pos.y.mul(uWave2Freq).add(pos.z.mul(2.0)).add(t.mul(uWave2Spd));
+      const wave2Phase = pos.y.mul(uWave2Freq).add(pos.z.mul(2.0)).add(time.mul(uWave2Spd));
       const w2x = cos(wave2Phase).mul(uWave2Amp.mul(0.5));
       const w2y = sin(wave2Phase).mul(uWave2Amp);
       const w2z = cos(wave2Phase.mul(1.3)).mul(uWave2Amp.mul(0.7));
-      const dx = sin(t.mul(0.13).add(seedX.mul(7.0))).mul(uMicroDrift);
-      const dy = cos(t.mul(0.11).add(seedY.mul(5.0))).mul(uMicroDrift);
+      const dx = sin(time.mul(0.13).add(seedX.mul(7.0))).mul(uMicroDrift);
+      const dy = cos(time.mul(0.11).add(seedY.mul(5.0))).mul(uMicroDrift);
 
-      const edge = attribute('aEdge');
-      const detach = float(1.0).sub(smoothstep(float(0.0), float(0.6), edge)).mul(uWindGust).mul(uPaintingGust);
+      const detach = computeDetach(attribute('aEdge'));
 
       // Wind X: outgoing/incoming both drift in +windDir. Travel amplitude = half a stride at peak gust.
       const windX = uWindDir.mul(uStride).mul(detach).mul(0.5);
 
       // Cross-wind Y and swirl Z from v2's transition scatter pattern
-      const tw = t.mul(0.25);
+      const tw = time.mul(0.25);
       const windY = sin(tw.add(seedX.mul(3.0))).mul(detach).mul(0.1);
       const windZ = cos(tw.mul(0.7).add(seedX.add(seedY).mul(2.0))).mul(detach).mul(0.08);
 
@@ -292,15 +293,15 @@ async function init() {
   renderer.setAnimationLoop(() => {
     uTime.value = performance.now() / 1000;
     if (transitioning) {
-      const t = Math.min(1, (performance.now() - transitionStart) / (TRANSITION_DURATION_ref.value * 1000));
-      uWindGust.value = Math.sin(t * Math.PI); // 0 → 1 → 0 over the transition
-      const e = easeInOut(t);
+      const progress = Math.min(1, (performance.now() - transitionStart) / (TRANSITION_DURATION_ref.value * 1000));
+      uWindGust.value = Math.sin(progress * Math.PI); // 0 → 1 → 0 over the transition
+      const eased = easeInOut(progress);
       const fromX = paintingXs[currentIndex];
       const toX = paintingXs[targetIndex];
-      const x = fromX + (toX - fromX) * e;
+      const x = fromX + (toX - fromX) * eased;
       camera.position.x = x;
       controls.target.x = x;
-      if (t >= 1) {
+      if (progress >= 1) {
         uWindGust.value = 0;
         uPaintingGusts[currentIndex].value = 0;
         uPaintingGusts[targetIndex].value = 0;
