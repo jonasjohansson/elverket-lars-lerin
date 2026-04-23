@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { attribute, uniform, texture, vec2, vec3, vec4, float, Fn, sin, cos, mix, smoothstep, clamp, uv, pointUV } from 'three/tsl';
+import { attribute, uniform, texture, vec2, vec3, vec4, float, Fn, sin, cos, mix, smoothstep, clamp } from 'three/tsl';
 import GUI from 'https://cdn.jsdelivr.net/npm/lil-gui@0.20/+esm';
 
 const canvas = document.getElementById('c');
@@ -34,7 +34,7 @@ const PAINTINGS = PAINTING_IDS.map(n => `../shared/images/series-1/17_RESAN_OCH_
 const NUM_PAINTINGS = PAINTINGS.length;
 
 const params = {
-  splatScale: 7.0,
+  splatScale: 5.0,
   opacity: 0.9,
   bgColor: '#000000',
   waveAmplitude: 0.015,
@@ -160,22 +160,6 @@ function packAddressTextures(samples) {
   return { posTex, colTex };
 }
 
-function makeSoftDiscTexture(size = 64) {
-  const c = document.createElement('canvas');
-  c.width = size; c.height = size;
-  const ctx = c.getContext('2d');
-  const g = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
-  g.addColorStop(0.0, 'rgba(255,255,255,1.0)');
-  g.addColorStop(0.4, 'rgba(255,255,255,0.55)');
-  g.addColorStop(0.8, 'rgba(255,255,255,0.08)');
-  g.addColorStop(1.0, 'rgba(255,255,255,0.0)');
-  ctx.fillStyle = g;
-  ctx.fillRect(0, 0, size, size);
-  const tex = new THREE.CanvasTexture(c);
-  tex.needsUpdate = true;
-  return tex;
-}
-
 async function init() {
   await renderer.init();
   info.textContent = `Loading ${NUM_PAINTINGS} paintings...`;
@@ -189,8 +173,6 @@ async function init() {
   const samples = pixels.map(px => samplePainting(px, PARTICLE_COUNT));
   const { posTex, colTex } = packAddressTextures(samples);
   console.log(`packed: ${posTex.image.width}×${posTex.image.height} atlas · ${PARTICLES_PER_ROW}/row · ${ROWS_PER_PAINTING}rows/painting × ${NUM_PAINTINGS}`);
-
-  const softDisc = makeSoftDiscTexture(64);
 
   // Geometry: one vertex per particle. position attr is a placeholder (zeroes);
   // real position is fetched from posTex in the vertex node.
@@ -216,7 +198,6 @@ async function init() {
   const uToIdx        = uniform(0.0);
   const uT            = uniform(0.0);
   const uSize         = uniform(params.splatScale);
-  const uOpacity      = uniform(params.opacity);
   const uAtlasW       = uniform(PARTICLES_PER_ROW);                        // 1024
   const uAtlasH       = uniform(NUM_PAINTINGS * ROWS_PER_PAINTING);        // 7038
   const uRowsPerPaint = uniform(ROWS_PER_PAINTING);                        // 782
@@ -334,11 +315,7 @@ async function init() {
     const dustEnv = sinT.mul(sinT).mul(sinT);
 
     const col = mix(colInterp, uDustColor, dustEnv.mul(uDustMix));
-
-    // Soft radial alpha from disc texture — pointUV is the point-sprite UV (0..1 across the quad).
-    const discAlpha = texture(softDisc, pointUV).w;
-
-    return vec4(col, uOpacity.mul(discAlpha));
+    return vec4(col, 1.0);
   })();
 
   material.sizeNode = uSize;
