@@ -23,7 +23,7 @@ controls.enableDamping = true;
 controls.enabled = false; // free-look toggled with Space later
 controls.target.set(0, 0, -0.3);
 
-const PARTICLES_PER_PAINTING = 250_000;
+const PARTICLES_PER_PAINTING = 500_000;
 const PAINTING_HEIGHT = 2.0;
 const ALPHA_THRESHOLD = 0.5 * 255;
 const EDGE_BAND_PX = 40;
@@ -40,13 +40,16 @@ const params = {
   wave2Speed: 0.18,
   wave2Frequency: 3.5,
   microDrift: 0.0015,
-  particleSize: 2.5,
+  particleSize: 3.0,
+  alphaDip: 0.2,
   // Flow-field transition knobs (Anadol-style)
   curlAmp: 0.28,
   curlFreq: 1.8,
   curlSpeed: 0.4,
   coreFlow: 0.3,
   trailStrength: 0.88,
+  chaosAmp: 0.18,
+  chaosSpeed: 0.6,
 };
 
 const uTime     = uniform(0.0);
@@ -67,6 +70,9 @@ const uCurlFreq  = uniform(params.curlFreq);
 const uCurlSpeed = uniform(params.curlSpeed);
 const uCoreFlow  = uniform(params.coreFlow);       // 0 = edges only, 1 = whole painting
 const uTrailStrength = uniform(params.trailStrength);
+const uChaosAmp   = uniform(params.chaosAmp);      // per-particle jitter on top of curl
+const uChaosSpeed = uniform(params.chaosSpeed);
+const uAlphaDip   = uniform(params.alphaDip);
 let uPaintingGusts = [];
 
 function loadImage(src) {
@@ -143,13 +149,23 @@ function buildPaintingParticles(pixels, count) {
   }
   if (opaque.length === 0) throw new Error('No opaque pixels in painting');
 
+  // Shuffle opaque indices so the first N particles cover N unique pixels.
+  // Particles past opaque.length re-sample randomly (extra density on top of full coverage).
+  const opaqueShuffled = opaque.slice();
+  for (let i = opaqueShuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [opaqueShuffled[i], opaqueShuffled[j]] = [opaqueShuffled[j], opaqueShuffled[i]];
+  }
+
   const positions = new Float32Array(count * 3);
   const colors = new Float32Array(count * 3);
   const seeds = new Float32Array(count * 4);
   const edgeDist = new Float32Array(count);
 
   for (let p = 0; p < count; p++) {
-    const pixelIdx = opaque[Math.floor(Math.random() * opaque.length)];
+    const pixelIdx = p < opaqueShuffled.length
+      ? opaqueShuffled[p]
+      : opaque[Math.floor(Math.random() * opaque.length)];
     const px = pixelIdx % iw;
     const py = Math.floor(pixelIdx / iw);
     const rgba = pixelIdx * 4;
@@ -216,7 +232,7 @@ async function init() {
     m.colorNode = Fn(() => {
       const col = attribute('aColor');
       const detach = computeDetach(attribute('aEdge'));
-      const alpha = float(1.0).sub(detach.mul(0.3));
+      const alpha = float(1.0).sub(detach.mul(uAlphaDip));
       return vec4(col, alpha);
     })();
     m.sizeNode = uSize;
@@ -258,10 +274,18 @@ async function init() {
       const curlZ = sin(pos.x.mul(cf).add(ct.mul(0.7))).mul(cos(pos.y.mul(cf).add(ct.mul(1.3))));
       const curlMag = uCurlAmp.mul(detach);
 
+      // Per-particle chaos: each particle has its own jitter trajectory based on its seed.
+      // Breaks the coherence of the curl field — neighboring particles take individual paths.
+      const chaosT = time.mul(uChaosSpeed);
+      const chaosX = sin(chaosT.mul(0.9).add(seedX.mul(11.0))).mul(cos(chaosT.mul(1.1).add(seedY.mul(7.0))));
+      const chaosY = cos(chaosT.mul(1.3).add(seedY.mul(9.0))).mul(sin(chaosT.mul(0.8).add(seedX.mul(8.0))));
+      const chaosZ = sin(chaosT.mul(0.7).add(seedX.add(seedY).mul(5.0)));
+      const chaosMag = uChaosAmp.mul(detach);
+
       return pos.add(vec3(
-        w1x.add(w2x).add(dx).add(windX).add(curlX.mul(curlMag)),
-        w1y.add(w2y).add(dy).add(windY).add(curlY.mul(curlMag)),
-        w1z.add(w2z).add(windZ).add(curlZ.mul(curlMag)),
+        w1x.add(w2x).add(dx).add(windX).add(curlX.mul(curlMag)).add(chaosX.mul(chaosMag)),
+        w1y.add(w2y).add(dy).add(windY).add(curlY.mul(curlMag)).add(chaosY.mul(chaosMag)),
+        w1z.add(w2z).add(windZ).add(curlZ.mul(curlMag)).add(chaosZ.mul(chaosMag)),
       ));
     })();
     return m;
@@ -293,7 +317,7 @@ async function init() {
   const sceneColor = scenePass.getTextureNode('output');
   postProcessing.outputNode = afterImage(sceneColor, uTrailStrength);
 
-  const TRANSITION_DURATION_ref = { value: 2.5 };  // seconds (mutable for GUI later)
+  const TRANSITION_DURATION_ref = { value: 8.0 };  // seconds (mutable for GUI later)
   let currentIndex = 0;
   let targetIndex = 0;
   let transitionStart = 0;
@@ -339,14 +363,17 @@ async function init() {
 
   const fT = gui.addFolder('Transition');
   const transitionParams = { duration: TRANSITION_DURATION_ref.value, stride: avgW + gap };
-  fT.add(transitionParams, 'duration', 0.5, 8, 0.1).name('Duration (s)').onChange(v => TRANSITION_DURATION_ref.value = v);
+  fT.add(transitionParams, 'duration', 0.5, 30, 0.1).name('Duration (s)').onChange(v => TRANSITION_DURATION_ref.value = v);
   fT.add(transitionParams, 'stride', 1, 8, 0.1).name('Stride').onChange(v => uStride.value = v);
+  fT.add(params, 'alphaDip', 0, 1, 0.01).name('Alpha Dip').onChange(v => uAlphaDip.value = v);
 
   const fF = gui.addFolder('Flow');
   fF.add(params, 'curlAmp', 0, 1.5, 0.01).name('Curl Amp').onChange(v => uCurlAmp.value = v);
   fF.add(params, 'curlFreq', 0.1, 8, 0.1).name('Curl Freq').onChange(v => uCurlFreq.value = v);
   fF.add(params, 'curlSpeed', 0, 2, 0.05).name('Curl Speed').onChange(v => uCurlSpeed.value = v);
   fF.add(params, 'coreFlow', 0, 1, 0.02).name('Core Flow').onChange(v => uCoreFlow.value = v);
+  fF.add(params, 'chaosAmp', 0, 1.0, 0.01).name('Chaos Amp').onChange(v => uChaosAmp.value = v);
+  fF.add(params, 'chaosSpeed', 0, 3, 0.05).name('Chaos Speed').onChange(v => uChaosSpeed.value = v);
   fF.add(params, 'trailStrength', 0, 0.98, 0.01).name('Trails').onChange(v => uTrailStrength.value = v);
 
   const actions = {
