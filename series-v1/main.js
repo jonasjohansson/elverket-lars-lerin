@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { attribute, vec3, vec4, float, Fn, sin, cos, uniform, smoothstep } from 'three/tsl';
+import GUI from 'https://cdn.jsdelivr.net/npm/lil-gui@0.20/+esm';
 
 const canvas = document.getElementById('c');
 const info = document.getElementById('info');
@@ -289,6 +290,32 @@ async function init() {
     }
     if (e.code === 'Space') { e.preventDefault(); controls.enabled = !controls.enabled; }
   });
+
+  const gui = new GUI({ title: 'Series Ribbon' });
+
+  const fR = gui.addFolder('Rendering');
+  fR.add(params, 'particleSize', 0.5, 8, 0.1).name('Particle Size').onChange(v => uSize.value = v);
+
+  const fW = gui.addFolder('Ambient');
+  fW.add(params, 'waveAmplitude', 0, 0.1, 0.002).name('Wave Amp').onChange(v => uWaveAmp.value = v);
+  fW.add(params, 'waveSpeed', 0, 1, 0.01).name('Wave Speed').onChange(v => uWaveSpd.value = v);
+  fW.add(params, 'waveFrequency', 0, 8, 0.1).name('Wave Freq').onChange(v => uWaveFreq.value = v);
+  fW.add(params, 'wave2Amplitude', 0, 0.05, 0.002).name('Wave 2 Amp').onChange(v => uWave2Amp.value = v);
+  fW.add(params, 'wave2Speed', 0, 1, 0.01).name('Wave 2 Speed').onChange(v => uWave2Spd.value = v);
+  fW.add(params, 'wave2Frequency', 0, 8, 0.1).name('Wave 2 Freq').onChange(v => uWave2Freq.value = v);
+  fW.add(params, 'microDrift', 0, 0.01, 0.0005).name('Micro Drift').onChange(v => uMicroDrift.value = v);
+
+  const fT = gui.addFolder('Transition');
+  const transitionParams = { duration: TRANSITION_DURATION_ref.value, stride: avgW + gap };
+  fT.add(transitionParams, 'duration', 0.5, 8, 0.1).name('Duration (s)').onChange(v => TRANSITION_DURATION_ref.value = v);
+  fT.add(transitionParams, 'stride', 1, 8, 0.1).name('Stride').onChange(v => uStride.value = v);
+
+  const actions = {
+    next: () => snapTo(currentIndex + 1),
+    prev: () => snapTo(currentIndex - 1),
+  };
+  gui.add(actions, 'prev').name('← Prev');
+  gui.add(actions, 'next').name('→ Next');
 
   renderer.setAnimationLoop(() => {
     uTime.value = performance.now() / 1000;
