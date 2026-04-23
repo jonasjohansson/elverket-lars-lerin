@@ -148,7 +148,47 @@ async function init() {
   camera.position.x = paintingXs[0];
   controls.target.x = paintingXs[0];
 
+  const TRANSITION_DURATION_ref = { value: 2.5 };  // seconds (mutable for GUI later)
+  let currentIndex = 0;
+  let targetIndex = 0;
+  let transitionStart = 0;
+  let transitioning = false;
+
+  function easeInOut(t) { return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2; }
+
+  function snapTo(i) {
+    if (transitioning) return;
+    const clamped = Math.max(0, Math.min(PAINTINGS.length - 1, i));
+    if (clamped === currentIndex) return;
+    targetIndex = clamped;
+    transitionStart = performance.now();
+    transitioning = true;
+  }
+
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowRight') snapTo(currentIndex + 1);
+    if (e.key === 'ArrowLeft')  snapTo(currentIndex - 1);
+    if (e.key === 'f' || e.key === 'F') {
+      if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(() => {});
+      else document.exitFullscreen().catch(() => {});
+    }
+    if (e.code === 'Space') { e.preventDefault(); controls.enabled = !controls.enabled; }
+  });
+
   renderer.setAnimationLoop(() => {
+    if (transitioning) {
+      const t = Math.min(1, (performance.now() - transitionStart) / (TRANSITION_DURATION_ref.value * 1000));
+      const e = easeInOut(t);
+      const fromX = paintingXs[currentIndex];
+      const toX = paintingXs[targetIndex];
+      const x = fromX + (toX - fromX) * e;
+      camera.position.x = x;
+      controls.target.x = x;
+      if (t >= 1) {
+        currentIndex = targetIndex;
+        transitioning = false;
+      }
+    }
     controls.update();
     renderer.render(scene, camera);
   });
