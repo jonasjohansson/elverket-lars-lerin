@@ -16,7 +16,7 @@ renderer.toneMappingExposure = 1.2;
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.01, 100);
-camera.position.set(0, 0, 3.8);
+camera.position.set(0, 0, 5.5);
 
 const controls = new OrbitControls(camera, canvas);
 controls.enableDamping = true;
@@ -42,6 +42,7 @@ const params = {
   microDrift: 0.0015,
   particleSize: 2.0,
   alphaDip: 0.2,
+  cameraZ: 5.5,
   // Flow-field transition knobs (Anadol-style)
   curlAmp: 0.28,
   curlFreq: 1.8,
@@ -351,6 +352,7 @@ async function init() {
 
   const fR = gui.addFolder('Rendering');
   fR.add(params, 'particleSize', 0.5, 8, 0.1).name('Particle Size').onChange(v => uSize.value = v);
+  fR.add(params, 'cameraZ', 1.5, 20, 0.1).name('Camera Distance').onChange(v => { camera.position.z = v; });
 
   const fW = gui.addFolder('Ambient');
   fW.add(params, 'waveAmplitude', 0, 0.1, 0.002).name('Wave Amp').onChange(v => uWaveAmp.value = v);
