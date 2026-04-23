@@ -48,6 +48,8 @@ const params = {
   gustChaos: 0.04,
   gustDirectionX: -1.0,
   gustDirectionZ: 0.4,
+  dustMixStrength: 0.55,
+  dustColor: '#8c8070',
 };
 
 function loadImage(src) {
@@ -211,6 +213,8 @@ async function init() {
   const uGustChaos = uniform(params.gustChaos);
   const uGustDirX  = uniform(params.gustDirectionX);
   const uGustDirZ  = uniform(params.gustDirectionZ);
+  const uDustMix   = uniform(params.dustMixStrength);
+  const uDustColor = uniform(new THREE.Color(params.dustColor));
 
   // Returns vec2 uv into the 1024-wide atlas for (paintingIdx, particleIdx).
   // x = particleIdx % ATLAS_W
@@ -287,11 +291,28 @@ async function init() {
 
   material.colorNode = Fn(() => {
     const idx = attribute('aIndex');
+    const seed = attribute('aSeed');
+    const delay = seed.z;
+
     const uvFrom = atlasUV(uFromIdx, idx);
     const uvTo   = atlasUV(uToIdx,   idx);
     const colFrom = texture(colTex, uvFrom).xyz;
     const colTo   = texture(colTex, uvTo).xyz;
-    const col = mix(colFrom, colTo, uT);
+
+    // Dwell: each particle holds its From color until ~(0.4 + 0.3·delay),
+    // then hands over by ~(0.6 + 0.3·delay). Delay staggers particles so
+    // the color transition front sweeps, not pops.
+    const cLo = float(0.4).add(delay.mul(0.3));
+    const cHi = float(0.6).add(delay.mul(0.3));
+    const cT = smoothstep(cLo, cHi, uT);
+    const colInterp = mix(colFrom, colTo, cT);
+
+    // Dust mix peaks at t=0.5 (sin³πt is sharper than sin²πt)
+    const piT = uT.mul(3.14159);
+    const sinT = sin(piT);
+    const dustEnv = sinT.mul(sinT).mul(sinT);
+
+    const col = mix(colInterp, uDustColor, dustEnv.mul(uDustMix));
     return vec4(col, 1.0);
   })();
 
