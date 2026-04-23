@@ -268,6 +268,9 @@ async function init() {
     targetIndex = clamped;
     transitionStart = performance.now();
     transitioning = true;
+    uWindDir.value = Math.sign(targetIndex - currentIndex);
+    uPaintingGusts[currentIndex].value = 1.0;
+    uPaintingGusts[targetIndex].value = 1.0;
   }
 
   window.addEventListener('keydown', (e) => {
@@ -284,6 +287,7 @@ async function init() {
     uTime.value = performance.now() / 1000;
     if (transitioning) {
       const t = Math.min(1, (performance.now() - transitionStart) / (TRANSITION_DURATION_ref.value * 1000));
+      uWindGust.value = Math.sin(t * Math.PI); // 0 → 1 → 0 over the transition
       const e = easeInOut(t);
       const fromX = paintingXs[currentIndex];
       const toX = paintingXs[targetIndex];
@@ -291,6 +295,9 @@ async function init() {
       camera.position.x = x;
       controls.target.x = x;
       if (t >= 1) {
+        uWindGust.value = 0;
+        uPaintingGusts[currentIndex].value = 0;
+        uPaintingGusts[targetIndex].value = 0;
         currentIndex = targetIndex;
         transitioning = false;
       }
