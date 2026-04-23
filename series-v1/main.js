@@ -51,6 +51,7 @@ const params = {
   trailStrength: 0.75,
   chaosAmp: 0.18,
   chaosSpeed: 0.6,
+  variationScale: 1.0,  // 0 = all paintings identical, 1 = default spread, >1 = wild
 };
 
 const uTime     = uniform(0.0);
@@ -74,6 +75,17 @@ const uTrailStrength = uniform(params.trailStrength);
 const uChaosAmp   = uniform(params.chaosAmp);      // per-particle jitter on top of curl
 const uChaosSpeed = uniform(params.chaosSpeed);
 const uAlphaDip   = uniform(params.alphaDip);
+const uVariationScale = uniform(params.variationScale);
+
+// Seeded PRNG so each painting gets a reproducible "personality" by index.
+function mulberry32(s) {
+  return () => {
+    let t = (s += 0x6D2B79F5);
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
 let uPaintingGusts = [];
 
 function loadImage(src) {
@@ -216,7 +228,32 @@ async function init() {
 
   uPaintingGusts = builds.map(() => uniform(0.0));
 
-  function makeMaterial(uPaintingGust) {
+  // Per-painting "personality" — deterministic multipliers per painting index.
+  // All are expressed relative to 1.0 so uVariationScale 0 collapses them back to identical.
+  const variations = builds.map((_, i) => {
+    const r = mulberry32(i * 17 + 1);
+    const around = (spread) => 1.0 - spread + r() * spread * 2; // ~[1-spread, 1+spread]
+    return {
+      curlAmp:    around(0.45),
+      curlFreq:   around(0.35),
+      curlSpeed:  around(0.4),
+      chaosAmp:   around(0.5),
+      chaosSpeed: around(0.4),
+      coreFlow:   around(0.4),
+      phase:      r() * 6.2831853,  // radians — staggers curl/chaos timing
+    };
+  });
+
+  function makeMaterial(uPaintingGust, variation) {
+    // Helper: effective multiplier that collapses to 1.0 when variationScale = 0.
+    const mult = (v) => mix(float(1.0), float(v), uVariationScale);
+    const vCurlAmp   = mult(variation.curlAmp);
+    const vCurlFreq  = mult(variation.curlFreq);
+    const vCurlSpeed = mult(variation.curlSpeed);
+    const vChaosAmp  = mult(variation.chaosAmp);
+    const vChaosSpd  = mult(variation.chaosSpeed);
+    const vCoreFlow  = mult(variation.coreFlow);
+    const vPhase     = float(variation.phase).mul(uVariationScale);
     const m = new THREE.PointsNodeMaterial({
       transparent: true,
       blending: THREE.NormalBlending,
@@ -226,7 +263,8 @@ async function init() {
     // participates at a reduced weight so the whole painting breathes into the storm.
     const computeDetach = (edge) => {
       const edgeWeight = float(1.0).sub(smoothstep(float(0.0), float(0.6), edge));
-      const combined = mix(uCoreFlow, float(1.0), edgeWeight);
+      const effCoreFlow = uCoreFlow.mul(vCoreFlow);
+      const combined = mix(effCoreFlow, float(1.0), edgeWeight);
       return combined.mul(uWindGust).mul(uPaintingGust);
     };
 
@@ -268,20 +306,20 @@ async function init() {
 
       // Pseudo-curl noise: three lobes with swapped axes → divergence-free-ish tumble.
       // Sampled at world position so neighboring particles swirl coherently.
-      const cf = uCurlFreq;
-      const ct = time.mul(uCurlSpeed);
+      const cf = uCurlFreq.mul(vCurlFreq);
+      const ct = time.mul(uCurlSpeed).mul(vCurlSpeed).add(vPhase);
       const curlX = sin(pos.y.mul(cf).add(ct)).mul(cos(pos.z.mul(cf).add(ct.mul(1.3))));
       const curlY = sin(pos.z.mul(cf).add(ct.mul(1.7))).mul(cos(pos.x.mul(cf).add(ct)));
       const curlZ = sin(pos.x.mul(cf).add(ct.mul(0.7))).mul(cos(pos.y.mul(cf).add(ct.mul(1.3))));
-      const curlMag = uCurlAmp.mul(detach);
+      const curlMag = uCurlAmp.mul(vCurlAmp).mul(detach);
 
       // Per-particle chaos: each particle has its own jitter trajectory based on its seed.
       // Breaks the coherence of the curl field — neighboring particles take individual paths.
-      const chaosT = time.mul(uChaosSpeed);
+      const chaosT = time.mul(uChaosSpeed).mul(vChaosSpd).add(vPhase);
       const chaosX = sin(chaosT.mul(0.9).add(seedX.mul(11.0))).mul(cos(chaosT.mul(1.1).add(seedY.mul(7.0))));
       const chaosY = cos(chaosT.mul(1.3).add(seedY.mul(9.0))).mul(sin(chaosT.mul(0.8).add(seedX.mul(8.0))));
       const chaosZ = sin(chaosT.mul(0.7).add(seedX.add(seedY).mul(5.0)));
-      const chaosMag = uChaosAmp.mul(detach);
+      const chaosMag = uChaosAmp.mul(vChaosAmp).mul(detach);
 
       return pos.add(vec3(
         w1x.add(w2x).add(dx).add(windX).add(curlX.mul(curlMag)).add(chaosX.mul(chaosMag)),
@@ -301,7 +339,7 @@ async function init() {
     g.setAttribute('aSeed',    new THREE.BufferAttribute(b.seeds, 4));
     g.setAttribute('aEdge',    new THREE.BufferAttribute(b.edgeDist, 1));
     g.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 0), 100);
-    const m = new THREE.Points(g, makeMaterial(uPaintingGusts[i]));
+    const m = new THREE.Points(g, makeMaterial(uPaintingGusts[i], variations[i]));
     m.position.x = paintingXs[i];
     scene.add(m);
     meshes.push(m);
@@ -377,6 +415,7 @@ async function init() {
   fF.add(params, 'chaosAmp', 0, 1.0, 0.01).name('Chaos Amp').onChange(v => uChaosAmp.value = v);
   fF.add(params, 'chaosSpeed', 0, 3, 0.05).name('Chaos Speed').onChange(v => uChaosSpeed.value = v);
   fF.add(params, 'trailStrength', 0, 0.98, 0.01).name('Trails').onChange(v => uTrailStrength.value = v);
+  fF.add(params, 'variationScale', 0, 2, 0.05).name('Variation').onChange(v => uVariationScale.value = v);
 
   const actions = {
     next: () => snapTo(currentIndex + 1),
