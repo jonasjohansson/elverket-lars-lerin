@@ -192,7 +192,13 @@ async function init() {
       blending: THREE.NormalBlending,
       depthWrite: true,
     });
-    m.colorNode = Fn(() => vec4(attribute('aColor'), 1.0))();
+    m.colorNode = Fn(() => {
+      const col = attribute('aColor');
+      const edge = attribute('aEdge');
+      const detach = float(1.0).sub(smoothstep(float(0.0), float(0.6), edge)).mul(uWindGust).mul(uPaintingGust);
+      const alpha = float(1.0).sub(detach.mul(0.3));
+      return vec4(col, alpha);
+    })();
     m.sizeNode = uSize;
     m.sizeAttenuation = true;
     m.positionNode = Fn(() => {
