@@ -120,7 +120,7 @@ async function init() {
     aColB[i * 3 + 1] = sB.col[i * 3 + 1];
     aColB[i * 3 + 2] = sB.col[i * 3 + 2];
 
-    aZ[i] = 0.0;  // will become scatter in Task 4
+    aZ[i] = (Math.random() - 0.5) * 0.4;  // [-0.2, +0.2] default scatter
 
     aSeed[i * 4]     = (Math.random() - 0.5) * 2;
     aSeed[i * 4 + 1] = (Math.random() - 0.5) * 2;
@@ -148,7 +148,8 @@ async function init() {
 
   material.positionNode = Fn(() => {
     const pA = attribute('aPosA');
-    return vec3(pA.x, pA.y, float(0.0));
+    const z  = attribute('aZ');
+    return vec3(pA.x, pA.y, z);
   })();
 
   material.colorNode = Fn(() => {
