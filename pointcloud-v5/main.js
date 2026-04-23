@@ -44,6 +44,10 @@ const params = {
   wave2Speed: 0.18,
   wave2Frequency: 3.5,
   microDrift: 0.0015,
+  gustAmplitude: 0.15,
+  gustChaos: 0.04,
+  gustDirectionX: -1.0,
+  gustDirectionZ: 0.4,
 };
 
 function loadImage(src) {
@@ -203,6 +207,10 @@ async function init() {
   const uWave2Spd     = uniform(params.wave2Speed);
   const uWave2Freq    = uniform(params.wave2Frequency);
   const uMicroDrift   = uniform(params.microDrift);
+  const uGustAmp  = uniform(params.gustAmplitude);
+  const uGustChaos = uniform(params.gustChaos);
+  const uGustDirX  = uniform(params.gustDirectionX);
+  const uGustDirZ  = uniform(params.gustDirectionZ);
 
   // Returns vec2 uv into the 1024-wide atlas for (paintingIdx, particleIdx).
   // x = particleIdx % ATLAS_W
@@ -237,6 +245,26 @@ async function init() {
     const posXY = mix(posFrom, posTo, tEased);
     const pos = vec3(posXY.x, posXY.y, float(0.0));
 
+    // Gust envelope: sin²(π·t), zero at 0 and 1, peaks at 0.5
+    const piT = uT.mul(3.14159);
+    const gustEnv = sin(piT).mul(sin(piT));
+
+    // Low-frequency curl-ish displacement based on pos and a slow time
+    const gustPhaseX = pos.x.mul(2.3).add(pos.y.mul(1.1)).add(t.mul(0.4));
+    const gustPhaseY = pos.x.mul(1.7).sub(pos.y.mul(2.0)).add(t.mul(0.3));
+    const gustX = sin(gustPhaseX).mul(uGustAmp).mul(0.8).add(uGustDirX.mul(uGustAmp).mul(0.6));
+    const gustY = cos(gustPhaseY).mul(uGustAmp).mul(0.5);
+    const gustZ = sin(gustPhaseX.mul(0.7).add(1.3)).mul(uGustAmp).mul(0.35).add(uGustDirZ.mul(uGustAmp).mul(0.3));
+
+    // High-frequency per-particle chaos
+    const chaosX = sin(t.mul(1.4).add(seedX.mul(9.0))).mul(uGustChaos);
+    const chaosY = cos(t.mul(1.1).add(seedY.mul(8.0))).mul(uGustChaos);
+    const chaosZ = sin(t.mul(0.9).add(seedX.add(seedY).mul(7.0))).mul(uGustChaos.mul(0.7));
+
+    const gX = gustX.add(chaosX).mul(gustEnv);
+    const gY = gustY.add(chaosY).mul(gustEnv);
+    const gZ = gustZ.add(chaosZ).mul(gustEnv);
+
     const wave1Phase = pos.x.mul(uWaveFreq).add(pos.y.mul(1.5)).add(t.mul(uWaveSpd));
     const w1x = sin(wave1Phase).mul(uWaveAmp);
     const w1y = cos(wave1Phase.mul(0.7)).mul(uWaveAmp.mul(0.8));
@@ -251,9 +279,9 @@ async function init() {
     const dy = cos(t.mul(0.11).add(seedY.mul(5.0))).mul(uMicroDrift);
 
     return pos.add(vec3(
-      w1x.add(w2x).add(dx),
-      w1y.add(w2y).add(dy),
-      w1z.add(w2z),
+      w1x.add(w2x).add(dx).add(gX),
+      w1y.add(w2y).add(dy).add(gY),
+      w1z.add(w2z).add(gZ),
     ));
   })();
 
