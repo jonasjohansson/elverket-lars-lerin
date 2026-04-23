@@ -146,6 +146,8 @@ async function init() {
   const uDispersalAmp = uniform(0.35);
   const uGravity = uniform(0.25);
   const uChaosAmp = uniform(0.18);
+  const uDarken = uniform(0.7);
+  const uOpacity = uniform(0.9);
 
   // Clustered death moment dM ∈ [0,1] from position — neighbors share similar dM.
   const dieMoment = (posXY, delay) => {
@@ -206,9 +208,16 @@ async function init() {
     const pA = attribute('aPosA');
     const seed = attribute('aSeed');
     const delay = seed.z;
+
     const d = dieProgress(pA, delay);
     const c = mix(cA, cB, d);
-    return vec4(c.x, c.y, c.z, 1.0);
+    const crumble = float(1.0).sub(smoothstep(0.0, 1.0, d.sub(0.5).abs().mul(2.0)));
+
+    const dark = float(1.0).sub(crumble.mul(uDarken));
+    const litCol = c.mul(dark);
+    const alpha = uOpacity.mul(float(1.0).sub(crumble.mul(0.6)));
+
+    return vec4(litCol.x, litCol.y, litCol.z, alpha);
   })();
 
   material.sizeNode = uSize;
