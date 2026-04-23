@@ -139,6 +139,7 @@ async function init() {
   geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 0), 100);
 
   const uSize = uniform(4.0);
+  const uPhase = uniform(0.0);
 
   const material = new THREE.PointsNodeMaterial({
     transparent: true,
@@ -148,13 +149,17 @@ async function init() {
 
   material.positionNode = Fn(() => {
     const pA = attribute('aPosA');
+    const pB = attribute('aPosB');
     const z  = attribute('aZ');
-    return vec3(pA.x, pA.y, z);
+    const xy = mix(pA, pB, uPhase);
+    return vec3(xy.x, xy.y, z);
   })();
 
   material.colorNode = Fn(() => {
     const cA = attribute('aColA');
-    return vec4(cA.x, cA.y, cA.z, 1.0);
+    const cB = attribute('aColB');
+    const c  = mix(cA, cB, uPhase);
+    return vec4(c.x, c.y, c.z, 1.0);
   })();
 
   material.sizeNode = uSize;
@@ -164,6 +169,8 @@ async function init() {
   scene.add(points);
 
   info.textContent = 'painting A';
+
+  window.__u = { uPhase };
 
   renderer.setAnimationLoop(() => {
     controls.update();
