@@ -89,6 +89,45 @@ function samplePainting(pixels, count) {
   return { pos, col, worldW, worldH };
 }
 
+// Pack per-painting address arrays into (9 × N) DataTextures.
+// Layout: column = painting index, row = particle index.
+function packAddressTextures(samples) {
+  const N = PARTICLE_COUNT;
+  const cols = samples.length;
+
+  const posData = new Float32Array(cols * N * 2);
+  const colData = new Float32Array(cols * N * 3);
+
+  for (let p = 0; p < cols; p++) {
+    const s = samples[p];
+    for (let i = 0; i < N; i++) {
+      // texel (col=p, row=i) → data index = (i * cols + p)
+      const texelIdx = i * cols + p;
+      posData[texelIdx * 2]     = s.pos[i * 2];
+      posData[texelIdx * 2 + 1] = s.pos[i * 2 + 1];
+      colData[texelIdx * 3]     = s.col[i * 3];
+      colData[texelIdx * 3 + 1] = s.col[i * 3 + 1];
+      colData[texelIdx * 3 + 2] = s.col[i * 3 + 2];
+    }
+  }
+
+  const posTex = new THREE.DataTexture(posData, cols, N, THREE.RGFormat, THREE.FloatType);
+  posTex.minFilter = THREE.NearestFilter;
+  posTex.magFilter = THREE.NearestFilter;
+  posTex.wrapS = THREE.ClampToEdgeWrapping;
+  posTex.wrapT = THREE.ClampToEdgeWrapping;
+  posTex.needsUpdate = true;
+
+  const colTex = new THREE.DataTexture(colData, cols, N, THREE.RGBFormat, THREE.FloatType);
+  colTex.minFilter = THREE.NearestFilter;
+  colTex.magFilter = THREE.NearestFilter;
+  colTex.wrapS = THREE.ClampToEdgeWrapping;
+  colTex.wrapT = THREE.ClampToEdgeWrapping;
+  colTex.needsUpdate = true;
+
+  return { posTex, colTex };
+}
+
 async function init() {
   await renderer.init();
   info.textContent = `Loading ${NUM_PAINTINGS} paintings...`;
@@ -100,10 +139,8 @@ async function init() {
   await new Promise(r => requestAnimationFrame(r));
 
   const samples = pixels.map(px => samplePainting(px, PARTICLE_COUNT));
-
-  console.log('painting dims:', samples.map(s => `${s.worldW.toFixed(2)}×${s.worldH.toFixed(2)}`));
-  console.log('total address bytes:',
-    samples.length * (samples[0].pos.byteLength + samples[0].col.byteLength));
+  const { posTex, colTex } = packAddressTextures(samples);
+  console.log('packed:', posTex.image.width, '×', posTex.image.height, 'pos +', colTex.image.width, '×', colTex.image.height, 'col');
 
   info.textContent = `${NUM_PAINTINGS} paintings · ${(PARTICLE_COUNT / 1e6).toFixed(2)}M particles · WebGPU`;
   renderer.setAnimationLoop(() => {
