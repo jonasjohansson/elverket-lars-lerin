@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { attribute, uniform, texture, vec2, vec3, vec4, float, Fn, sin, cos, mix, smoothstep } from 'three/tsl';
+import { attribute, uniform, texture, vec2, vec3, vec4, float, Fn, sin, cos, mix, smoothstep, clamp } from 'three/tsl';
 import GUI from 'https://cdn.jsdelivr.net/npm/lil-gui@0.20/+esm';
 
 const canvas = document.getElementById('c');
@@ -244,8 +244,10 @@ async function init() {
     const posFrom = texture(posTex, uvFrom).xy;
     const posTo   = texture(posTex, uvTo).xy;
 
-    // Ease the lerp so ends are calm, middle is fastest
-    const tEased = smoothstep(float(0.0), float(1.0), uT);
+    // Per-particle stagger: shift effective uT by ±0.1 based on delay seed.
+    const delay = seed.z;
+    const tLocal = clamp(uT.add(delay.sub(0.5).mul(0.2)), float(0), float(1));
+    const tEased = smoothstep(float(0.0), float(1.0), tLocal);
     const posXY = mix(posFrom, posTo, tEased);
     const pos = vec3(posXY.x, posXY.y, float(0.0));
 
