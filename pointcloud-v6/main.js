@@ -266,6 +266,25 @@ async function init() {
   let stateStart = performance.now() / 1000;
   let stateName = 'holdA';  // holdA | AtoB | holdB | BtoA
 
+  window.addEventListener('keydown', (e) => {
+    if (e.code === 'Space') {
+      e.preventDefault();
+      params.autoLoop = !params.autoLoop;
+      if (params.autoLoop) stateStart = performance.now() / 1000;
+    } else if (e.code === 'ArrowRight') {
+      params.autoLoop = false;
+      stateName = 'holdB';
+      uPhase.value = 1;
+    } else if (e.code === 'ArrowLeft') {
+      params.autoLoop = false;
+      stateName = 'holdA';
+      uPhase.value = 0;
+    } else if (e.key === 'f' || e.key === 'F') {
+      if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(() => {});
+      else document.exitFullscreen().catch(() => {});
+    }
+  });
+
   const clock = new THREE.Clock();
   renderer.setAnimationLoop(() => {
     const t = clock.getElapsedTime();
