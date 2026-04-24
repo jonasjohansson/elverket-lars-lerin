@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { attribute, uniform, float, vec2, vec3, vec4, Fn, mix, sin, cos, smoothstep, clamp, uv } from 'three/tsl';
+import GUI from 'https://cdn.jsdelivr.net/npm/lil-gui@0.20/+esm';
 
 const canvas = document.getElementById('c');
 const info = document.getElementById('info');
@@ -265,6 +266,38 @@ async function init() {
 
   let stateStart = performance.now() / 1000;
   let stateName = 'holdA';  // holdA | AtoB | holdB | BtoA
+
+  const gui = new GUI({ title: 'Pointcloud v6' });
+
+  const fLoop = gui.addFolder('Loop');
+  fLoop.add(params, 'autoLoop').listen().name('Auto Loop');
+  fLoop.add(params, 'holdDuration', 0, 20, 0.1).name('Hold (s)');
+  fLoop.add(params, 'transitionDuration', 1, 20, 0.1).name('Transition (s)');
+  fLoop.add({ phase: 0 }, 'phase', 0, 1, 0.001).name('Phase').onChange(v => {
+    params.autoLoop = false;
+    uPhase.value = v;
+  }).listen();
+
+  const fDis = gui.addFolder('Disintegration');
+  fDis.add({ patchScale: 3.0 }, 'patchScale', 0.5, 12, 0.1).name('Patch Scale').onChange(v => uPatchScale.value = v);
+  fDis.add({ fadeWindow: 0.08 }, 'fadeWindow', 0.02, 0.3, 0.005).name('Fade Window').onChange(v => uFadeWindow.value = v);
+  fDis.add({ dispersalAmp: 0.35 }, 'dispersalAmp', 0, 2, 0.01).name('Dispersal').onChange(v => uDispersalAmp.value = v);
+  fDis.add({ gravity: 0.25 }, 'gravity', 0, 1, 0.01).name('Gravity').onChange(v => uGravity.value = v);
+  fDis.add({ chaosAmp: 0.18 }, 'chaosAmp', 0, 0.6, 0.01).name('Chaos').onChange(v => uChaosAmp.value = v);
+  fDis.add({ shrink: 0.85 }, 'shrink', 0, 1, 0.01).name('Shrink').onChange(v => uShrink.value = v);
+  fDis.add({ darken: 0.7 }, 'darken', 0, 1, 0.01).name('Darken').onChange(v => uDarken.value = v);
+
+  const fR = gui.addFolder('Rendering');
+  fR.add({ size: 4.0 }, 'size', 1, 12, 0.1).name('Splat Size').onChange(v => uSize.value = v);
+  fR.add({ opacity: 0.9 }, 'opacity', 0, 1, 0.01).name('Opacity').onChange(v => uOpacity.value = v);
+  fR.add({ waveAmp: 0.015 }, 'waveAmp', 0, 0.05, 0.001).name('Wave Amp').onChange(v => uWaveAmp.value = v);
+
+  gui.add({
+    jumpA: () => { params.autoLoop = false; stateName = 'holdA'; uPhase.value = 0; }
+  }, 'jumpA').name('⟵ Jump to A');
+  gui.add({
+    jumpB: () => { params.autoLoop = false; stateName = 'holdB'; uPhase.value = 1; }
+  }, 'jumpB').name('Jump to B ⟶');
 
   window.addEventListener('keydown', (e) => {
     if (e.code === 'Space') {
