@@ -23,8 +23,8 @@ controls.enableDamping = true;
 controls.enabled = false;
 controls.target.set(0, 0, 0);
 
-const PARTICLES_PER_PAINTING = 900_000;
-const SAND_COUNT = 500_000;
+const PARTICLES_PER_PAINTING = 450_000;
+const SAND_COUNT = 200_000;
 const PAINTING_HEIGHT = 2.0;
 const ALPHA_THRESHOLD = 0.5 * 255;
 
@@ -49,6 +49,11 @@ const params = {
   stormCurlAmp: 0.5,       // curl noise strength in storm band
   stormCurlFreq: 1.5,
   stormChaosAmp: 0.28,     // per-particle chaos in storm band
+
+  // Ambient flow — always on, gives the painting constant fluid "breathing"
+  ambientCurlAmp: 0.014,
+  ambientCurlFreq: 0.6,
+  ambientCurlSpeed: 0.14,
 
   // Sand cloud
   sandOpacity: 0.18,       // max airborne sand opacity at storm peak
@@ -79,6 +84,9 @@ const uStormSize = uniform(params.stormSizeLift);
 const uStormCurlAmp = uniform(params.stormCurlAmp);
 const uStormCurlFreq = uniform(params.stormCurlFreq);
 const uStormChaos = uniform(params.stormChaosAmp);
+const uAmbientCurlAmp = uniform(params.ambientCurlAmp);
+const uAmbientCurlFreq = uniform(params.ambientCurlFreq);
+const uAmbientCurlSpeed = uniform(params.ambientCurlSpeed);
 
 // Sand cloud
 const uSandOpacity = uniform(0.0);        // animated: 0 at rest, peak during transition
@@ -98,7 +106,7 @@ function loadImage(src) {
   });
 }
 
-function getPixels(img, maxW = 1600) {
+function getPixels(img, maxW = 1200) {
   let w = img.width, h = img.height;
   if (w > maxW) { const s = maxW / w; w = Math.round(w * s); h = Math.round(h * s); }
   const c = document.createElement('canvas');
@@ -215,9 +223,15 @@ async function init() {
       return smoothstep(uStormSoft.negate(), uStormSoft, signedDist);
     };
     const computeStormBand = (pos) => {
-      // 1 at front, 0 at soft-distance away (on either side)
-      const absDist = uFrontX.sub(pos.x).mul(uWindDir); // negative ahead, positive behind
-      const inBand = float(1.0).sub(smoothstep(float(0.0), uStormSoft.mul(1.3), absDist.abs()));
+      // Tight band for color/alpha transition (sharp wavefront)
+      const absDist = uFrontX.sub(pos.x).mul(uWindDir).abs();
+      const inBand = float(1.0).sub(smoothstep(float(0.0), uStormSoft.mul(1.3), absDist));
+      return clamp(inBand, 0, 1);
+    };
+    const computeMotionBand = (pos) => {
+      // Wider, softer band for motion influence — Anadol-style smear beyond the sharp front
+      const absDist = uFrontX.sub(pos.x).mul(uWindDir).abs();
+      const inBand = float(1.0).sub(smoothstep(float(0.0), uStormSoft.mul(2.8), absDist));
       return clamp(inBand, 0, 1);
     };
 
@@ -259,28 +273,43 @@ async function init() {
       const dx = sin(t.mul(0.13).add(seedX.mul(7.0))).mul(uMicroDrift);
       const dy = cos(t.mul(0.11).add(seedY.mul(5.0))).mul(uMicroDrift);
 
-      // Storm band displacement — only particles near the front get pushed
-      const band = computeStormBand(pos);
+      // Ambient curl — always-on slow fluid "breathing" (Anadol-style constant motion)
+      const acf = uAmbientCurlFreq;
+      const act = t.mul(uAmbientCurlSpeed);
+      const acX = sin(pos.y.mul(acf).add(act)).mul(cos(pos.z.mul(acf).add(act.mul(1.3))));
+      const acY = sin(pos.z.mul(acf).add(act.mul(1.7))).mul(cos(pos.x.mul(acf).add(act)));
+      const acZ = sin(pos.x.mul(acf).add(act.mul(0.7))).mul(cos(pos.y.mul(acf).add(act.mul(1.3))));
+
+      // Storm band displacement — stronger near the front; softer tail via motion band
+      const motionBand = computeMotionBand(pos);
       const cf = uStormCurlFreq;
-      const ct = t.mul(0.55);
+      const ct = t.mul(0.5);
       const curlX = sin(pos.y.mul(cf).add(ct)).mul(cos(pos.z.mul(cf).add(ct.mul(1.3))));
       const curlY = sin(pos.z.mul(cf).add(ct.mul(1.7))).mul(cos(pos.x.mul(cf).add(ct)));
       const curlZ = sin(pos.x.mul(cf).add(ct.mul(0.7))).mul(cos(pos.y.mul(cf).add(ct.mul(1.3))));
-      const curlMag = uStormCurlAmp.mul(band);
+      const curlMag = uStormCurlAmp.mul(motionBand);
+
+      // 2nd curl octave — finer detail, faster rotation, half amplitude
+      const cf2 = cf.mul(2.6);
+      const ct2 = t.mul(0.85);
+      const curl2X = sin(pos.y.mul(cf2).add(ct2)).mul(cos(pos.z.mul(cf2).add(ct2.mul(1.3))));
+      const curl2Y = sin(pos.z.mul(cf2).add(ct2.mul(1.7))).mul(cos(pos.x.mul(cf2).add(ct2)));
+      const curl2Z = sin(pos.x.mul(cf2).add(ct2.mul(0.7))).mul(cos(pos.y.mul(cf2).add(ct2.mul(1.3))));
+      const curl2Mag = uStormCurlAmp.mul(motionBand).mul(0.4);
 
       const chaosT = t.mul(0.9);
       const chX = sin(chaosT.mul(0.9).add(seedX.mul(11.0))).mul(cos(chaosT.mul(1.1).add(seedY.mul(7.0))));
       const chY = cos(chaosT.mul(1.3).add(seedY.mul(9.0))).mul(sin(chaosT.mul(0.8).add(seedX.mul(8.0))));
       const chZ = sin(chaosT.mul(0.7).add(seedX.add(seedY).mul(5.0)));
-      const chMag = uStormChaos.mul(band);
+      const chMag = uStormChaos.mul(motionBand);
 
-      // Overall bounded displacement
-      const displaceMag = uStormDisplace.mul(band);
+      // Overall bounded displacement (uses tight band so core of front really pushes)
+      const displaceMag = uStormDisplace.mul(computeStormBand(pos));
 
       return pos.add(vec3(
-        wx.add(dx).add(curlX.mul(curlMag)).add(chX.mul(chMag)).add(uWindDir.mul(displaceMag)),
-        wy.add(dy).add(curlY.mul(curlMag)).add(chY.mul(chMag)),
-        wz.add(curlZ.mul(curlMag)).add(chZ.mul(chMag)),
+        wx.add(dx).add(acX.mul(uAmbientCurlAmp)).add(curlX.mul(curlMag)).add(curl2X.mul(curl2Mag)).add(chX.mul(chMag)).add(uWindDir.mul(displaceMag)),
+        wy.add(dy).add(acY.mul(uAmbientCurlAmp)).add(curlY.mul(curlMag)).add(curl2Y.mul(curl2Mag)).add(chY.mul(chMag)),
+        wz.add(acZ.mul(uAmbientCurlAmp)).add(curlZ.mul(curlMag)).add(curl2Z.mul(curl2Mag)).add(chZ.mul(chMag)),
       ));
     })();
 
@@ -419,6 +448,9 @@ async function init() {
   fW.add(params, 'waveSpeed', 0, 1, 0.01).name('Wave Speed').onChange(v => uWaveSpd.value = v);
   fW.add(params, 'waveFrequency', 0, 8, 0.1).name('Wave Freq').onChange(v => uWaveFreq.value = v);
   fW.add(params, 'microDrift', 0, 0.01, 0.0005).name('Micro Drift').onChange(v => uMicroDrift.value = v);
+  fW.add(params, 'ambientCurlAmp', 0, 0.08, 0.001).name('Flow Amp').onChange(v => uAmbientCurlAmp.value = v);
+  fW.add(params, 'ambientCurlFreq', 0.1, 3, 0.05).name('Flow Freq').onChange(v => uAmbientCurlFreq.value = v);
+  fW.add(params, 'ambientCurlSpeed', 0, 1, 0.01).name('Flow Speed').onChange(v => uAmbientCurlSpeed.value = v);
 
   const fT = gui.addFolder('Transition');
   fT.add(params, 'transitionDuration', 0.5, 30, 0.1).name('Duration (s)').onChange(v => TRANSITION_DURATION_ref.value = v);
