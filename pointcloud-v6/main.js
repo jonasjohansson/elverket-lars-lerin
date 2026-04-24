@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { attribute, uniform, float, vec2, vec3, vec4, Fn, mix, sin, cos, smoothstep, clamp } from 'three/tsl';
+import { attribute, uniform, float, vec2, vec3, vec4, Fn, mix, sin, cos, smoothstep, clamp, uv } from 'three/tsl';
 
 const canvas = document.getElementById('c');
 const info = document.getElementById('info');
@@ -231,7 +231,12 @@ async function init() {
     const litCol = c.mul(dark);
     const alpha = uOpacity.mul(float(1.0).sub(crumble.mul(0.6)));
 
-    return vec4(litCol.x, litCol.y, litCol.z, alpha);
+    // soft-splat: radial gaussian from point-sprite center
+    const pUV = uv();                             // [0,1] over the point sprite
+    const r = pUV.sub(0.5).length();              // [0, ~0.7]
+    const softMask = smoothstep(0.5, 0.0, r);     // 1 at center, 0 at edges
+    const finalAlpha = alpha.mul(softMask);
+    return vec4(litCol.x, litCol.y, litCol.z, finalAlpha);
   })();
 
   material.sizeNode = Fn(() => {
