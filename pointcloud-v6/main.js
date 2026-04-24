@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { attribute, uniform, float, vec2, vec3, vec4, Fn, mix, sin, cos, smoothstep, clamp, uv } from 'three/tsl';
+import { attribute, uniform, float, vec2, vec3, vec4, Fn, mix, sin, cos, smoothstep, clamp } from 'three/tsl';
 import GUI from 'https://cdn.jsdelivr.net/npm/lil-gui@0.20/+esm';
 
 const canvas = document.getElementById('c');
@@ -145,7 +145,7 @@ async function init() {
   geometry.setAttribute('aSeed', new THREE.BufferAttribute(aSeed, 4));
   geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 0), 100);
 
-  const uSize = uniform(4.0);
+  const uSize = uniform(2.5);
   const uPhase = uniform(0.0);
   const uPatchScale = uniform(3.0);
   const uFadeWindow = uniform(0.08);
@@ -238,12 +238,7 @@ async function init() {
     const litCol = c.mul(dark);
     const alpha = uOpacity.mul(float(1.0).sub(crumble.mul(0.6)));
 
-    // soft-splat: radial gaussian from point-sprite center
-    const pUV = uv();                             // [0,1] over the point sprite
-    const r = pUV.sub(0.5).length();              // [0, ~0.7]
-    const softMask = smoothstep(0.5, 0.0, r);     // 1 at center, 0 at edges
-    const finalAlpha = alpha.mul(softMask);
-    return vec4(litCol.x, litCol.y, litCol.z, finalAlpha);
+    return vec4(litCol.x, litCol.y, litCol.z, alpha);
   })();
 
   material.sizeNode = Fn(() => {
