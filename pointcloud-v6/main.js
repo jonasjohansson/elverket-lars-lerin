@@ -294,19 +294,32 @@ async function init() {
     jumpB: () => { params.autoLoop = false; stateName = 'holdB'; uPhase.value = 1; }
   }, 'jumpB').name('Jump to B ⟶');
 
+  let manualAnim = null;
+  function animatePhaseTo(target) {
+    params.autoLoop = false;
+    if (manualAnim) cancelAnimationFrame(manualAnim);
+    const start = uPhase.value;
+    const t0 = performance.now();
+    const dur = params.transitionDuration * 1000;
+    const step = () => {
+      const p = Math.min(1, (performance.now() - t0) / dur);
+      uPhase.value = start + (target - start) * p;
+      stateName = target >= 0.5 ? 'holdB' : 'holdA';
+      if (p < 1) manualAnim = requestAnimationFrame(step);
+      else manualAnim = null;
+    };
+    step();
+  }
+
   window.addEventListener('keydown', (e) => {
     if (e.code === 'Space') {
       e.preventDefault();
       params.autoLoop = !params.autoLoop;
       if (params.autoLoop) stateStart = performance.now() / 1000;
     } else if (e.code === 'ArrowRight') {
-      params.autoLoop = false;
-      stateName = 'holdB';
-      uPhase.value = 1;
+      animatePhaseTo(1);
     } else if (e.code === 'ArrowLeft') {
-      params.autoLoop = false;
-      stateName = 'holdA';
-      uPhase.value = 0;
+      animatePhaseTo(0);
     } else if (e.key === 'f' || e.key === 'F') {
       if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(() => {});
       else document.exitFullscreen().catch(() => {});
