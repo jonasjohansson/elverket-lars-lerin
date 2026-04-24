@@ -25,6 +25,12 @@ const PARTICLE_COUNT = 800_000;
 const PAINTING_HEIGHT = 2.0;
 const ALPHA_THRESHOLD = 0.5 * 255;
 
+const params = {
+  holdDuration: 4.0,
+  transitionDuration: 6.0,
+  autoLoop: true,
+};
+
 const PAINTING_A = '../shared/images/series-1/17_RESAN_OCH_ORIENTEN_LL_0012-trim.png';
 const PAINTING_B = '../shared/images/series-1/17_RESAN_OCH_ORIENTEN_LL_0029-trim.png';
 
@@ -257,10 +263,34 @@ async function init() {
 
   window.__u = { uPhase, uPatchScale, uFadeWindow };
 
+  let stateStart = performance.now() / 1000;
+  let stateName = 'holdA';  // holdA | AtoB | holdB | BtoA
+
   const clock = new THREE.Clock();
   renderer.setAnimationLoop(() => {
     const t = clock.getElapsedTime();
     uTime.value = t;
+
+    if (params.autoLoop) {
+      const now = performance.now() / 1000;
+      const dt = now - stateStart;
+      const { holdDuration: H, transitionDuration: T } = params;
+
+      if (stateName === 'holdA') {
+        uPhase.value = 0;
+        if (dt >= H) { stateName = 'AtoB'; stateStart = now; }
+      } else if (stateName === 'AtoB') {
+        uPhase.value = Math.min(1, dt / T);
+        if (dt >= T) { stateName = 'holdB'; stateStart = now; uPhase.value = 1; }
+      } else if (stateName === 'holdB') {
+        uPhase.value = 1;
+        if (dt >= H) { stateName = 'BtoA'; stateStart = now; }
+      } else if (stateName === 'BtoA') {
+        uPhase.value = Math.max(0, 1 - dt / T);
+        if (dt >= T) { stateName = 'holdA'; stateStart = now; uPhase.value = 0; }
+      }
+    }
+
     controls.update();
     renderer.render(scene, camera);
   });
