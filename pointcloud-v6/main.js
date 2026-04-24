@@ -149,6 +149,9 @@ async function init() {
   const uDarken = uniform(0.7);
   const uOpacity = uniform(0.9);
   const uShrink = uniform(0.85);
+  const uWaveAmp = uniform(0.015);
+  const uWaveSpeed = uniform(0.25);
+  const uWaveFreq = uniform(2.0);
 
   // Clustered death moment dM ∈ [0,1] from position — neighbors share similar dM.
   const dieMoment = (posXY, delay) => {
@@ -200,7 +203,17 @@ async function init() {
     const dy = dirY.mul(disp).sub(crumble.mul(uGravity)).add(chY);
     const dz = dirZ.mul(disp).add(chZ);
 
-    return vec3(xy.x.add(dx), xy.y.add(dy), z.add(dz));
+    // ambient wave — always on, gentle breathing
+    const wavePhase = pA.x.mul(uWaveFreq).add(pA.y.mul(1.5)).add(t.mul(uWaveSpeed));
+    const wX = sin(wavePhase).mul(uWaveAmp);
+    const wY = cos(wavePhase.mul(0.7)).mul(uWaveAmp.mul(0.8));
+    const wZ = sin(wavePhase.mul(0.5).add(1.0)).mul(uWaveAmp.mul(0.6));
+
+    return vec3(
+      xy.x.add(dx).add(wX),
+      xy.y.add(dy).add(wY),
+      z.add(dz).add(wZ)
+    );
   })();
 
   material.colorNode = Fn(() => {
