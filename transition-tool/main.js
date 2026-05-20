@@ -893,7 +893,7 @@ function initAdvecState() {
   gl.viewport(0, 0, fboW, fboH);
   gl.useProgram(initProg);
   bindImageTextures();
-  const fA = fitInfo(state.imgA, fboW, fboH, state.fit);
+  const fA = composedFit('A', fboW, fboH);
   gl.uniform2f(initUni.aspA, fA.sx, fA.sy);
   gl.uniform2f(initUni.offA, fA.ox, fA.oy);
   gl.uniform1i(initUni.validA, state.imgA ? 1 : 0);
@@ -914,8 +914,8 @@ function advecStep(tAt) {
   gl.activeTexture(gl.TEXTURE2);
   gl.bindTexture(gl.TEXTURE_2D, srcTex);
 
-  const fA = fitInfo(state.imgA, fboW, fboH, state.fit);
-  const fB = fitInfo(state.imgB, fboW, fboH, state.fit);
+  const fA = composedFit('A', fboW, fboH);
+  const fB = composedFit('B', fboW, fboH);
   gl.uniform2f(simUni.aspA, fA.sx, fA.sy); gl.uniform2f(simUni.offA, fA.ox, fA.oy);
   gl.uniform2f(simUni.aspB, fB.sx, fB.sy); gl.uniform2f(simUni.offB, fB.ox, fB.oy);
   gl.uniform1i(simUni.validA, state.imgA ? 1 : 0);
@@ -1041,6 +1041,8 @@ const state = {
   advecSeedImage: 2,     // 0 A, 1 B, 2 both
   fit: 'cover',
   bg: '#000000',
+  zoomA: 1.0, panAx: 0.0, panAy: 0.0,
+  zoomB: 1.0, panBx: 0.0, panBy: 0.0,
   exportFps: 24,
   exportSizeMode: 'src',
   recording: false,
@@ -1077,6 +1079,25 @@ function fitInfo(img, cw, ch, mode) {
     const sx = ia / ca;
     return { sx: sx, sy: 1, ox: (1 - sx) * 0.5, oy: 0 };
   }
+}
+
+// Compose the user's per-image zoom + pan with the fit-mode transform.
+// Math: the shader maps canvasUV → imageUV via q = (canvasUV - offset) / scale.
+// We pre-apply user zoom Z and pan p before the fit, which gives:
+//   scale'  = scale * Z
+//   offset' = Z * offset + 0.5 * (1 - Z) - Z * pan
+function composedFit(slot, cw, ch) {
+  const img = slot === 'A' ? state.imgA : state.imgB;
+  const z   = slot === 'A' ? state.zoomA : state.zoomB;
+  const px  = slot === 'A' ? state.panAx : state.panBx;
+  const py  = slot === 'A' ? state.panAy : state.panBy;
+  const f = fitInfo(img, cw, ch, state.fit);
+  return {
+    sx: f.sx * z,
+    sy: f.sy * z,
+    ox: z * f.ox + 0.5 * (1 - z) - z * px,
+    oy: z * f.oy + 0.5 * (1 - z) - z * py,
+  };
 }
 
 // Sanity-cap the internal render size to the GPU's reported max-texture-size
@@ -1166,8 +1187,8 @@ function render() {
   gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
 
   const cw = canvas.width, ch = canvas.height;
-  const fA = fitInfo(state.imgA, cw, ch, state.fit);
-  const fB = fitInfo(state.imgB, cw, ch, state.fit);
+  const fA = composedFit('A', cw, ch);
+  const fB = composedFit('B', cw, ch);
   gl.uniform2f(U.aspA, fA.sx, fA.sy);
   gl.uniform2f(U.offA, fA.ox, fA.oy);
   gl.uniform2f(U.aspB, fB.sx, fB.sy);
@@ -1723,6 +1744,29 @@ tip(fAtm.addBinding(state, 'warmth',   { min: -1, max: 1, step: 0.01 }),
 tip(fAtm.addBinding(state, 'vignette', { min: 0, max: 1, step: 0.01 }),
     'Radial darken that breathes in at peak.');
 
+// IMAGE FRAMING (zoom + pan per image, collapsed by default) ----------------
+const fImgA = pane.addFolder({ title: 'Image A — framing', expanded: false });
+tip(fImgA.addBinding(state, 'zoomA', { min: 0.5, max: 4, step: 0.01, label: 'zoom' }),
+    'Scale image A in/out of the canvas. >1 crops to the centre; <1 lets it shrink with margins.');
+tip(fImgA.addBinding(state, 'panAx', { min: -1, max: 1, step: 0.005, label: 'pan x' }),
+    'Horizontal pan of A. Negative = look left of centre; positive = right.');
+tip(fImgA.addBinding(state, 'panAy', { min: -1, max: 1, step: 0.005, label: 'pan y' }),
+    'Vertical pan of A. Negative = look down; positive = up.');
+fImgA.addButton({ title: 'Reset A framing' }).on('click', () => {
+  state.zoomA = 1; state.panAx = 0; state.panAy = 0; pane.refresh();
+});
+
+const fImgB = pane.addFolder({ title: 'Image B — framing', expanded: false });
+tip(fImgB.addBinding(state, 'zoomB', { min: 0.5, max: 4, step: 0.01, label: 'zoom' }),
+    'Scale image B in/out of the canvas. >1 crops to the centre; <1 lets it shrink with margins.');
+tip(fImgB.addBinding(state, 'panBx', { min: -1, max: 1, step: 0.005, label: 'pan x' }),
+    'Horizontal pan of B. Negative = look left of centre; positive = right.');
+tip(fImgB.addBinding(state, 'panBy', { min: -1, max: 1, step: 0.005, label: 'pan y' }),
+    'Vertical pan of B. Negative = look down; positive = up.');
+fImgB.addButton({ title: 'Reset B framing' }).on('click', () => {
+  state.zoomB = 1; state.panBx = 0; state.panBy = 0; pane.refresh();
+});
+
 // STYLE (collapsed) ---------------------------------------------------------
 const fStyle = pane.addFolder({ title: 'Style', expanded: false });
 fStyle.addBinding(state, 'fit', {
@@ -1749,7 +1793,9 @@ fExp.addBinding(state, 'exportSizeMode', {
   },
 });
 const btnRecord = fExp.addButton({ title: 'Record .webm' });
-btnRecord.on('click', startRecording);
+btnRecord.on('click', () => startRecording());
+const btnBatch = fExp.addButton({ title: 'Batch record presets (15 s each)' });
+btnBatch.on('click', batchRecordPresets);
 
 // PRESETS -------------------------------------------------------------------
 // Snapshot only the fields that describe the look; skip transient ones (t, imgA/B, etc).
@@ -1771,6 +1817,7 @@ const PRESET_KEYS = [
   'advecSeedCount', 'advecSeedRadius', 'advecSeedSource', 'advecSeedImage',
   'organic', 'edges', 'spread', 'maskScale',
   'softness', 'glow', 'bloom', 'warmth', 'vignette',
+  'zoomA', 'panAx', 'panAy', 'zoomB', 'panBx', 'panBy',
 ];
 
 const FACTORY_PRESETS = {
@@ -1888,7 +1935,42 @@ window.addEventListener('keydown', e => {
 // ============================================================================
 // Recording
 // ============================================================================
-async function startRecording() {
+
+const MODE_NAMES = {
+  0: 'off', 1: 'rim', 2: 'paper', 3: 'blooms', 4: 'diffusion',
+  5: 'sediment', 6: 'salt', 7: 'iris',
+  8: 'wet-bleed', 9: 'pigment-run',
+  10: 'advec', 11: 'advec-gravity', 12: 'advec-curl',
+  13: 'advec-brush', 14: 'advec-seed',
+};
+const SED_SOURCE_NAMES = ['luma', 'sat', 'hue', 'detail', 'temp'];
+const SALT_SOURCE_NAMES = ['random', 'light', 'dark', 'col', 'edge'];
+
+function fixed(v, n = 2) { return (Math.round(v * Math.pow(10, n)) / Math.pow(10, n)).toString(); }
+
+// Build a filename that embeds the current mode and its most relevant params.
+function makeFilename() {
+  const m = state.mode;
+  const parts = [MODE_NAMES[m] || `mode${m}`];
+  if      (m === 1)  parts.push(`rimW=${fixed(state.rimWidth)}`, `dark=${fixed(state.rimDark)}`);
+  else if (m === 2)  parts.push(`ang=${fixed(state.paperAngle)}`, `aniso=${fixed(state.paperAniso, 1)}`, `gran=${fixed(state.paperGranulation)}`);
+  else if (m === 3)  parts.push(`n=${state.bloomCount}`, `rate=${fixed(state.bloomRate)}`, `rim=${fixed(state.bloomRim)}`);
+  else if (m === 4)  parts.push(`str=${fixed(state.diffStrength)}`, `r=${fixed(state.diffRadius)}`);
+  else if (m === 5)  parts.push(`by=${SED_SOURCE_NAMES[state.sedSource] || 'luma'}`, `bands=${state.sedBands}`, `soft=${fixed(state.sedSoftness)}`);
+  else if (m === 6)  parts.push(`from=${SALT_SOURCE_NAMES[state.saltSource] || 'random'}`, `grain=${fixed(state.saltDensity)}`, `bias=${fixed(state.saltBias)}`);
+  else if (m === 7)  parts.push(`focus=${fixed(state.irisFocusX)}-${fixed(state.irisFocusY)}`, `jit=${fixed(state.irisJitter)}`);
+  else if (m === 8)  parts.push(`fing=${fixed(state.bleedFinger)}`, `amt=${fixed(state.bleedAmount)}`, `halo=${fixed(state.bleedHalo)}`);
+  else if (m === 9)  parts.push(`grav=${fixed(state.runGravity)}`, `drip=${fixed(state.runDrip)}`);
+  else if (m === 10) parts.push(`visc=${fixed(state.advecVisc)}`, `rate=${fixed(state.advecRate)}`);
+  else if (m === 11) parts.push(`grav=${fixed(state.advecGravity)}`, `ang=${fixed(state.advecGravAngle)}`, `streak=${fixed(state.advecGravStreak)}`);
+  else if (m === 12) parts.push(`curl=${fixed(state.advecCurlStr)}`, `scale=${fixed(state.advecCurlScale, 1)}`);
+  else if (m === 13) parts.push(`follow=${fixed(state.advecBrushFollow)}`);
+  else if (m === 14) parts.push(`from=${SALT_SOURCE_NAMES[state.advecSeedSource] || 'random'}`, `n=${state.advecSeedCount}`, `r=${fixed(state.advecSeedRadius)}`);
+  parts.push(`${Math.round(state.duration)}s`);
+  return `morph__${parts.join('__')}.webm`;
+}
+
+async function startRecording(opts = {}) {
   if (state.recording) return;
   if (!state.imgA || !state.imgB) return;
 
@@ -1914,7 +1996,7 @@ async function startRecording() {
 
   state.recording = true;
   const originalTitle = btnRecord.title;
-  btnRecord.title = 'Recording…';
+  btnRecord.title = opts.statusPrefix ? `${opts.statusPrefix} Recording…` : 'Recording…';
 
   const totalFrames = Math.max(2, Math.round(state.duration * fps));
   rec.start();
@@ -1927,7 +2009,7 @@ async function startRecording() {
     state.t = i / (totalFrames - 1);
     drawOnce();
     offCtx.drawImage(canvas, 0, 0, recW, recH);
-    btnRecord.title = `frame ${i + 1} / ${totalFrames}`;
+    btnRecord.title = `${opts.statusPrefix || ''} frame ${i + 1} / ${totalFrames}`;
     await new Promise(r => setTimeout(r, 1000 / fps));
   }
 
@@ -1936,15 +2018,50 @@ async function startRecording() {
 
   const blob = new Blob(chunks, { type: mime });
   const url = URL.createObjectURL(blob);
+  const filename = opts.filename || makeFilename();
   const a = document.createElement('a');
-  a.href = url; a.download = `morph_${Date.now()}.webm`; a.click();
+  a.href = url; a.download = filename; a.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 
   state.recording = false;
   btnRecord.title = `saved (${(blob.size / 1024 / 1024).toFixed(1)} MB)`;
-  setTimeout(() => { btnRecord.title = originalTitle; }, 2500);
+  if (!opts.keepTitle) setTimeout(() => { btnRecord.title = originalTitle; }, 2500);
   state.t = prevT;
   state.playing = wasPlaying;
+}
+
+// Iterate every factory preset, force 15 s duration, record each to disk with
+// a mode-descriptive filename. Restores original state at the end.
+async function batchRecordPresets() {
+  if (state.recording) return;
+  if (!state.imgA || !state.imgB) return;
+
+  const before = snapshotState();
+  const beforeDuration = state.duration;
+  const names = Object.keys(FACTORY_PRESETS);
+  for (let i = 0; i < names.length; i++) {
+    const name = names[i];
+    applyPreset('factory:' + name);
+    state.duration = 15;
+    pane.refresh();
+    advec.needsReset = true;
+    await new Promise(r => requestAnimationFrame(r));
+    await new Promise(r => requestAnimationFrame(r));
+    const safe = name.replace(/[^a-z0-9-]+/gi, '-').toLowerCase();
+    const fname = `morph__${safe}__${makeFilename().replace(/^morph__/, '')}`;
+    await startRecording({
+      filename: fname,
+      statusPrefix: `[${i + 1}/${names.length}]`,
+      keepTitle: i < names.length - 1,
+    });
+    await new Promise(r => setTimeout(r, 500));
+  }
+  // restore
+  for (const k of PRESET_KEYS) if (k in before) state[k] = before[k];
+  state.duration = beforeDuration;
+  pane.refresh();
+  advec.needsReset = true;
+  btnRecord.title = 'Record .webm';
 }
 
 // Synchronous draw (used by the recorder so we don't depend on rAF cadence)
@@ -1953,8 +2070,8 @@ function drawOnce() {
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texA);
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texB);
   const cw = canvas.width, ch = canvas.height;
-  const fA = fitInfo(state.imgA, cw, ch, state.fit);
-  const fB = fitInfo(state.imgB, cw, ch, state.fit);
+  const fA = composedFit('A', cw, ch);
+  const fB = composedFit('B', cw, ch);
   gl.uniform2f(U.aspA, fA.sx, fA.sy); gl.uniform2f(U.offA, fA.ox, fA.oy);
   gl.uniform2f(U.aspB, fB.sx, fB.sy); gl.uniform2f(U.offB, fB.ox, fB.oy);
   pushUniforms();
