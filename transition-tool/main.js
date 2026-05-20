@@ -42,8 +42,9 @@ uniform float u_seed;
 // watercolor mode:
 //   0 off, 1 rim, 2 paper, 3 blooms, 4 diffusion,
 //   5 sediment, 6 salt, 7 iris,
-//   8 wet bleed (fingering), 9 pigment run (gravity), 10 stroke bleed,
-//   11 wet advection (FBO sim)
+//   8 wet bleed (fingering), 9 pigment run (gravity),
+//   10 wet advection, 11 gravity advection, 12 curl-noise eddies,
+//   13 brush-channel advection, 14 seed-point injection
 uniform int   u_mode;
 uniform float u_rimWidth;
 uniform float u_rimDark;
@@ -74,9 +75,6 @@ uniform float u_bleedHalo;         // saturated wet halo at the front
 // Pigment run (gravity)
 uniform float u_runGravity;        // 0 = pure luma, 1 = full top-to-bottom
 uniform float u_runDrip;           // vertical sample offset
-// Stroke bleed
-uniform float u_strokeReach;       // offset distance along stroke direction
-uniform float u_strokeSoftness;    // along-stroke blur
 // Wet advection (FBO sim) — display path reads from the simulated state tex
 uniform sampler2D u_advecState;
 
@@ -293,20 +291,6 @@ float irisMask(vec2 uv) {
   return clamp(r + jitter, 0.0, 1.0);
 }
 
-// Stroke direction from A's local luma gradient (perpendicular to it).
-// Returns the unit stroke vector, or (0,0) if the area is too flat.
-vec2 strokeDir(vec2 uv) {
-  float e = 0.003;
-  float lx = luma(sampleFit(u_texA, uv + vec2(e, 0.0), u_aspectA, u_offsetA, u_validA).rgb) -
-             luma(sampleFit(u_texA, uv - vec2(e, 0.0), u_aspectA, u_offsetA, u_validA).rgb);
-  float ly = luma(sampleFit(u_texA, uv + vec2(0.0, e), u_aspectA, u_offsetA, u_validA).rgb) -
-             luma(sampleFit(u_texA, uv - vec2(0.0, e), u_aspectA, u_offsetA, u_validA).rgb);
-  vec2 grad = vec2(lx, ly);
-  float g = length(grad);
-  if (g < 1e-4) return vec2(0.0);
-  return vec2(-grad.y, grad.x) / g;
-}
-
 // Wet bleed mask: luminance-based base + anisotropic high-freq noise that
 // produces finger-like protrusions at the dissolve front (Saffman-Taylor
 // instability look).
@@ -351,9 +335,10 @@ float maskAt(vec2 uv) {
 void main() {
   vec2 uv = v_uv;
 
-  // Wet advection mode: the heavy lifting happens in the sim shader writing to
-  // a ping-pong FBO. Here we just sample the simulated state and output it.
-  if (u_mode == 11) {
+  // Advection family (modes 10..14): the heavy lifting happens in the sim
+  // shader writing to a ping-pong FBO. Here we just sample the simulated
+  // state and output it.
+  if (u_mode >= 10 && u_mode <= 14) {
     frag = vec4(texture(u_advecState, uv).rgb, 1.0);
     return;
   }
@@ -387,16 +372,6 @@ void main() {
     mask = wetBleedMask(uv, lumA, lumB);
   } else if (u_mode == 9) {
     mask = pigmentRunMask(uv, lumA);
-  } else if (u_mode == 10) {
-    // stroke bleed: mask follows A's luminance (so brushwork structures the
-    // dissolve) and we re-sample B along the stroke direction below.
-    mask = clamp(lumA, 0.0, 1.0);
-    vec2 sd = strokeDir(uv);
-    if (length(sd) > 0.0) {
-      colB = softBlur(u_texB, uv + sd * u_strokeReach * 0.045,
-                      blurR + u_strokeSoftness * 0.015,
-                      u_aspectB, u_offsetB, u_validB);
-    }
   } else {
     float eA = edgeMag(u_texA, uv, u_aspectA, u_offsetA, u_validA);
     float eB = edgeMag(u_texB, uv, u_aspectB, u_offsetB, u_validB);
@@ -552,7 +527,6 @@ const U = {
   irisFocus: uni('u_irisFocus'), irisJitter: uni('u_irisJitter'),
   bleedFinger: uni('u_bleedFinger'), bleedAmount: uni('u_bleedAmount'), bleedHalo: uni('u_bleedHalo'),
   runGravity: uni('u_runGravity'), runDrip: uni('u_runDrip'),
-  strokeReach: uni('u_strokeReach'), strokeSoftness: uni('u_strokeSoftness'),
   advecState: uni('u_advecState'),
   bg: uni('u_bg'), validA: uni('u_validA'), validB: uni('u_validB')
 };
@@ -603,6 +577,16 @@ uniform float u_maskScale;
 uniform float u_organic;
 uniform float u_spread;
 uniform vec3  u_bg;
+// Variant selector: 0 default, 1 gravity, 2 curl, 3 brush-channel, 4 seed
+uniform int   u_variant;
+uniform float u_advGravity;     // gravity: downward weight bias
+uniform float u_advGravBias;    // gravity: mix shadows-of-A into mask
+uniform float u_advCurlStr;     // curl: velocity strength
+uniform float u_advCurlScale;   // curl: noise frequency
+uniform float u_advBrushFollow; // brush-channel: anisotropy strength
+uniform int   u_advSeedCount;   // seed: number of seeds
+uniform float u_advSeedRadius;  // seed: per-seed injection radius
+
 in vec2 v_uv;
 out vec4 frag;
 
@@ -629,30 +613,119 @@ vec4 sampleFit(sampler2D tex, vec2 uv, vec2 scale, vec2 offset, int valid) {
   return texture(tex, q);
 }
 
+// 2D curl of a scalar fbm field — gives a divergence-free velocity field.
+vec2 curlField(vec2 uv) {
+  float e = 0.004;
+  vec2 p = uv * u_advCurlScale;
+  float p_yp = fbm(p + vec2(0.0, e));
+  float p_yn = fbm(p - vec2(0.0, e));
+  float p_xp = fbm(p + vec2(e, 0.0));
+  float p_xn = fbm(p - vec2(e, 0.0));
+  return vec2(p_yp - p_yn, p_xn - p_xp);
+}
+
 void main() {
   vec2 uv = v_uv;
 
-  // 8-tap neighbour average for soft diffusion
-  vec3 cur = texture(u_state, uv).rgb;
-  vec3 nb = (
-    texture(u_state, uv + vec2(u_pixel.x, 0.0)).rgb +
-    texture(u_state, uv - vec2(u_pixel.x, 0.0)).rgb +
-    texture(u_state, uv + vec2(0.0, u_pixel.y)).rgb +
-    texture(u_state, uv - vec2(0.0, u_pixel.y)).rgb +
-    texture(u_state, uv + u_pixel * 0.7071).rgb +
-    texture(u_state, uv - u_pixel * 0.7071).rgb +
-    texture(u_state, uv + vec2(u_pixel.x, -u_pixel.y) * 0.7071).rgb +
-    texture(u_state, uv + vec2(-u_pixel.x, u_pixel.y) * 0.7071).rgb
-  ) * 0.125;
-  vec3 diffused = mix(cur, nb, u_visc);
-
-  // image-aware mask: noise + luma delta
+  // ---- A and B colour samples (shared across variants) ----
   vec3 cA = sampleFit(u_texA, uv, u_aspectA, u_offsetA, u_validA).rgb;
   vec3 cB = sampleFit(u_texB, uv, u_aspectB, u_offsetB, u_validB).rgb;
-  float n = fbm(uv * u_maskScale + u_seed * 0.13);
   float lA = luma(cA), lB = luma(cB);
+
+  // ---- Read previous state, possibly advected ----
+  vec3 cur;
+  if (u_variant == 2 && u_advCurlStr > 0.001) {
+    // Curl-noise: read state from upstream (uv - velocity)
+    vec2 vel = curlField(uv) * u_advCurlStr * 0.06;
+    cur = texture(u_state, uv - vel).rgb;
+  } else {
+    cur = texture(u_state, uv).rgb;
+  }
+
+  // ---- Diffusion step (variant-dependent kernel) ----
+  vec3 nb;
+  if (u_variant == 1) {
+    // Gravity: weight upward neighbours more so pigment "falls" into this pixel.
+    float wu = 1.0 + u_advGravity * 1.2;   // received from above
+    float wd = max(0.0, 1.0 - u_advGravity * 0.8);  // received from below
+    float wh = 1.0;  // horizontal
+    float wsum = wu + wd + 2.0 * wh + 4.0 * 0.7071;
+    nb = (
+      texture(u_state, uv + vec2(u_pixel.x, 0.0)).rgb * wh +
+      texture(u_state, uv - vec2(u_pixel.x, 0.0)).rgb * wh +
+      texture(u_state, uv + vec2(0.0, u_pixel.y)).rgb * wu +
+      texture(u_state, uv - vec2(0.0, u_pixel.y)).rgb * wd +
+      texture(u_state, uv + u_pixel * 0.7071).rgb * 0.7071 +
+      texture(u_state, uv - u_pixel * 0.7071).rgb * 0.7071 +
+      texture(u_state, uv + vec2(u_pixel.x, -u_pixel.y) * 0.7071).rgb * 0.7071 +
+      texture(u_state, uv + vec2(-u_pixel.x, u_pixel.y) * 0.7071).rgb * 0.7071
+    ) / wsum;
+  } else if (u_variant == 3) {
+    // Brush-channel: anisotropic diffusion along A's stroke direction
+    // (perpendicular to its luma gradient).
+    float e = 0.003;
+    float gx = luma(sampleFit(u_texA, uv + vec2(e, 0.0), u_aspectA, u_offsetA, u_validA).rgb) -
+               luma(sampleFit(u_texA, uv - vec2(e, 0.0), u_aspectA, u_offsetA, u_validA).rgb);
+    float gy = luma(sampleFit(u_texA, uv + vec2(0.0, e), u_aspectA, u_offsetA, u_validA).rgb) -
+               luma(sampleFit(u_texA, uv - vec2(0.0, e), u_aspectA, u_offsetA, u_validA).rgb);
+    vec2 grad = vec2(gx, gy);
+    float glen = length(grad);
+    vec2 sd = (glen > 1e-4) ? vec2(-grad.y, grad.x) / glen : vec2(1.0, 0.0);
+    // Weight along ±sd higher than perpendicular.
+    float follow = u_advBrushFollow;
+    vec2 perp = vec2(-sd.y, sd.x);
+    float wAlong = 1.0 + follow * 1.5;
+    float wPerp  = max(0.0, 1.0 - follow * 0.85);
+    nb = (
+      texture(u_state, uv + sd * u_pixel.x * 1.4).rgb * wAlong +
+      texture(u_state, uv - sd * u_pixel.x * 1.4).rgb * wAlong +
+      texture(u_state, uv + perp * u_pixel.x).rgb * wPerp +
+      texture(u_state, uv - perp * u_pixel.x).rgb * wPerp
+    ) / (2.0 * wAlong + 2.0 * wPerp + 1e-4);
+  } else {
+    // Default isotropic 8-tap (used by variants 0, 2, 4).
+    nb = (
+      texture(u_state, uv + vec2(u_pixel.x, 0.0)).rgb +
+      texture(u_state, uv - vec2(u_pixel.x, 0.0)).rgb +
+      texture(u_state, uv + vec2(0.0, u_pixel.y)).rgb +
+      texture(u_state, uv - vec2(0.0, u_pixel.y)).rgb +
+      texture(u_state, uv + u_pixel * 0.7071).rgb +
+      texture(u_state, uv - u_pixel * 0.7071).rgb +
+      texture(u_state, uv + vec2(u_pixel.x, -u_pixel.y) * 0.7071).rgb +
+      texture(u_state, uv + vec2(-u_pixel.x, u_pixel.y) * 0.7071).rgb
+    ) * 0.125;
+  }
+  vec3 diffused = mix(cur, nb, u_visc);
+
+  // ---- Mask & B-injection (variant-dependent) ----
+  float mask;
+  float n = fbm(uv * u_maskScale + u_seed * 0.13);
   float lumMask = 0.5 + 0.5 * (lB - lA);
-  float mask = mix(n, lumMask, u_organic);
+
+  if (u_variant == 1) {
+    // Gravity: bias toward shadows-of-A AND vertical position (bottom first)
+    float shadow = lA;          // dark A → low value → reveals earlier
+    float grav   = 1.0 - uv.y;  // bottom (uv.y=0) → 1 (... wait, low mask reveals first)
+    // we want bottom to reveal first → mask LOW at bottom → mask = uv.y
+    grav = uv.y;
+    float gMask = mix(shadow, grav, u_advGravBias);
+    mask = mix(n, gMask, u_organic);
+  } else if (u_variant == 4) {
+    // Seed-point: distance to nearest seed point determines reveal threshold.
+    float minD = 9999.0;
+    for (int i = 0; i < 16; i++) {
+      if (i >= u_advSeedCount) break;
+      float fi = float(i) + u_seed * 0.07 + 1.0;
+      vec2 sp = vec2(hash(vec2(fi * 1.3, 13.0)), hash(vec2(fi * 2.7, 47.0)));
+      float d = distance(uv, sp);
+      minD = min(minD, d);
+    }
+    // mask = distance / radius, so pixels close to a seed reveal earliest
+    mask = clamp(minD / max(u_advSeedRadius, 0.05), 0.0, 1.0);
+  } else {
+    // Default / curl / brush: noise + lum mix
+    mask = mix(n, lumMask, u_organic);
+  }
 
   float sp = mix(0.1, 0.5, u_spread);
   float reveal = smoothstep(mask - sp, mask + sp * 0.3, u_t);
@@ -705,6 +778,14 @@ const simUni = {
   organic:   gl.getUniformLocation(simProg, 'u_organic'),
   spread:    gl.getUniformLocation(simProg, 'u_spread'),
   bg:        gl.getUniformLocation(simProg, 'u_bg'),
+  variant:    gl.getUniformLocation(simProg, 'u_variant'),
+  gravity:    gl.getUniformLocation(simProg, 'u_advGravity'),
+  gravBias:   gl.getUniformLocation(simProg, 'u_advGravBias'),
+  curlStr:    gl.getUniformLocation(simProg, 'u_advCurlStr'),
+  curlScale:  gl.getUniformLocation(simProg, 'u_advCurlScale'),
+  brushFollow: gl.getUniformLocation(simProg, 'u_advBrushFollow'),
+  seedCount:  gl.getUniformLocation(simProg, 'u_advSeedCount'),
+  seedRadius: gl.getUniformLocation(simProg, 'u_advSeedRadius'),
 };
 gl.uniform1i(simUni.state, 2);
 gl.uniform1i(simUni.texA, 0);
@@ -811,6 +892,15 @@ function advecStep(tAt) {
   gl.uniform1f(simUni.maskScale, state.maskScale);
   gl.uniform1f(simUni.organic, state.organic);
   gl.uniform1f(simUni.spread, state.spread);
+  // variant = state.mode - 10
+  gl.uniform1i(simUni.variant, state.mode - 10);
+  gl.uniform1f(simUni.gravity, state.advecGravity);
+  gl.uniform1f(simUni.gravBias, state.advecGravBias);
+  gl.uniform1f(simUni.curlStr, state.advecCurlStr);
+  gl.uniform1f(simUni.curlScale, state.advecCurlScale);
+  gl.uniform1f(simUni.brushFollow, state.advecBrushFollow);
+  gl.uniform1i(simUni.seedCount, state.advecSeedCount);
+  gl.uniform1f(simUni.seedRadius, state.advecSeedRadius);
   const bg = hexToRgb(state.bg);
   gl.uniform3f(simUni.bg, bg[0], bg[1], bg[2]);
 
@@ -893,11 +983,16 @@ const state = {
   bleedHalo: 0.5,
   runGravity: 0.5,
   runDrip: 0.35,
-  strokeReach: 0.35,
-  strokeSoftness: 0.25,
   advecVisc: 0.55,
   advecRate: 0.18,
   advecSteps: 3,
+  advecGravity: 0.6,
+  advecGravBias: 0.5,
+  advecCurlStr: 0.5,
+  advecCurlScale: 2.5,
+  advecBrushFollow: 0.7,
+  advecSeedCount: 5,
+  advecSeedRadius: 0.45,
   fit: 'cover',
   bg: '#000000',
   exportFps: 24,
@@ -1001,7 +1096,7 @@ function render() {
 
   // Advection mode runs its sim into FBOs first, then we display the result.
   let advecTex = null;
-  if (state.mode === 11) {
+  if (state.mode >= 10 && state.mode <= 14) {
     advecTex = runAdvection();
   }
 
@@ -1079,8 +1174,6 @@ function pushUniforms() {
   gl.uniform1f(U.bleedHalo, state.bleedHalo);
   gl.uniform1f(U.runGravity, state.runGravity);
   gl.uniform1f(U.runDrip, state.runDrip);
-  gl.uniform1f(U.strokeReach, state.strokeReach);
-  gl.uniform1f(U.strokeSoftness, state.strokeSoftness);
   const bg = hexToRgb(state.bg);
   gl.uniform3f(U.bg, bg[0], bg[1], bg[2]);
   gl.uniform1i(U.validA, state.imgA ? 1 : 0);
@@ -1255,12 +1348,15 @@ tip(
       'tonal sediment':  5,
       'salt':            6,
       'iris':            7,
-      'wet bleed':       8,
-      'pigment run':     9,
-      'stroke bleed':    10,
-      'wet advection':   11,
+      'wet bleed':              8,
+      'pigment run':            9,
+      'wet advection':          10,
+      'gravity advection':      11,
+      'curl-noise eddies':      12,
+      'brush-channel advection': 13,
+      'seed-point injection':   14,
     },
-  }).on('change', () => updateModeFolders()),
+  }).on('change', () => { updateModeFolders(); advec.needsReset = true; }),
   'Watercolor behaviour layered on top of the dissolve.'
 );
 
@@ -1273,8 +1369,11 @@ const fSalt   = fWater.addFolder({ title: 'Salt',           expanded: true });
 const fIris   = fWater.addFolder({ title: 'Iris',           expanded: true });
 const fBleed  = fWater.addFolder({ title: 'Wet bleed',      expanded: true });
 const fRun    = fWater.addFolder({ title: 'Pigment run',    expanded: true });
-const fStroke = fWater.addFolder({ title: 'Stroke bleed',   expanded: true });
-const fAdvec  = fWater.addFolder({ title: 'Wet advection',  expanded: true });
+const fAdvec   = fWater.addFolder({ title: 'Wet advection',          expanded: true });
+const fAdvecG  = fWater.addFolder({ title: 'Gravity advection',      expanded: true });
+const fAdvecC  = fWater.addFolder({ title: 'Curl-noise eddies',      expanded: true });
+const fAdvecB  = fWater.addFolder({ title: 'Brush-channel advection', expanded: true });
+const fAdvecS  = fWater.addFolder({ title: 'Seed-point injection',   expanded: true });
 
 tip(fRim.addBinding(state, 'rimWidth', { min: 0, max: 0.4, step: 0.005, label: 'rim width' }),
     'Thickness of the dark settling band at the wet front.');
@@ -1359,11 +1458,6 @@ tip(fRun.addBinding(state, 'runGravity', { min: 0, max: 1, step: 0.01, label: 'g
 tip(fRun.addBinding(state, 'runDrip', { min: 0, max: 1, step: 0.01, label: 'drip' }),
     'Vertical trail of B\'s pigment carried down from just above the front — like wet paint running.');
 
-tip(fStroke.addBinding(state, 'strokeReach', { min: 0, max: 1, step: 0.01, label: 'reach' }),
-    'How far B is offset along A\'s stroke direction. Pigment streaks along the painting\'s existing brushwork.');
-tip(fStroke.addBinding(state, 'strokeSoftness', { min: 0, max: 1, step: 0.01, label: 'softness' }),
-    'Additional blur along the stroke direction. Higher = silkier, more diffuse streaks.');
-
 tip(fAdvec.addBinding(state, 'advecVisc', { min: 0, max: 1, step: 0.01, label: 'viscosity' }),
     'How much each pixel averages with its neighbours per step. Higher = more spread, less crisp.');
 tip(fAdvec.addBinding(state, 'advecRate', { min: 0, max: 1, step: 0.01, label: 'mixing rate' }),
@@ -1371,6 +1465,32 @@ tip(fAdvec.addBinding(state, 'advecRate', { min: 0, max: 1, step: 0.01, label: '
 tip(fAdvec.addBinding(state, 'advecSteps', { min: 1, max: 8, step: 1, label: 'steps / frame' }),
     'Diffusion iterations per rendered frame. More steps = smoother bleed but more GPU cost.');
 fAdvec.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
+
+// Gravity variant
+tip(fAdvecG.addBinding(state, 'advecGravity', { min: 0, max: 1, step: 0.01, label: 'gravity' }),
+    'How strongly pigment is biased toward falling from above into the current pixel.');
+tip(fAdvecG.addBinding(state, 'advecGravBias', { min: 0, max: 1, step: 0.01, label: 'shadow ↔ flow' }),
+    '0 = A\'s shadows attract pigment first; 1 = pure top-to-bottom run regardless of image content.');
+fAdvecG.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
+
+// Curl variant
+tip(fAdvecC.addBinding(state, 'advecCurlStr', { min: 0, max: 1, step: 0.01, label: 'eddy strength' }),
+    'How strongly pigment is carried along the curl velocity field. Higher = more swirling.');
+tip(fAdvecC.addBinding(state, 'advecCurlScale', { min: 0.5, max: 8, step: 0.1, label: 'eddy scale' }),
+    'Scale of the eddies. Low = a few large swirls, high = many small turbulent ones.');
+fAdvecC.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
+
+// Brush-channel variant
+tip(fAdvecB.addBinding(state, 'advecBrushFollow', { min: 0, max: 1, step: 0.01, label: 'follow strokes' }),
+    'How strongly diffusion is aligned with A\'s local brush direction. 0 = isotropic, 1 = pigment travels almost exclusively along strokes.');
+fAdvecB.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
+
+// Seed-point variant
+tip(fAdvecS.addBinding(state, 'advecSeedCount', { min: 1, max: 16, step: 1, label: 'seed count' }),
+    'How many drop-points B\'s pigment seeps from.');
+tip(fAdvecS.addBinding(state, 'advecSeedRadius', { min: 0.1, max: 1, step: 0.01, label: 'reach' }),
+    'How far each seed\'s wash spreads through the canvas (relative to image size).');
+fAdvecS.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
 
 function updateModeFolders() {
   fRim.hidden    = state.mode !== 1;
@@ -1382,8 +1502,11 @@ function updateModeFolders() {
   fIris.hidden   = state.mode !== 7;
   fBleed.hidden  = state.mode !== 8;
   fRun.hidden    = state.mode !== 9;
-  fStroke.hidden = state.mode !== 10;
-  fAdvec.hidden  = state.mode !== 11;
+  fAdvec.hidden   = state.mode !== 10;
+  fAdvecG.hidden  = state.mode !== 11;
+  fAdvecC.hidden  = state.mode !== 12;
+  fAdvecB.hidden  = state.mode !== 13;
+  fAdvecS.hidden  = state.mode !== 14;
 }
 updateModeFolders();
 
@@ -1403,8 +1526,8 @@ fDis.addBinding(state, 'curve', {
 tip(fDis.addBinding(state, 'seed', { min: 0, max: 999, step: 1 }),
     'Random seed — shifts the mask and bloom positions.');
 
-// ATMOSPHERE ----------------------------------------------------------------
-const fAtm = pane.addFolder({ title: 'Atmosphere', expanded: true });
+// ATMOSPHERE (collapsed by default since defaults are all zero) --------------
+const fAtm = pane.addFolder({ title: 'Atmosphere', expanded: false });
 tip(fAtm.addBinding(state, 'softness', { min: 0, max: 1, step: 0.01 }),
     'Defocus blur radius at the midpoint of the transition.');
 tip(fAtm.addBinding(state, 'glow',     { min: 0, max: 1, step: 0.01 }),
@@ -1457,8 +1580,11 @@ const PRESET_KEYS = [
   'irisFocusX', 'irisFocusY', 'irisJitter',
   'bleedFinger', 'bleedAmount', 'bleedHalo',
   'runGravity', 'runDrip',
-  'strokeReach', 'strokeSoftness',
   'advecVisc', 'advecRate', 'advecSteps',
+  'advecGravity', 'advecGravBias',
+  'advecCurlStr', 'advecCurlScale',
+  'advecBrushFollow',
+  'advecSeedCount', 'advecSeedRadius',
   'organic', 'edges', 'spread', 'maskScale',
   'softness', 'glow', 'bloom', 'warmth', 'vignette',
 ];
