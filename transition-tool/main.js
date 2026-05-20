@@ -41,7 +41,9 @@ uniform float u_seed;
 
 // watercolor mode:
 //   0 off, 1 rim, 2 paper, 3 blooms, 4 diffusion,
-//   5 sediment, 6 salt, 7 iris
+//   5 sediment, 6 salt, 7 iris,
+//   8 wet bleed (fingering), 9 pigment run (gravity), 10 stroke bleed,
+//   11 wet advection (FBO sim)
 uniform int   u_mode;
 uniform float u_rimWidth;
 uniform float u_rimDark;
@@ -65,6 +67,16 @@ uniform float u_saltBias;          // salt: how strongly source biases reveal ti
 uniform int   u_saltImage;         // salt: 0=A, 1=B, 2=both averaged
 uniform vec2  u_irisFocus;         // iris: focal point in UV space
 uniform float u_irisJitter;        // iris: front irregularity
+// Wet bleed (fingering)
+uniform float u_bleedFinger;       // finger anisotropy / freq
+uniform float u_bleedAmount;       // perturbation strength
+uniform float u_bleedHalo;         // saturated wet halo at the front
+// Pigment run (gravity)
+uniform float u_runGravity;        // 0 = pure luma, 1 = full top-to-bottom
+uniform float u_runDrip;           // vertical sample offset
+// Stroke bleed
+uniform float u_strokeReach;       // offset distance along stroke direction
+uniform float u_strokeSoftness;    // along-stroke blur
 
 uniform vec3  u_bg;
 uniform int   u_validA;
@@ -279,6 +291,47 @@ float irisMask(vec2 uv) {
   return clamp(r + jitter, 0.0, 1.0);
 }
 
+// Stroke direction from A's local luma gradient (perpendicular to it).
+// Returns the unit stroke vector, or (0,0) if the area is too flat.
+vec2 strokeDir(vec2 uv) {
+  float e = 0.003;
+  float lx = luma(sampleFit(u_texA, uv + vec2(e, 0.0), u_aspectA, u_offsetA, u_validA).rgb) -
+             luma(sampleFit(u_texA, uv - vec2(e, 0.0), u_aspectA, u_offsetA, u_validA).rgb);
+  float ly = luma(sampleFit(u_texA, uv + vec2(0.0, e), u_aspectA, u_offsetA, u_validA).rgb) -
+             luma(sampleFit(u_texA, uv - vec2(0.0, e), u_aspectA, u_offsetA, u_validA).rgb);
+  vec2 grad = vec2(lx, ly);
+  float g = length(grad);
+  if (g < 1e-4) return vec2(0.0);
+  return vec2(-grad.y, grad.x) / g;
+}
+
+// Wet bleed mask: luminance-based base + anisotropic high-freq noise that
+// produces finger-like protrusions at the dissolve front (Saffman-Taylor
+// instability look).
+float wetBleedMask(vec2 uv, float lumA, float lumB) {
+  float base = mix(0.5, 0.5 + 0.5 * (lumB - lumA), 0.55);
+  // anisotropic noise stretched in one axis for fingering
+  float aniso = mix(8.0, 28.0, u_bleedFinger);
+  vec2 fingUV = uv * vec2(aniso, aniso * 0.35);
+  float n1 = fbm(fingUV + u_seed * 0.3);
+  // low-freq branching
+  float n2 = fbm(uv * 3.0 + u_seed * 0.7);
+  float fingers = (n1 - 0.5) * u_bleedAmount * 0.8 + (n2 - 0.5) * 0.18;
+  return clamp(base + fingers, 0.0, 1.0);
+}
+
+// Pigment run: mask = mix of A's luminance (shadows of A reveal first, as if
+// they're attracting the wash) with vertical position (gravity — bottom of
+// canvas reveals before top). u_runGravity blends the two.
+float pigmentRunMask(vec2 uv, float lumA) {
+  // shadows-of-A first → low mask in dark areas: mask = lumA
+  // gravity: bottom reveals first → mask = uv.y
+  float m = mix(lumA, uv.y, u_runGravity);
+  // small noise jitter so the front isn't a sharp horizontal line
+  float n = (fbm(uv * 2.5 + u_seed * 0.11) - 0.5) * 0.06;
+  return clamp(m + n, 0.0, 1.0);
+}
+
 // Lightweight mask used by the diffusion mode to peek at neighbours
 // (skip the edge term — too many texture taps otherwise).
 float maskAt(vec2 uv) {
@@ -321,6 +374,20 @@ void main() {
     mask = saltMask(uv, colA.rgb, colB.rgb);
   } else if (u_mode == 7) {
     mask = irisMask(uv);
+  } else if (u_mode == 8) {
+    mask = wetBleedMask(uv, lumA, lumB);
+  } else if (u_mode == 9) {
+    mask = pigmentRunMask(uv, lumA);
+  } else if (u_mode == 10) {
+    // stroke bleed: mask follows A's luminance (so brushwork structures the
+    // dissolve) and we re-sample B along the stroke direction below.
+    mask = clamp(lumA, 0.0, 1.0);
+    vec2 sd = strokeDir(uv);
+    if (length(sd) > 0.0) {
+      colB = softBlur(u_texB, uv + sd * u_strokeReach * 0.045,
+                      blurR + u_strokeSoftness * 0.015,
+                      u_aspectB, u_offsetB, u_validB);
+    }
   } else {
     float eA = edgeMag(u_texA, uv, u_aspectA, u_offsetA, u_validA);
     float eB = edgeMag(u_texB, uv, u_aspectB, u_offsetB, u_validB);
@@ -369,6 +436,28 @@ void main() {
       float fade = env * env;
       outc.rgb = mix(outc.rgb, rim, band * darkness * fade * 0.85);
     }
+  }
+
+  // ---- wet bleed: saturated wet halo just inside the front ----
+  if (u_mode == 8 && u_bleedHalo > 0.001 && env > 0.02) {
+    float haloW = 0.005 + u_bleedHalo * 0.06;
+    // halo only where the pixel has already started revealing (inside B's territory)
+    if (t > mask) {
+      float band = exp(-pow((t - mask) / haloW, 2.0));
+      vec3 base = mix(colA.rgb, colB.rgb, 0.75);
+      float lum = luma(base);
+      vec3 saturated = clamp(mix(vec3(lum), base, 1.5), 0.0, 1.0);
+      outc.rgb = mix(outc.rgb, saturated, band * u_bleedHalo * env * 0.4);
+    }
+  }
+
+  // ---- pigment run: vertical drip — pixels just past the front carry a
+  // little of B's pigment from slightly above (as if running down). ----
+  if (u_mode == 9 && u_runDrip > 0.001 && env > 0.02 && t > mask) {
+    float dripBand = exp(-pow((t - mask) / 0.08, 2.0));
+    vec3 dripB = sampleFit(u_texB, uv + vec2(0.0, u_runDrip * 0.05),
+                           u_aspectB, u_offsetB, u_validB).rgb;
+    outc.rgb = mix(outc.rgb, dripB, dripBand * u_runDrip * env * 0.35);
   }
 
   // ---- bloom halo: wide blur of the bright regions, screen-blended back at peak ----
@@ -452,6 +541,9 @@ const U = {
   saltDensity: uni('u_saltDensity'), saltContrast: uni('u_saltContrast'), saltSparkle: uni('u_saltSparkle'),
   saltSource: uni('u_saltSource'), saltBias: uni('u_saltBias'), saltImage: uni('u_saltImage'),
   irisFocus: uni('u_irisFocus'), irisJitter: uni('u_irisJitter'),
+  bleedFinger: uni('u_bleedFinger'), bleedAmount: uni('u_bleedAmount'), bleedHalo: uni('u_bleedHalo'),
+  runGravity: uni('u_runGravity'), runDrip: uni('u_runDrip'),
+  strokeReach: uni('u_strokeReach'), strokeSoftness: uni('u_strokeSoftness'),
   bg: uni('u_bg'), validA: uni('u_validA'), validB: uni('u_validB')
 };
 gl.uniform1i(U.texA, 0);
@@ -522,6 +614,13 @@ const state = {
   irisFocusX: 0.5,
   irisFocusY: 0.5,
   irisJitter: 0.35,
+  bleedFinger: 0.5,
+  bleedAmount: 0.45,
+  bleedHalo: 0.5,
+  runGravity: 0.5,
+  runDrip: 0.35,
+  strokeReach: 0.35,
+  strokeSoftness: 0.25,
   fit: 'cover',
   bg: '#000000',
   exportFps: 24,
@@ -562,19 +661,31 @@ function fitInfo(img, cw, ch, mode) {
   }
 }
 
+// Sanity-cap the internal render size to the GPU's reported max-texture-size
+// (or 8192, whichever is smaller). We still pass the source resolution through
+// when it's smaller. Heights up to 1920, widths essentially unlimited up to
+// the GPU cap. This lets very-wide source images render at 1:1.
+const GL_MAX_TEX = Math.min(gl.getParameter(gl.MAX_TEXTURE_SIZE), 8192);
+
 function resizeCanvas() {
   if (!state.imgA && !state.imgB) return;
   const ref = state.imgA || state.imgB;
-  const maxW = window.innerWidth - 320 - 48;
-  const maxH = window.innerHeight - 48;
+  const minimized = document.body.classList.contains('minimized');
+  const sidePanel = minimized ? 0 : 360;
+  const padding = minimized ? 0 : 32;
+  const maxW = window.innerWidth - sidePanel - padding;
+  const maxH = window.innerHeight - padding;
   const ia = ref.naturalWidth / ref.naturalHeight;
   let w = ref.naturalWidth, h = ref.naturalHeight;
-  // cap to fit screen visually, but keep internal resolution generous for export
-  const internalCap = 1920;
-  if (w > internalCap) { w = internalCap; h = Math.round(internalCap / ia); }
+  // Cap whichever dimension is larger to GL_MAX_TEX, preserving aspect.
+  const longer = Math.max(w, h);
+  if (longer > GL_MAX_TEX) {
+    const scale = GL_MAX_TEX / longer;
+    w = Math.round(w * scale);
+    h = Math.round(h * scale);
+  }
   canvas.width = w;
   canvas.height = h;
-  // CSS size: scale to fit viewport
   const fit = Math.min(maxW / w, maxH / h, 1);
   canvas.style.width = (w * fit) + 'px';
   canvas.style.height = (h * fit) + 'px';
@@ -667,6 +778,13 @@ function pushUniforms() {
   gl.uniform1i(U.saltImage, state.saltImage);
   gl.uniform2f(U.irisFocus, state.irisFocusX, state.irisFocusY);
   gl.uniform1f(U.irisJitter, state.irisJitter);
+  gl.uniform1f(U.bleedFinger, state.bleedFinger);
+  gl.uniform1f(U.bleedAmount, state.bleedAmount);
+  gl.uniform1f(U.bleedHalo, state.bleedHalo);
+  gl.uniform1f(U.runGravity, state.runGravity);
+  gl.uniform1f(U.runDrip, state.runDrip);
+  gl.uniform1f(U.strokeReach, state.strokeReach);
+  gl.uniform1f(U.strokeSoftness, state.strokeSoftness);
   const bg = hexToRgb(state.bg);
   gl.uniform3f(U.bg, bg[0], bg[1], bg[2]);
   gl.uniform1i(U.validA, state.imgA ? 1 : 0);
@@ -779,6 +897,20 @@ window.addEventListener('drop', e => {
 
 window.addEventListener('resize', resizeCanvas);
 
+// ----- panel minimize -----
+const togglePanelBtn = document.getElementById('toggle-panel');
+function setMinimized(min) {
+  document.body.classList.toggle('minimized', min);
+  togglePanelBtn.textContent = min ? '›' : '‹';
+  togglePanelBtn.title = min ? 'Show controls (Tab)' : 'Hide controls (Tab)';
+  // recompute canvas display size for the new layout once the CSS transition starts
+  requestAnimationFrame(() => requestAnimationFrame(resizeCanvas));
+  setTimeout(resizeCanvas, 250);
+}
+togglePanelBtn.addEventListener('click', () => {
+  setMinimized(!document.body.classList.contains('minimized'));
+});
+
 // ----- Tweakpane -----
 const pane = new Pane({ container: document.getElementById('tp-host') });
 
@@ -825,6 +957,9 @@ tip(
       'tonal sediment':  5,
       'salt':            6,
       'iris':            7,
+      'wet bleed':       8,
+      'pigment run':     9,
+      'stroke bleed':    10,
     },
   }).on('change', () => updateModeFolders()),
   'Watercolor behaviour layered on top of the dissolve.'
@@ -837,6 +972,9 @@ const fDiff   = fWater.addFolder({ title: 'Wet diffusion',  expanded: true });
 const fSed    = fWater.addFolder({ title: 'Tonal sediment', expanded: true });
 const fSalt   = fWater.addFolder({ title: 'Salt',           expanded: true });
 const fIris   = fWater.addFolder({ title: 'Iris',           expanded: true });
+const fBleed  = fWater.addFolder({ title: 'Wet bleed',      expanded: true });
+const fRun    = fWater.addFolder({ title: 'Pigment run',    expanded: true });
+const fStroke = fWater.addFolder({ title: 'Stroke bleed',   expanded: true });
 
 tip(fRim.addBinding(state, 'rimWidth', { min: 0, max: 0.4, step: 0.005, label: 'rim width' }),
     'Thickness of the dark settling band at the wet front.');
@@ -909,6 +1047,23 @@ tip(fIris.addBinding(state, 'irisFocusY', { min: 0, max: 1, step: 0.005, label: 
 tip(fIris.addBinding(state, 'irisJitter', { min: 0, max: 1, step: 0.01, label: 'jitter' }),
     'Irregularity of the iris front. Higher = breathes more instead of expanding as a perfect circle.');
 
+tip(fBleed.addBinding(state, 'bleedFinger', { min: 0, max: 1, step: 0.01, label: 'finger' }),
+    'Anisotropy / frequency of the fingering protrusions. Low = chunky fronts, high = fine threads.');
+tip(fBleed.addBinding(state, 'bleedAmount', { min: 0, max: 1, step: 0.01, label: 'amount' }),
+    'How strongly the wet front breaks into finger-like protrusions.');
+tip(fBleed.addBinding(state, 'bleedHalo', { min: 0, max: 1, step: 0.01, label: 'wet halo' }),
+    'Saturated wet halo just inside the front — the sheen of recently-soaked pigment.');
+
+tip(fRun.addBinding(state, 'runGravity', { min: 0, max: 1, step: 0.01, label: 'gravity' }),
+    '0 = A\'s shadows alone determine reveal order; 1 = pure top-to-bottom run (pigment flows downhill).');
+tip(fRun.addBinding(state, 'runDrip', { min: 0, max: 1, step: 0.01, label: 'drip' }),
+    'Vertical trail of B\'s pigment carried down from just above the front — like wet paint running.');
+
+tip(fStroke.addBinding(state, 'strokeReach', { min: 0, max: 1, step: 0.01, label: 'reach' }),
+    'How far B is offset along A\'s stroke direction. Pigment streaks along the painting\'s existing brushwork.');
+tip(fStroke.addBinding(state, 'strokeSoftness', { min: 0, max: 1, step: 0.01, label: 'softness' }),
+    'Additional blur along the stroke direction. Higher = silkier, more diffuse streaks.');
+
 function updateModeFolders() {
   fRim.hidden    = state.mode !== 1;
   fPaper.hidden  = state.mode !== 2;
@@ -917,6 +1072,9 @@ function updateModeFolders() {
   fSed.hidden    = state.mode !== 5;
   fSalt.hidden   = state.mode !== 6;
   fIris.hidden   = state.mode !== 7;
+  fBleed.hidden  = state.mode !== 8;
+  fRun.hidden    = state.mode !== 9;
+  fStroke.hidden = state.mode !== 10;
 }
 updateModeFolders();
 
@@ -964,7 +1122,15 @@ fExp.addBinding(state, 'exportFps', {
 });
 fExp.addBinding(state, 'exportSizeMode', {
   label: 'size',
-  options: { 'source (max)': 'src', '1920×1080': '1920', '1280×720': '1280', '960×540': '960' },
+  options: {
+    'source (full res)': 'src',
+    '5120 wide':         '5120',
+    '3840 wide':         '3840',
+    '2560 wide':         '2560',
+    '1920 wide':         '1920',
+    '1280 wide':         '1280',
+    '960 wide':          '960',
+  },
 });
 const btnRecord = fExp.addButton({ title: 'Record .webm' });
 btnRecord.on('click', startRecording);
@@ -980,6 +1146,9 @@ const PRESET_KEYS = [
   'sedBands', 'sedSoftness', 'sedDirection', 'sedSource',
   'saltDensity', 'saltContrast', 'saltSource', 'saltBias', 'saltImage',
   'irisFocusX', 'irisFocusY', 'irisJitter',
+  'bleedFinger', 'bleedAmount', 'bleedHalo',
+  'runGravity', 'runDrip',
+  'strokeReach', 'strokeSoftness',
   'organic', 'edges', 'spread', 'maskScale',
   'softness', 'glow', 'bloom', 'warmth', 'vignette',
 ];
@@ -1091,6 +1260,7 @@ function applyPreset(id) {
 window.addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') return;
   if (e.key === ' ')           { e.preventDefault(); btnPlay.element.querySelector('button').click(); }
+  if (e.key === 'Tab')         { e.preventDefault(); setMinimized(!document.body.classList.contains('minimized')); }
   if (e.key === 'ArrowLeft')   { state.t = Math.max(0, state.t - 0.02); pane.refresh(); }
   if (e.key === 'ArrowRight')  { state.t = Math.min(1, state.t + 0.02); pane.refresh(); }
 });
