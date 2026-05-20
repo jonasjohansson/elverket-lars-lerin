@@ -579,13 +579,18 @@ uniform float u_spread;
 uniform vec3  u_bg;
 // Variant selector: 0 default, 1 gravity, 2 curl, 3 brush-channel, 4 seed
 uniform int   u_variant;
-uniform float u_advGravity;     // gravity: downward weight bias
-uniform float u_advGravBias;    // gravity: mix shadows-of-A into mask
+uniform float u_advGravity;     // gravity: along-flow weight bias
+uniform float u_advGravBias;    // gravity: mix shadows-of-A vs flow direction in the mask
+uniform float u_advGravAngle;   // gravity: flow direction (0=down, 0.25=right, 0.5=up, 0.75=left)
+uniform float u_advGravStreak;  // gravity: along-flow anisotropy (longer streaks at high values)
+uniform float u_advGravLateral; // gravity: perpendicular spread
 uniform float u_advCurlStr;     // curl: velocity strength
 uniform float u_advCurlScale;   // curl: noise frequency
 uniform float u_advBrushFollow; // brush-channel: anisotropy strength
 uniform int   u_advSeedCount;   // seed: number of seeds
 uniform float u_advSeedRadius;  // seed: per-seed injection radius
+uniform int   u_advSeedFromImg; // seed: 0 random hash, 1 use uploaded positions
+uniform vec2  u_advSeeds[16];   // seed positions in UV space (only used when u_advSeedFromImg == 1)
 
 in vec2 v_uv;
 out vec4 frag;
@@ -645,20 +650,39 @@ void main() {
   // ---- Diffusion step (variant-dependent kernel) ----
   vec3 nb;
   if (u_variant == 1) {
-    // Gravity: weight upward neighbours more so pigment "falls" into this pixel.
-    float wu = 1.0 + u_advGravity * 1.2;   // received from above
-    float wd = max(0.0, 1.0 - u_advGravity * 0.8);  // received from below
-    float wh = 1.0;  // horizontal
-    float wsum = wu + wd + 2.0 * wh + 4.0 * 0.7071;
+    // Gravity with arbitrary direction. flowDir = (sin(a), -cos(a)) so:
+    //   angle 0    → down  (0,-1)
+    //   angle 0.25 → right (1, 0)
+    //   angle 0.5  → up    (0, 1)
+    //   angle 0.75 → left (-1, 0)
+    // Pigment "falls" along +flowDir; the neighbour kernel weights the
+    // upstream direction (against flow) higher so pigment accumulates here.
+    float a = u_advGravAngle * 6.2831853;
+    vec2 flowDir = vec2(sin(a), -cos(a));
+    vec2 perp    = vec2(-flowDir.y, flowDir.x);
+
+    // Anisotropy: streak elongates the kernel along the flow axis.
+    float streak = 1.0 + u_advGravStreak * 2.5;
+    vec2 upstep   = -flowDir * u_pixel.x * streak;  // sample upstream
+    vec2 downstep =  flowDir * u_pixel.x * streak;
+    vec2 latstep  =  perp    * u_pixel.x;
+
+    float wUp   = 1.0 + u_advGravity * 1.6;
+    float wDown = max(0.0, 1.0 - u_advGravity * 0.85);
+    float wLat  = 0.3 + u_advGravLateral * 1.4;
+    float wDiagU = (wUp   + wLat) * 0.5;
+    float wDiagD = (wDown + wLat) * 0.5;
+    float wsum   = wUp + wDown + 2.0 * wLat + 2.0 * wDiagU + 2.0 * wDiagD;
+
     nb = (
-      texture(u_state, uv + vec2(u_pixel.x, 0.0)).rgb * wh +
-      texture(u_state, uv - vec2(u_pixel.x, 0.0)).rgb * wh +
-      texture(u_state, uv + vec2(0.0, u_pixel.y)).rgb * wu +
-      texture(u_state, uv - vec2(0.0, u_pixel.y)).rgb * wd +
-      texture(u_state, uv + u_pixel * 0.7071).rgb * 0.7071 +
-      texture(u_state, uv - u_pixel * 0.7071).rgb * 0.7071 +
-      texture(u_state, uv + vec2(u_pixel.x, -u_pixel.y) * 0.7071).rgb * 0.7071 +
-      texture(u_state, uv + vec2(-u_pixel.x, u_pixel.y) * 0.7071).rgb * 0.7071
+      texture(u_state, uv + upstep).rgb                 * wUp +
+      texture(u_state, uv + downstep).rgb               * wDown +
+      texture(u_state, uv + latstep).rgb                * wLat +
+      texture(u_state, uv - latstep).rgb                * wLat +
+      texture(u_state, uv + upstep * 0.7071 + latstep * 0.7071).rgb   * wDiagU +
+      texture(u_state, uv + upstep * 0.7071 - latstep * 0.7071).rgb   * wDiagU +
+      texture(u_state, uv + downstep * 0.7071 + latstep * 0.7071).rgb * wDiagD +
+      texture(u_state, uv + downstep * 0.7071 - latstep * 0.7071).rgb * wDiagD
     ) / wsum;
   } else if (u_variant == 3) {
     // Brush-channel: anisotropic diffusion along A's stroke direction
@@ -703,24 +727,31 @@ void main() {
   float lumMask = 0.5 + 0.5 * (lB - lA);
 
   if (u_variant == 1) {
-    // Gravity: bias toward shadows-of-A AND vertical position (bottom first)
-    float shadow = lA;          // dark A → low value → reveals earlier
-    float grav   = 1.0 - uv.y;  // bottom (uv.y=0) → 1 (... wait, low mask reveals first)
-    // we want bottom to reveal first → mask LOW at bottom → mask = uv.y
-    grav = uv.y;
-    float gMask = mix(shadow, grav, u_advGravBias);
+    // Bias toward shadows-of-A AND flow progress (pixels far along the flow
+    // direction reveal first). flowDir is recomputed here.
+    float a = u_advGravAngle * 6.2831853;
+    vec2 flowDir = vec2(sin(a), -cos(a));
+    // projection of (uv - centre) onto flowDir: positive = far along flow
+    float flowProgress = 0.5 - dot(uv - 0.5, flowDir);
+    float shadow = lA;
+    float gMask = mix(shadow, flowProgress, u_advGravBias);
     mask = mix(n, gMask, u_organic);
   } else if (u_variant == 4) {
-    // Seed-point: distance to nearest seed point determines reveal threshold.
+    // Seed-point: distance to nearest seed → reveal threshold. Seeds come from
+    // either uploaded image-derived positions or hash-based randomness.
     float minD = 9999.0;
     for (int i = 0; i < 16; i++) {
       if (i >= u_advSeedCount) break;
-      float fi = float(i) + u_seed * 0.07 + 1.0;
-      vec2 sp = vec2(hash(vec2(fi * 1.3, 13.0)), hash(vec2(fi * 2.7, 47.0)));
+      vec2 sp;
+      if (u_advSeedFromImg == 1) {
+        sp = u_advSeeds[i];
+      } else {
+        float fi = float(i) + u_seed * 0.07 + 1.0;
+        sp = vec2(hash(vec2(fi * 1.3, 13.0)), hash(vec2(fi * 2.7, 47.0)));
+      }
       float d = distance(uv, sp);
       minD = min(minD, d);
     }
-    // mask = distance / radius, so pixels close to a seed reveal earliest
     mask = clamp(minD / max(u_advSeedRadius, 0.05), 0.0, 1.0);
   } else {
     // Default / curl / brush: noise + lum mix
@@ -781,11 +812,16 @@ const simUni = {
   variant:    gl.getUniformLocation(simProg, 'u_variant'),
   gravity:    gl.getUniformLocation(simProg, 'u_advGravity'),
   gravBias:   gl.getUniformLocation(simProg, 'u_advGravBias'),
+  gravAngle:  gl.getUniformLocation(simProg, 'u_advGravAngle'),
+  gravStreak: gl.getUniformLocation(simProg, 'u_advGravStreak'),
+  gravLateral: gl.getUniformLocation(simProg, 'u_advGravLateral'),
   curlStr:    gl.getUniformLocation(simProg, 'u_advCurlStr'),
   curlScale:  gl.getUniformLocation(simProg, 'u_advCurlScale'),
   brushFollow: gl.getUniformLocation(simProg, 'u_advBrushFollow'),
-  seedCount:  gl.getUniformLocation(simProg, 'u_advSeedCount'),
-  seedRadius: gl.getUniformLocation(simProg, 'u_advSeedRadius'),
+  seedCount:    gl.getUniformLocation(simProg, 'u_advSeedCount'),
+  seedRadius:   gl.getUniformLocation(simProg, 'u_advSeedRadius'),
+  seedFromImg:  gl.getUniformLocation(simProg, 'u_advSeedFromImg'),
+  seeds:        gl.getUniformLocation(simProg, 'u_advSeeds'),
 };
 gl.uniform1i(simUni.state, 2);
 gl.uniform1i(simUni.texA, 0);
@@ -896,11 +932,16 @@ function advecStep(tAt) {
   gl.uniform1i(simUni.variant, state.mode - 10);
   gl.uniform1f(simUni.gravity, state.advecGravity);
   gl.uniform1f(simUni.gravBias, state.advecGravBias);
+  gl.uniform1f(simUni.gravAngle, state.advecGravAngle);
+  gl.uniform1f(simUni.gravStreak, state.advecGravStreak);
+  gl.uniform1f(simUni.gravLateral, state.advecGravLateral);
   gl.uniform1f(simUni.curlStr, state.advecCurlStr);
   gl.uniform1f(simUni.curlScale, state.advecCurlScale);
   gl.uniform1f(simUni.brushFollow, state.advecBrushFollow);
   gl.uniform1i(simUni.seedCount, state.advecSeedCount);
   gl.uniform1f(simUni.seedRadius, state.advecSeedRadius);
+  gl.uniform1i(simUni.seedFromImg, state.advecSeedSource === 0 ? 0 : 1);
+  gl.uniform2fv(simUni.seeds, seedPositions);
   const bg = hexToRgb(state.bg);
   gl.uniform3f(simUni.bg, bg[0], bg[1], bg[2]);
 
@@ -988,11 +1029,16 @@ const state = {
   advecSteps: 3,
   advecGravity: 0.6,
   advecGravBias: 0.5,
+  advecGravAngle: 0,        // 0 = straight down
+  advecGravStreak: 0.4,
+  advecGravLateral: 0.3,
   advecCurlStr: 0.5,
   advecCurlScale: 2.5,
   advecBrushFollow: 0.7,
   advecSeedCount: 5,
   advecSeedRadius: 0.45,
+  advecSeedSource: 1,    // 0 random, 1 light, 2 dark, 3 coloured, 4 edges
+  advecSeedImage: 2,     // 0 A, 1 B, 2 both
   fit: 'cover',
   bg: '#000000',
   exportFps: 24,
@@ -1213,9 +1259,99 @@ function loadFromUrl(url, slot) {
     dropHint.classList.add('hidden');
     resizeCanvas();
     advec.needsReset = true;
+    recomputeSeedPositions();
     if (typeof maybeAutoplay === 'function') maybeAutoplay();
   };
   img.src = url;
+}
+
+// === image-aware seed positions (for seed-point injection mode) ============
+// Downsample the chosen image to a small grid, score each pixel by the chosen
+// property, greedy-pick top-N positions with a min-distance constraint so the
+// seeds don't cluster. Positions are stored in UV space and uploaded to the
+// sim shader as a vec2[16] uniform.
+const MAX_SEEDS = 16;
+let seedPositions = new Float32Array(MAX_SEEDS * 2);
+
+function recomputeSeedPositions() {
+  // 0=random, 1=light, 2=dark, 3=coloured, 4=edges
+  if (state.advecSeedSource === 0) return;
+  // Choose source image(s)
+  let imgs;
+  if (state.advecSeedImage === 0)      imgs = state.imgA ? [state.imgA] : [];
+  else if (state.advecSeedImage === 1) imgs = state.imgB ? [state.imgB] : [];
+  else                                  imgs = [state.imgA, state.imgB].filter(Boolean);
+  if (imgs.length === 0) return;
+
+  const ref = imgs[0];
+  const w = 96, h = Math.max(8, Math.round(96 * ref.naturalHeight / ref.naturalWidth));
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+
+  // Accumulate score across selected images.
+  const scoreGrid = new Float32Array(w * h);
+  for (const im of imgs) {
+    ctx.clearRect(0, 0, w, h);
+    ctx.drawImage(im, 0, 0, w, h);
+    const data = ctx.getImageData(0, 0, w, h).data;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const i = (y * w + x) * 4;
+        const r = data[i] / 255, g = data[i + 1] / 255, b = data[i + 2] / 255;
+        const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+        let s;
+        if (state.advecSeedSource === 1) {        // light
+          s = lum;
+        } else if (state.advecSeedSource === 2) { // dark
+          s = 1 - lum;
+        } else if (state.advecSeedSource === 3) { // coloured (HSV chroma/max)
+          const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+          s = mx > 1e-4 ? (mx - mn) / mx : 0;
+        } else {                                   // edges (gradient magnitude)
+          if (x === 0 || x === w - 1 || y === 0 || y === h - 1) { s = 0; }
+          else {
+            const lN = (data[((y - 1) * w + x) * 4] / 255) * 0.299 + (data[((y - 1) * w + x) * 4 + 1] / 255) * 0.587 + (data[((y - 1) * w + x) * 4 + 2] / 255) * 0.114;
+            const lS = (data[((y + 1) * w + x) * 4] / 255) * 0.299 + (data[((y + 1) * w + x) * 4 + 1] / 255) * 0.587 + (data[((y + 1) * w + x) * 4 + 2] / 255) * 0.114;
+            const lW = (data[(y * w + x - 1) * 4] / 255) * 0.299 + (data[(y * w + x - 1) * 4 + 1] / 255) * 0.587 + (data[(y * w + x - 1) * 4 + 2] / 255) * 0.114;
+            const lE = (data[(y * w + x + 1) * 4] / 255) * 0.299 + (data[(y * w + x + 1) * 4 + 1] / 255) * 0.587 + (data[(y * w + x + 1) * 4 + 2] / 255) * 0.114;
+            s = Math.hypot(lE - lW, lS - lN);
+          }
+        }
+        scoreGrid[y * w + x] += s;
+      }
+    }
+  }
+  // Build score+position list
+  const list = [];
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      list.push([scoreGrid[y * w + x] / imgs.length, (x + 0.5) / w, 1 - (y + 0.5) / h]);
+    }
+  }
+  list.sort((a, b) => b[0] - a[0]);
+
+  // Greedy non-clustering selection
+  const minDist = 0.12;
+  const picked = [];
+  for (const item of list) {
+    if (picked.length >= MAX_SEEDS) break;
+    if (item[0] <= 0) break;
+    let ok = true;
+    for (const p of picked) {
+      const dx = item[1] - p[1], dy = item[2] - p[2];
+      if (dx * dx + dy * dy < minDist * minDist) { ok = false; break; }
+    }
+    if (ok) picked.push(item);
+  }
+  // Fill any unused slots with the lowest-scoring picked position so the
+  // distance field still resolves; sim respects u_advSeedCount as the cutoff.
+  while (picked.length < MAX_SEEDS) picked.push(picked[picked.length - 1] || [0, 0.5, 0.5]);
+  for (let i = 0; i < MAX_SEEDS; i++) {
+    seedPositions[i * 2]     = picked[i][1];
+    seedPositions[i * 2 + 1] = picked[i][2];
+  }
+  advec.needsReset = true;
 }
 
 function updateSlotPreview(slot, url) {
@@ -1246,6 +1382,7 @@ document.getElementById('swap').addEventListener('click', () => {
   if (state.imgA) uploadImage(texA, state.imgA);
   if (state.imgB) uploadImage(texB, state.imgB);
   advec.needsReset = true;
+  recomputeSeedPositions();
   const sA = document.querySelector('.slot[data-slot="A"] img');
   const sB = document.querySelector('.slot[data-slot="B"] img');
   if (sA && sB)        { const tmp = sA.src; sA.src = sB.src; sB.src = tmp; }
@@ -1316,6 +1453,7 @@ tip(fPlay.addBinding(state, 'duration', { min: 0.5, max: 30, step: 0.1 }),
     'Total duration of the morph in seconds.');
 
 const btnPlay = fPlay.addButton({ title: 'Pause' });
+const btnRestart = fPlay.addButton({ title: 'Restart from start' });
 const btnLoop = fPlay.addButton({ title: 'Loop: on' });
 
 btnPlay.on('click', () => {
@@ -1328,6 +1466,14 @@ btnPlay.on('click', () => {
     state.startTime = performance.now() - consumed * state.duration * 1000;
     btnPlay.title = 'Pause';
   }
+});
+btnRestart.on('click', () => {
+  state.t = 0;
+  state.reverse = false;
+  state.playing = true;
+  state.startTime = performance.now();
+  btnPlay.title = 'Pause';
+  advec.needsReset = true; // will warm up the sim from A
 });
 btnLoop.on('click', () => {
   state.loop = !state.loop;
@@ -1467,10 +1613,16 @@ tip(fAdvec.addBinding(state, 'advecSteps', { min: 1, max: 8, step: 1, label: 'st
 fAdvec.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
 
 // Gravity variant
+tip(fAdvecG.addBinding(state, 'advecGravAngle', { min: 0, max: 1, step: 0.005, label: 'flow angle' }),
+    'Direction pigment falls. 0 = down, 0.25 = right, 0.5 = up, 0.75 = left.');
 tip(fAdvecG.addBinding(state, 'advecGravity', { min: 0, max: 1, step: 0.01, label: 'gravity' }),
-    'How strongly pigment is biased toward falling from above into the current pixel.');
+    'How strongly the upstream neighbour contributes vs the downstream one. Higher = harder fall.');
+tip(fAdvecG.addBinding(state, 'advecGravStreak', { min: 0, max: 1, step: 0.01, label: 'streak' }),
+    'Anisotropy along the flow axis. Higher = longer trailing streaks of pigment.');
+tip(fAdvecG.addBinding(state, 'advecGravLateral', { min: 0, max: 1, step: 0.01, label: 'lateral spread' }),
+    'Perpendicular bleed. Low = narrow streams, high = wider gentle washes.');
 tip(fAdvecG.addBinding(state, 'advecGravBias', { min: 0, max: 1, step: 0.01, label: 'shadow ↔ flow' }),
-    '0 = A\'s shadows attract pigment first; 1 = pure top-to-bottom run regardless of image content.');
+    '0 = A\'s shadows attract pigment first; 1 = pure spatial flow regardless of image content.');
 fAdvecG.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
 
 // Curl variant
@@ -1486,6 +1638,22 @@ tip(fAdvecB.addBinding(state, 'advecBrushFollow', { min: 0, max: 1, step: 0.01, 
 fAdvecB.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
 
 // Seed-point variant
+tip(fAdvecS.addBinding(state, 'advecSeedSource', {
+  label: 'place at',
+  options: {
+    'random':         0,
+    'light areas':    1,
+    'dark areas':     2,
+    'coloured areas': 3,
+    'edge detail':    4,
+  },
+}), 'Where seeds are placed: random, or biased to a property of the source images so the bleed grows out of the painting\'s own structure.')
+  .on('change', () => recomputeSeedPositions());
+tip(fAdvecS.addBinding(state, 'advecSeedImage', {
+  label: 'sample',
+  options: { 'A': 0, 'B': 1, 'both': 2 },
+}), 'Which painting the seed placement reads from.')
+  .on('change', () => recomputeSeedPositions());
 tip(fAdvecS.addBinding(state, 'advecSeedCount', { min: 1, max: 16, step: 1, label: 'seed count' }),
     'How many drop-points B\'s pigment seeps from.');
 tip(fAdvecS.addBinding(state, 'advecSeedRadius', { min: 0.1, max: 1, step: 0.01, label: 'reach' }),
@@ -1581,10 +1749,10 @@ const PRESET_KEYS = [
   'bleedFinger', 'bleedAmount', 'bleedHalo',
   'runGravity', 'runDrip',
   'advecVisc', 'advecRate', 'advecSteps',
-  'advecGravity', 'advecGravBias',
+  'advecGravity', 'advecGravBias', 'advecGravAngle', 'advecGravStreak', 'advecGravLateral',
   'advecCurlStr', 'advecCurlScale',
   'advecBrushFollow',
-  'advecSeedCount', 'advecSeedRadius',
+  'advecSeedCount', 'advecSeedRadius', 'advecSeedSource', 'advecSeedImage',
   'organic', 'edges', 'spread', 'maskScale',
   'softness', 'glow', 'bloom', 'warmth', 'vignette',
 ];
