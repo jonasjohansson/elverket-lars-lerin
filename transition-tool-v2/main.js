@@ -1119,8 +1119,53 @@ filepicker.addEventListener('change', e => {
   e.target.value = '';
 });
 
+// IndexedDB persistence: remember the last A and B blobs across sessions.
+const IDB_NAME = 'transition-tool';
+const IDB_STORE = 'images';
+function idbOpen() {
+  return new Promise((resolve, reject) => {
+    const r = indexedDB.open(IDB_NAME, 1);
+    r.onupgradeneeded = () => r.result.createObjectStore(IDB_STORE);
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+}
+async function idbGet(key) {
+  try {
+    const db = await idbOpen();
+    return await new Promise((resolve, reject) => {
+      const req = db.transaction(IDB_STORE, 'readonly').objectStore(IDB_STORE).get(key);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  } catch { return null; }
+}
+async function idbPut(key, value) {
+  try {
+    const db = await idbOpen();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).put(value, key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {}
+}
+async function idbClearAll() {
+  try {
+    const db = await idbOpen();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).clear();
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {}
+}
+
 function loadFile(file, slot) {
   if (!file.type.startsWith('image/')) return;
+  idbPut(slot === 'A' ? 'imageA' : 'imageB', file);  // persist the blob
   loadFromUrl(URL.createObjectURL(file), slot);
 }
 function loadFromUrl(url, slot) {
@@ -1154,8 +1199,13 @@ function maybeAutoplay() {
   state.startTime = performance.now();
   if (typeof btnPlay !== 'undefined') btnPlay.title = 'Pause';
 }
-loadFromUrl('./defaults/lofoten_A.jpg', 'A');
-loadFromUrl('./defaults/lofoten_B.jpg', 'B');
+// On startup: try to restore persisted A/B from IndexedDB; fall back to the
+// bundled defaults if a slot has nothing stored.
+(async () => {
+  const [blobA, blobB] = await Promise.all([idbGet('imageA'), idbGet('imageB')]);
+  loadFromUrl(blobA ? URL.createObjectURL(blobA) : './defaults/lofoten_A.jpg', 'A');
+  loadFromUrl(blobB ? URL.createObjectURL(blobB) : './defaults/lofoten_B.jpg', 'B');
+})();
 
 // per-slot drag-and-drop
 document.querySelectorAll('.slot').forEach(s => {
@@ -1182,7 +1232,7 @@ document.getElementById('swap').addEventListener('click', async () => {
   const sB = document.querySelector('.slot[data-slot="B"] img');
   if (sA && sB) { const u = sA.src; sA.src = sB.src; sB.src = u; }
 });
-document.getElementById('clear').addEventListener('click', () => {
+document.getElementById('clear').addEventListener('click', async () => {
   state.imgA = null; state.imgB = null;
   texA.destroy(); texB.destroy();
   texA = makePlaceholderTexture();
@@ -1197,6 +1247,13 @@ document.getElementById('clear').addEventListener('click', () => {
     }
   });
   canvas.classList.add('empty');
+  await idbClearAll();
+});
+
+document.getElementById('reset').addEventListener('click', async () => {
+  await idbClearAll();
+  loadFromUrl('./defaults/lofoten_A.jpg', 'A');
+  loadFromUrl('./defaults/lofoten_B.jpg', 'B');
 });
 
 window.addEventListener('resize', resizeCanvas);
