@@ -67,6 +67,8 @@
       color: #555; font-size: 10px;
     }
     .slot:hover { border-color: #444; color: #888; }
+    .slot.drop-target { border-color: #4af; box-shadow: 0 0 0 1px #4af inset; }
+    .slot.drop-target * { pointer-events: none; }
     .slot img { width: 100%; height: 100%; object-fit: cover; display: block; }
     .slot .lab { position: absolute; top: 3px; left: 4px; color: #fff;
       background: rgba(0,0,0,0.6); padding: 1px 5px; font-size: 9px; pointer-events: none; }

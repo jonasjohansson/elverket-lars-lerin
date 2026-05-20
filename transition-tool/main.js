@@ -1405,7 +1405,21 @@ document.getElementById('clear').addEventListener('click', () => {
   dropHint.classList.remove('hidden');
 });
 
-// drag-and-drop anywhere on the window
+// drag-and-drop — per-slot targets first, window catches anything else.
+document.querySelectorAll('.slot').forEach(s => {
+  s.addEventListener('dragenter', e => { e.preventDefault(); e.stopPropagation(); s.classList.add('drop-target'); });
+  s.addEventListener('dragover',  e => { e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = 'copy'; });
+  s.addEventListener('dragleave', e => { e.preventDefault(); e.stopPropagation(); s.classList.remove('drop-target'); });
+  s.addEventListener('drop', e => {
+    e.preventDefault(); e.stopPropagation();
+    s.classList.remove('drop-target');
+    document.body.classList.remove('dragging');
+    const files = [...e.dataTransfer.files].filter(f => f.type.startsWith('image/'));
+    if (files.length === 0) return;
+    loadFile(files[0], s.dataset.slot);
+  });
+});
+
 window.addEventListener('dragenter', e => { e.preventDefault(); document.body.classList.add('dragging'); });
 window.addEventListener('dragover',  e => { e.preventDefault(); });
 window.addEventListener('dragleave', e => { if (e.clientX === 0 && e.clientY === 0) document.body.classList.remove('dragging'); });
@@ -1414,6 +1428,8 @@ window.addEventListener('drop', e => {
   document.body.classList.remove('dragging');
   const files = [...e.dataTransfer.files].filter(f => f.type.startsWith('image/'));
   if (files.length === 0) return;
+  // Fallback when dropped outside either slot: fill the empty slot first,
+  // otherwise replace A; two files go to A and B in order.
   if (files.length === 1) {
     const target = !state.imgA ? 'A' : (!state.imgB ? 'B' : 'A');
     loadFile(files[0], target);
