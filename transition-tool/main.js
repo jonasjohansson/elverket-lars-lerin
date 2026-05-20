@@ -343,8 +343,12 @@ void main() {
     return;
   }
 
-  // shape the timeline
-  float t = applyCurve(u_t, u_curve);
+  // shape the timeline. Stretch t so the per-pixel smoothstep window
+  // (mask ± spread) is fully traversed for t ∈ [0,1] — otherwise pixels
+  // with mask near 0 or 1 never reach a full reveal at the endpoints.
+  float sp = mix(0.05, 0.7, u_spread);
+  float tCurve = applyCurve(u_t, u_curve);
+  float t = tCurve * (1.0 + 2.0 * sp) - sp;
   float env = pow(sin(3.14159265 * clamp(u_t, 0.0, 1.0)), 0.85);
 
   // soft defocus that breathes in at the midpoint
@@ -378,8 +382,7 @@ void main() {
     mask = organicMask(uv, lumA, lumB, max(eA, eB));
   }
 
-  // spread: low = crisp dissolve, high = wide gentle fade
-  float sp = mix(0.05, 0.7, u_spread);
+  // spread: low = crisp dissolve, high = wide gentle fade. sp computed above.
   float mixT = clamp(smoothstep(mask - sp, mask + sp, t), 0.0, 1.0);
 
   // ---- diffusion mode: B's pigment seeps into A as a soft anticipatory tint ----
@@ -759,7 +762,9 @@ void main() {
   }
 
   float sp = mix(0.1, 0.5, u_spread);
-  float reveal = smoothstep(mask - sp, mask + sp * 0.3, u_t);
+  // Stretch t so end-of-timeline pixels fully reveal.
+  float tR = u_t * (1.0 + 2.0 * sp) - sp;
+  float reveal = smoothstep(mask - sp, mask + sp * 0.3, tR);
   vec3 mixed = mix(diffused, cB, reveal * u_rate);
 
   frag = vec4(mixed, 1.0);

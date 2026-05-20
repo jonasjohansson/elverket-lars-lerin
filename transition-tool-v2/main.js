@@ -295,7 +295,12 @@ fn organicMask(uv: vec2f, lA: f32, lB: f32, edge: f32) -> f32 {
     return vec4f(textureSampleLevel(advState, samp, uv, 0.0).rgb, 1.0);
   }
 
-  let t = applyCurve(p.t, p.curve);
+  // Stretch t so the per-pixel smoothstep window (mask±spread) is fully
+  // traversed for t ∈ [0,1] — without this, pixels with mask near 0 or 1
+  // never fully reveal at the timeline's endpoints.
+  let sp = mix(0.05, 0.7, p.spread);
+  let tCurve = applyCurve(p.t, p.curve);
+  let t = tCurve * (1.0 + 2.0 * sp) - sp;
   let env = pow(sin(3.14159265 * clamp(p.t, 0.0, 1.0)), 0.85);
 
   let cA = sampleFit(texA, uv, p.scaleA, p.offsetA, p.validA);
@@ -327,7 +332,6 @@ fn organicMask(uv: vec2f, lA: f32, lB: f32, edge: f32) -> f32 {
     mask = organicMask(uv, lA, lB, max(eA, eB));
   }
 
-  let sp = mix(0.05, 0.7, p.spread);
   var mixT = clamp(smoothstep(mask - sp, mask + sp, t), 0.0, 1.0);
 
   // ---- wet diffusion (mode 4): anticipatory tint of B into A ----
@@ -610,7 +614,9 @@ fn curlField(uv: vec2f) -> vec2f {
   }
 
   let sp = mix(0.1, 0.5, p.spread);
-  let reveal = smoothstep(mask - sp, mask + sp * 0.3, p.t);
+  // Stretch t so end-of-timeline pixels fully reveal — same fix as display shader.
+  let tR = p.t * (1.0 + 2.0 * sp) - sp;
+  let reveal = smoothstep(mask - sp, mask + sp * 0.3, tR);
   let mixed = mix(diffused, cB.rgb, reveal * p.advRate);
   return vec4f(mixed, 1.0);
 }
