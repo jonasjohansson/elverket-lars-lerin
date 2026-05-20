@@ -492,35 +492,122 @@ fn sampleFit(tex: texture_2d<f32>, uv: vec2f, scale: vec2f, offset: vec2f, valid
   return textureSampleLevel(tex, samp, q, 0.0);
 }
 
+fn curlField(uv: vec2f) -> vec2f {
+  let e = 0.004;
+  let pos = uv * p.advCurlScale;
+  let pyp = fbm(pos + vec2f(0.0, e));
+  let pyn = fbm(pos - vec2f(0.0, e));
+  let pxp = fbm(pos + vec2f(e, 0.0));
+  let pxn = fbm(pos - vec2f(e, 0.0));
+  return vec2f(pyp - pyn, pxn - pxp);
+}
+
 @fragment fn fs(in: VSOut) -> @location(0) vec4f {
   let uv = in.uv;
-  // 1 / dims (we sample state via sampler so we need pixel size in UV space)
   let dims = vec2f(textureDimensions(stateIn));
   let px = 1.0 / dims;
 
-  // 8-tap neighbour average for soft isotropic diffusion (variant 0, baseline).
-  let cur = textureSampleLevel(stateIn, samp, uv, 0.0).rgb;
-  let nb = (
-    textureSampleLevel(stateIn, samp, uv + vec2f(px.x, 0.0), 0.0).rgb +
-    textureSampleLevel(stateIn, samp, uv - vec2f(px.x, 0.0), 0.0).rgb +
-    textureSampleLevel(stateIn, samp, uv + vec2f(0.0, px.y), 0.0).rgb +
-    textureSampleLevel(stateIn, samp, uv - vec2f(0.0, px.y), 0.0).rgb +
-    textureSampleLevel(stateIn, samp, uv + px * 0.7071, 0.0).rgb +
-    textureSampleLevel(stateIn, samp, uv - px * 0.7071, 0.0).rgb +
-    textureSampleLevel(stateIn, samp, uv + vec2f(px.x, -px.y) * 0.7071, 0.0).rgb +
-    textureSampleLevel(stateIn, samp, uv + vec2f(-px.x, px.y) * 0.7071, 0.0).rgb
-  ) * 0.125;
-  let diffused = mix(cur, nb, p.advVisc);
-
-  // image-aware mask: noise + luma delta
   let cA = sampleFit(texA, uv, p.scaleA, p.offsetA, p.validA);
   let cB = sampleFit(texB, uv, p.scaleB, p.offsetB, p.validB);
+  let lA = luma(cA.rgb); let lB = luma(cB.rgb);
+
+  // ---- read previous state, optionally pre-advected (variant 2: curl) ----
+  var cur: vec3f;
+  if (p.advVariant == 2u && p.advCurlStr > 0.001) {
+    let vel = curlField(uv) * p.advCurlStr * 0.06;
+    cur = textureSampleLevel(stateIn, samp, uv - vel, 0.0).rgb;
+  } else {
+    cur = textureSampleLevel(stateIn, samp, uv, 0.0).rgb;
+  }
+
+  // ---- diffusion kernel ----
+  var nb: vec3f;
+  if (p.advVariant == 1u) {
+    // Gravity: anisotropic kernel along the flow direction.
+    let a = p.advGravAngle * 6.2831853;
+    let flowDir = vec2f(sin(a), -cos(a));
+    let perp = vec2f(-flowDir.y, flowDir.x);
+    let streak = 1.0 + p.advGravStreak * 2.5;
+    let upstep   = -flowDir * px.x * streak;
+    let downstep =  flowDir * px.x * streak;
+    let latstep  =  perp    * px.x;
+    let wUp   = 1.0 + p.advGravity * 1.6;
+    let wDown = max(0.0, 1.0 - p.advGravity * 0.85);
+    let wLat  = 0.3 + p.advGravLateral * 1.4;
+    let wDiagU = (wUp   + wLat) * 0.5;
+    let wDiagD = (wDown + wLat) * 0.5;
+    let wsum   = wUp + wDown + 2.0 * wLat + 2.0 * wDiagU + 2.0 * wDiagD;
+    nb = (
+      textureSampleLevel(stateIn, samp, uv + upstep, 0.0).rgb * wUp +
+      textureSampleLevel(stateIn, samp, uv + downstep, 0.0).rgb * wDown +
+      textureSampleLevel(stateIn, samp, uv + latstep, 0.0).rgb * wLat +
+      textureSampleLevel(stateIn, samp, uv - latstep, 0.0).rgb * wLat +
+      textureSampleLevel(stateIn, samp, uv + upstep * 0.7071 + latstep * 0.7071, 0.0).rgb * wDiagU +
+      textureSampleLevel(stateIn, samp, uv + upstep * 0.7071 - latstep * 0.7071, 0.0).rgb * wDiagU +
+      textureSampleLevel(stateIn, samp, uv + downstep * 0.7071 + latstep * 0.7071, 0.0).rgb * wDiagD +
+      textureSampleLevel(stateIn, samp, uv + downstep * 0.7071 - latstep * 0.7071, 0.0).rgb * wDiagD
+    ) / wsum;
+  } else if (p.advVariant == 3u) {
+    // Brush-channel: diffusion along A's local stroke direction.
+    let e = 0.003;
+    let gx = luma(sampleFit(texA, uv + vec2f(e, 0.0), p.scaleA, p.offsetA, p.validA).rgb) -
+             luma(sampleFit(texA, uv - vec2f(e, 0.0), p.scaleA, p.offsetA, p.validA).rgb);
+    let gy = luma(sampleFit(texA, uv + vec2f(0.0, e), p.scaleA, p.offsetA, p.validA).rgb) -
+             luma(sampleFit(texA, uv - vec2f(0.0, e), p.scaleA, p.offsetA, p.validA).rgb);
+    let grad = vec2f(gx, gy);
+    let glen = length(grad);
+    let sd = select(vec2f(1.0, 0.0), vec2f(-grad.y, grad.x) / glen, glen > 1e-4);
+    let perp = vec2f(-sd.y, sd.x);
+    let follow = p.advBrushFollow;
+    let wAlong = 1.0 + follow * 1.5;
+    let wPerp  = max(0.0, 1.0 - follow * 0.85);
+    nb = (
+      textureSampleLevel(stateIn, samp, uv + sd * px.x * 1.4, 0.0).rgb * wAlong +
+      textureSampleLevel(stateIn, samp, uv - sd * px.x * 1.4, 0.0).rgb * wAlong +
+      textureSampleLevel(stateIn, samp, uv + perp * px.x, 0.0).rgb * wPerp +
+      textureSampleLevel(stateIn, samp, uv - perp * px.x, 0.0).rgb * wPerp
+    ) / (2.0 * wAlong + 2.0 * wPerp + 1e-4);
+  } else {
+    // Isotropic 8-tap (variants 0, 2, 4)
+    nb = (
+      textureSampleLevel(stateIn, samp, uv + vec2f(px.x, 0.0), 0.0).rgb +
+      textureSampleLevel(stateIn, samp, uv - vec2f(px.x, 0.0), 0.0).rgb +
+      textureSampleLevel(stateIn, samp, uv + vec2f(0.0, px.y), 0.0).rgb +
+      textureSampleLevel(stateIn, samp, uv - vec2f(0.0, px.y), 0.0).rgb +
+      textureSampleLevel(stateIn, samp, uv + px * 0.7071, 0.0).rgb +
+      textureSampleLevel(stateIn, samp, uv - px * 0.7071, 0.0).rgb +
+      textureSampleLevel(stateIn, samp, uv + vec2f(px.x, -px.y) * 0.7071, 0.0).rgb +
+      textureSampleLevel(stateIn, samp, uv + vec2f(-px.x, px.y) * 0.7071, 0.0).rgb
+    ) * 0.125;
+  }
+  let diffused = mix(cur, nb, p.advVisc);
+
+  // ---- mask (variant-dependent) ----
+  var mask: f32;
   let n1 = fbm(uv * p.maskScale + p.seed * 0.13);
   let n2 = fbm(uv * p.maskScale * 2.3 + 17.0 + p.seed * 0.09);
   let noiseMask = mix(n1, n2, 0.35);
-  let lA = luma(cA.rgb); let lB = luma(cB.rgb);
   let lumMask = 0.5 + 0.5 * (lB - lA);
-  let mask = mix(noiseMask, lumMask, p.organic);
+
+  if (p.advVariant == 1u) {
+    let a = p.advGravAngle * 6.2831853;
+    let flowDir = vec2f(sin(a), -cos(a));
+    let flowProgress = 0.5 - dot(uv - 0.5, flowDir);
+    let gMask = mix(lA, flowProgress, p.advGravBias);
+    mask = mix(noiseMask, gMask, p.organic);
+  } else if (p.advVariant == 4u) {
+    // Seed-point: random hash-based seed positions
+    var minD = 9999.0;
+    for (var i = 0u; i < 16u; i = i + 1u) {
+      if (i >= p.advSeedCount) { break; }
+      let fi = f32(i) + p.seed * 0.07 + 1.0;
+      let sp = vec2f(hash21(vec2f(fi * 1.3, 13.0)), hash21(vec2f(fi * 2.7, 47.0)));
+      minD = min(minD, distance(uv, sp));
+    }
+    mask = clamp(minD / max(p.advSeedRadius, 0.05), 0.0, 1.0);
+  } else {
+    mask = mix(noiseMask, lumMask, p.organic);
+  }
 
   let sp = mix(0.1, 0.5, p.spread);
   let reveal = smoothstep(mask - sp, mask + sp * 0.3, p.t);
@@ -927,65 +1014,64 @@ function render() {
     state.t = state.reverse ? (1 - pT) : pT;
     if (typeof bT !== 'undefined') bT.refresh();
   }
-
-  if (state.imgA || state.imgB) {
-    writeUniforms();
-
-    const isAdvec = state.mode >= 10 && state.mode <= 14;
-    let finalState = null;
-    const enc = device.createCommandEncoder();
-
-    if (isAdvec) {
-      ensureStateTextures();
-      // Detect reset condition: first run, scrubbing backward, or t == 0.
-      if (advec.needsReset || state.t < advec.lastT - 0.03 || state.t === 0) {
-        // Init pass: render texA into stateTexA via initPipeline.
-        const initPass = enc.beginRenderPass({
-          colorAttachments: [{
-            view: stateTexA.createView(),
-            clearValue: { r: 0, g: 0, b: 0, a: 1 },
-            loadOp: 'clear', storeOp: 'store',
-          }],
-        });
-        initPass.setPipeline(initPipeline);
-        initPass.setBindGroup(0, makeSimBindGroup(stateTexB));  // stateIn unused by init
-        initPass.draw(6);
-        initPass.end();
-        advec.src = 'A';
-        advec.lastT = 0;
-        advec.needsReset = false;
-        // Warm-up: run several sim steps so the state matches current t.
-        const warm = Math.max(8, Math.round(state.advecSteps * 8));
-        for (let i = 0; i < warm; i++) {
-          const tAt = state.t * ((i + 1) / warm);
-          runSimStepInto(enc, tAt);
-        }
-      } else {
-        const N = Math.max(1, Math.round(state.advecSteps));
-        const startT = advec.lastT, endT = state.t;
-        for (let i = 0; i < N; i++) {
-          runSimStepInto(enc, startT + (endT - startT) * ((i + 1) / N));
-        }
-      }
-      advec.lastT = state.t;
-      finalState = (advec.src === 'A') ? stateTexA : stateTexB;
-    }
-
-    const displayBG = isAdvec ? makeDisplayBindGroup(finalState) : bindGroup;
-    const pass = enc.beginRenderPass({
-      colorAttachments: [{
-        view: ctx.getCurrentTexture().createView(),
-        clearValue: { r: 0, g: 0, b: 0, a: 1 },
-        loadOp: 'clear', storeOp: 'store',
-      }],
-    });
-    pass.setPipeline(pipeline);
-    pass.setBindGroup(0, displayBG);
-    pass.draw(6);
-    pass.end();
-    device.queue.submit([enc.finish()]);
-  }
+  renderFrame();
   requestAnimationFrame(render);
+}
+
+// Synchronous GPU draw — used by the rAF render loop and by the recorder.
+function renderFrame() {
+  if (!state.imgA && !state.imgB) return;
+  writeUniforms();
+
+  const isAdvec = state.mode >= 10 && state.mode <= 14;
+  let finalState = null;
+  const enc = device.createCommandEncoder();
+
+  if (isAdvec) {
+    ensureStateTextures();
+    if (advec.needsReset || state.t < advec.lastT - 0.03 || state.t === 0) {
+      const initPass = enc.beginRenderPass({
+        colorAttachments: [{
+          view: stateTexA.createView(),
+          clearValue: { r: 0, g: 0, b: 0, a: 1 },
+          loadOp: 'clear', storeOp: 'store',
+        }],
+      });
+      initPass.setPipeline(initPipeline);
+      initPass.setBindGroup(0, makeSimBindGroup(stateTexB));
+      initPass.draw(6);
+      initPass.end();
+      advec.src = 'A';
+      advec.lastT = 0;
+      advec.needsReset = false;
+      const warm = Math.max(8, Math.round(state.advecSteps * 8));
+      for (let i = 0; i < warm; i++) {
+        runSimStepInto(enc, state.t * ((i + 1) / warm));
+      }
+    } else {
+      const N = Math.max(1, Math.round(state.advecSteps));
+      const startT = advec.lastT, endT = state.t;
+      for (let i = 0; i < N; i++) {
+        runSimStepInto(enc, startT + (endT - startT) * ((i + 1) / N));
+      }
+    }
+    advec.lastT = state.t;
+    finalState = (advec.src === 'A') ? stateTexA : stateTexB;
+  }
+
+  const displayBG = isAdvec ? makeDisplayBindGroup(finalState) : bindGroup;
+  const pass = enc.beginRenderPass({
+    colorAttachments: [{
+      view: ctx.getCurrentTexture().createView(),
+      clearValue: { r: 0, g: 0, b: 0, a: 1 },
+      loadOp: 'clear', storeOp: 'store',
+    }],
+  });
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, displayBG);
+  pass.draw(6);
+  pass.end();
+  device.queue.submit([enc.finish()]);
 }
 
 // Run one sim step into the off-source ping-pong texture, then swap which is
@@ -1162,9 +1248,13 @@ fWater.addBinding(state, 'mode', {
     'tonal sediment':  5,
     'salt':            6,
     'iris':            7,
-    'wet bleed':       8,
-    'pigment run':     9,
-    'wet advection':   10,
+    'wet bleed':              8,
+    'pigment run':            9,
+    'wet advection':          10,
+    'gravity advection':      11,
+    'curl-noise eddies':      12,
+    'brush-channel advection': 13,
+    'seed-point injection':   14,
   },
 }).on('change', () => { updateModeFolders(); advec.needsReset = true; });
 
@@ -1231,6 +1321,28 @@ fAdvec.addBinding(state, 'advecRate',  { min: 0, max: 1, step: 0.01, label: 'mix
 fAdvec.addBinding(state, 'advecSteps', { min: 1, max: 8, step: 1, label: 'steps / frame' });
 fAdvec.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
 
+const fAdvecG = fWater.addFolder({ title: 'Gravity advection', expanded: true });
+fAdvecG.addBinding(state, 'advecGravAngle',   { min: 0, max: 1, step: 0.005, label: 'flow angle' });
+fAdvecG.addBinding(state, 'advecGravity',     { min: 0, max: 1, step: 0.01, label: 'gravity' });
+fAdvecG.addBinding(state, 'advecGravStreak',  { min: 0, max: 1, step: 0.01, label: 'streak' });
+fAdvecG.addBinding(state, 'advecGravLateral', { min: 0, max: 1, step: 0.01, label: 'lateral spread' });
+fAdvecG.addBinding(state, 'advecGravBias',    { min: 0, max: 1, step: 0.01, label: 'shadow ↔ flow' });
+fAdvecG.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
+
+const fAdvecC = fWater.addFolder({ title: 'Curl-noise eddies', expanded: true });
+fAdvecC.addBinding(state, 'advecCurlStr',   { min: 0, max: 1, step: 0.01, label: 'eddy strength' });
+fAdvecC.addBinding(state, 'advecCurlScale', { min: 0.5, max: 8, step: 0.1, label: 'eddy scale' });
+fAdvecC.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
+
+const fAdvecB = fWater.addFolder({ title: 'Brush-channel advection', expanded: true });
+fAdvecB.addBinding(state, 'advecBrushFollow', { min: 0, max: 1, step: 0.01, label: 'follow strokes' });
+fAdvecB.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
+
+const fAdvecS = fWater.addFolder({ title: 'Seed-point injection', expanded: true });
+fAdvecS.addBinding(state, 'advecSeedCount',  { min: 1, max: 16, step: 1, label: 'seed count' });
+fAdvecS.addBinding(state, 'advecSeedRadius', { min: 0.1, max: 1, step: 0.01, label: 'reach' });
+fAdvecS.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
+
 function updateModeFolders() {
   fRim.hidden    = state.mode !== 1;
   fPaper.hidden  = state.mode !== 2;
@@ -1241,7 +1353,11 @@ function updateModeFolders() {
   fIris.hidden   = state.mode !== 7;
   fBleed.hidden  = state.mode !== 8;
   fRun.hidden    = state.mode !== 9;
-  fAdvec.hidden  = state.mode !== 10;
+  fAdvec.hidden   = state.mode !== 10;
+  fAdvecG.hidden  = state.mode !== 11;
+  fAdvecC.hidden  = state.mode !== 12;
+  fAdvecB.hidden  = state.mode !== 13;
+  fAdvecS.hidden  = state.mode !== 14;
 }
 updateModeFolders();
 
@@ -1261,11 +1377,249 @@ fImg.addBinding(state, 'zoomB', { min: 0.5, max: 4, step: 0.01, label: 'B zoom' 
 fImg.addBinding(state, 'panBx', { min: -1, max: 1, step: 0.005, label: 'B pan x' });
 fImg.addBinding(state, 'panBy', { min: -1, max: 1, step: 0.005, label: 'B pan y' });
 
+// ----- Export / Record -----
+state.exportFps = 24;
+state.exportSizeMode = '1920';
+
+const RECORDER_MIMES = [
+  'video/mp4;codecs=avc1.42E01E', 'video/mp4;codecs=avc1', 'video/mp4',
+  'video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm',
+];
+function pickRecorderMime() {
+  for (const m of RECORDER_MIMES) if (MediaRecorder.isTypeSupported(m)) return m;
+  return 'video/webm';
+}
+const mimeToExt = m => m.startsWith('video/mp4') ? 'mp4' : 'webm';
+
+const MODE_NAMES_V2 = {
+  0: 'off', 1: 'rim', 2: 'paper', 3: 'blooms', 4: 'diffusion',
+  5: 'sediment', 6: 'salt', 7: 'iris', 8: 'wet-bleed', 9: 'pigment-run',
+  10: 'advec',
+};
+const SED_SOURCE_NAMES = ['luma','sat','hue','detail','temp'];
+const SALT_SOURCE_NAMES = ['random','light','dark','col','edge'];
+const fx = (v, n = 2) => (Math.round(v * Math.pow(10, n)) / Math.pow(10, n)).toString();
+
+function makeFilenameV2() {
+  const m = state.mode;
+  const parts = [MODE_NAMES_V2[m] || `mode${m}`];
+  if      (m === 1)  parts.push(`rimW=${fx(state.rimWidth)}`, `dark=${fx(state.rimDark)}`);
+  else if (m === 2)  parts.push(`ang=${fx(state.paperAngle)}`, `aniso=${fx(state.paperAniso,1)}`, `gran=${fx(state.paperGranulation)}`);
+  else if (m === 3)  parts.push(`n=${state.bloomCount}`, `rate=${fx(state.bloomRate)}`, `rim=${fx(state.bloomRim)}`);
+  else if (m === 4)  parts.push(`str=${fx(state.diffStrength)}`, `r=${fx(state.diffRadius)}`);
+  else if (m === 5)  parts.push(`by=${SED_SOURCE_NAMES[state.sedSource] || 'luma'}`, `bands=${state.sedBands}`, `soft=${fx(state.sedSoftness)}`);
+  else if (m === 6)  parts.push(`from=${SALT_SOURCE_NAMES[state.saltSource] || 'random'}`, `grain=${fx(state.saltDensity)}`, `bias=${fx(state.saltBias)}`);
+  else if (m === 7)  parts.push(`focus=${fx(state.irisFocusX)}-${fx(state.irisFocusY)}`, `jit=${fx(state.irisJitter)}`);
+  else if (m === 8)  parts.push(`fing=${fx(state.bleedFinger)}`, `amt=${fx(state.bleedAmount)}`, `halo=${fx(state.bleedHalo)}`);
+  else if (m === 9)  parts.push(`grav=${fx(state.runGravity)}`, `drip=${fx(state.runDrip)}`);
+  else if (m === 10) parts.push(`visc=${fx(state.advecVisc)}`, `rate=${fx(state.advecRate)}`);
+  parts.push(`${Math.round(state.duration)}s`);
+  return `morph__${parts.join('__')}`;
+}
+
+let recording = false;
+const fExp = pane.addFolder({ title: 'Export', expanded: true });
+fExp.addBinding(state, 'exportFps', {
+  label: 'fps', options: { '24 fps': 24, '30 fps': 30, '60 fps': 60 },
+});
+fExp.addBinding(state, 'exportSizeMode', {
+  label: 'size',
+  options: {
+    'source (full)': 'src', '5120 wide': '5120', '3840 wide': '3840',
+    '2560 wide': '2560', '1920 wide': '1920', '1280 wide': '1280', '960 wide': '960',
+  },
+});
+const btnRecord = fExp.addButton({ title: 'Record video' });
+btnRecord.on('click', () => startRecording());
+
+async function startRecording(opts = {}) {
+  if (recording) return;
+  if (!state.imgA || !state.imgB) return;
+
+  const fps = state.exportFps;
+  const sizeMode = state.exportSizeMode;
+  let recW = canvas.width, recH = canvas.height;
+  if (sizeMode !== 'src') {
+    const w = parseInt(sizeMode, 10);
+    const h = Math.round(w * canvas.height / canvas.width);
+    recW = w; recH = h;
+  }
+
+  const off = document.createElement('canvas');
+  off.width = recW; off.height = recH;
+  const offCtx = off.getContext('2d');
+
+  const stream = off.captureStream(fps);
+  const mime = pickRecorderMime();
+  const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 12_000_000 });
+  const chunks = [];
+  rec.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+
+  recording = true;
+  const originalTitle = btnRecord.title;
+  btnRecord.title = 'Recording…';
+
+  const totalFrames = Math.max(2, Math.round(state.duration * fps));
+  const wasPlaying = state.playing;
+  const prevT = state.t;
+  state.playing = false;
+  // Force advection reset so the sim warms up from t=0 again.
+  if (state.mode >= 10 && state.mode <= 14) advec.needsReset = true;
+
+  rec.start();
+  for (let i = 0; i < totalFrames; i++) {
+    state.t = i / (totalFrames - 1);
+    renderFrame();
+    // Let the GPU finish then copy to the 2D off-canvas so the captureStream
+    // sees a fresh frame.
+    await device.queue.onSubmittedWorkDone();
+    offCtx.drawImage(canvas, 0, 0, recW, recH);
+    btnRecord.title = `frame ${i + 1} / ${totalFrames}`;
+    await new Promise(r => setTimeout(r, 1000 / fps));
+  }
+  rec.stop();
+  await new Promise(r => { rec.onstop = r; });
+
+  const blob = new Blob(chunks, { type: mime });
+  const url = URL.createObjectURL(blob);
+  const ext = mimeToExt(mime);
+  const base = opts.filename || makeFilenameV2();
+  const filename = /\.(mp4|webm)$/i.test(base) ? base : `${base}.${ext}`;
+  const a = document.createElement('a');
+  a.href = url; a.download = filename; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+  recording = false;
+  btnRecord.title = `saved (${(blob.size / 1024 / 1024).toFixed(1)} MB)`;
+  setTimeout(() => { btnRecord.title = originalTitle; }, 2500);
+  state.t = prevT;
+  state.playing = wasPlaying;
+}
+
 const fStyle = pane.addFolder({ title: 'Style', expanded: false });
 fStyle.addBinding(state, 'fit', {
   options: { 'cover (crop)': 'cover', 'contain': 'contain', 'stretch': 'stretch' },
 });
 fStyle.addBinding(state, 'bg', { view: 'color' });
+
+// ----- Presets -----
+const PRESET_KEYS = [
+  'duration', 'mode', 'curve', 'seed',
+  'rimWidth', 'rimDark',
+  'paperAngle', 'paperAniso', 'paperGranulation',
+  'bloomCount', 'bloomRim', 'bloomRate',
+  'diffStrength', 'diffRadius',
+  'sedBands', 'sedSoftness', 'sedDirection', 'sedSource',
+  'saltDensity', 'saltContrast', 'saltSource', 'saltBias', 'saltImage',
+  'irisFocusX', 'irisFocusY', 'irisJitter',
+  'bleedFinger', 'bleedAmount', 'bleedHalo',
+  'runGravity', 'runDrip',
+  'advecVisc', 'advecRate', 'advecSteps',
+  'advecGravity', 'advecGravBias', 'advecGravAngle', 'advecGravStreak', 'advecGravLateral',
+  'advecCurlStr', 'advecCurlScale',
+  'advecBrushFollow',
+  'advecSeedCount', 'advecSeedRadius',
+  'organic', 'edges', 'spread', 'maskScale',
+  'zoomA', 'panAx', 'panAy', 'zoomB', 'panBx', 'panBy',
+];
+
+const FACTORY_PRESETS = {
+  'Smooth dreamy': {
+    duration: 5, mode: 0, curve: 1, seed: 42,
+    organic: 0.65, edges: 0.25, spread: 0.55, maskScale: 0.9,
+  },
+  'Paper grain — cold press': {
+    duration: 7, mode: 2, curve: 1, seed: 42,
+    paperAngle: 0, paperAniso: 6, paperGranulation: 0.7,
+    organic: 0.3, edges: 0.15, spread: 0.35, maskScale: 0.9,
+  },
+  'Backruns — dramatic': {
+    duration: 12, mode: 3, curve: 2, seed: 12,
+    bloomCount: 4, bloomRate: 0.45, bloomRim: 0.75,
+    organic: 0.5, edges: 0.2, spread: 0.5, maskScale: 0.9,
+  },
+  'Sediment — hue': {
+    duration: 8, mode: 5, curve: 0, seed: 42,
+    sedSource: 2, sedBands: 5, sedSoftness: 0.35,
+    organic: 0.5, spread: 0.5,
+  },
+  'Salt — light bias': {
+    duration: 6, mode: 6, curve: 0, seed: 42,
+    saltDensity: 0.55, saltContrast: 0.55, saltSource: 1, saltBias: 0.75, saltImage: 2,
+  },
+  'Wet advection (smooth)': {
+    duration: 10, mode: 10, curve: 0, seed: 42,
+    advecVisc: 0.55, advecRate: 0.18, advecSteps: 3,
+    organic: 0.6, spread: 0.55, maskScale: 0.9,
+  },
+  'Gravity advection — down': {
+    duration: 10, mode: 11, curve: 0, seed: 42,
+    advecGravAngle: 0, advecGravity: 0.8, advecGravStreak: 0.5,
+    advecGravLateral: 0.3, advecGravBias: 0.5,
+    advecVisc: 0.55, advecRate: 0.18,
+  },
+  'Curl-noise eddies': {
+    duration: 10, mode: 12, curve: 0, seed: 42,
+    advecCurlStr: 0.8, advecCurlScale: 1.5,
+    advecVisc: 0.55, advecRate: 0.18,
+  },
+};
+
+const LS_KEY = 'transition-tool-v2:presets';
+const loadUserPresets = () => { try { return JSON.parse(localStorage.getItem(LS_KEY)) || {}; } catch { return {}; } };
+const saveUserPresetsToLS = (o) => localStorage.setItem(LS_KEY, JSON.stringify(o));
+
+function snapshotState() {
+  const out = {};
+  for (const k of PRESET_KEYS) out[k] = state[k];
+  return out;
+}
+function applyPreset(id) {
+  const [kind, name] = id.split(':');
+  const src = kind === 'factory' ? FACTORY_PRESETS[name] : loadUserPresets()[name];
+  if (!src) return;
+  for (const k of PRESET_KEYS) if (k in src) state[k] = src[k];
+  if (state.mode >= 10 && state.mode <= 14) advec.needsReset = true;
+  pane.refresh();
+  updateModeFolders();
+}
+
+const presetUI = { current: '', newName: '' };
+const fPresets = pane.addFolder({ title: 'Presets', expanded: true });
+
+function buildPresetOptions() {
+  const opts = { '— select —': '' };
+  for (const k of Object.keys(FACTORY_PRESETS)) opts['★ ' + k] = 'factory:' + k;
+  const user = loadUserPresets();
+  for (const k of Object.keys(user))            opts['user · ' + k] = 'user:' + k;
+  return opts;
+}
+
+function rebuildPresetsFolder() {
+  while (fPresets.children.length) fPresets.children[0].dispose();
+  presetUI.current = '';
+  fPresets.addBinding(presetUI, 'current', { label: 'load', options: buildPresetOptions() })
+    .on('change', e => { if (e.value) applyPreset(e.value); });
+  fPresets.addBinding(presetUI, 'newName', { label: 'name' });
+  fPresets.addButton({ title: 'Save current as preset' }).on('click', () => {
+    const name = presetUI.newName.trim();
+    if (!name) return;
+    const user = loadUserPresets();
+    user[name] = snapshotState();
+    saveUserPresetsToLS(user);
+    presetUI.newName = '';
+    rebuildPresetsFolder();
+  });
+  fPresets.addButton({ title: 'Delete selected (user only)' }).on('click', () => {
+    if (!presetUI.current.startsWith('user:')) return;
+    const name = presetUI.current.slice(5);
+    const user = loadUserPresets();
+    delete user[name];
+    saveUserPresetsToLS(user);
+    rebuildPresetsFolder();
+  });
+}
+rebuildPresetsFolder();
 
 // Keyboard
 window.addEventListener('keydown', e => {
