@@ -1104,7 +1104,10 @@ function composedFit(slot, cw, ch) {
 // (or 8192, whichever is smaller). We still pass the source resolution through
 // when it's smaller. Heights up to 1920, widths essentially unlimited up to
 // the GPU cap. This lets very-wide source images render at 1:1.
-const GL_MAX_TEX = Math.min(gl.getParameter(gl.MAX_TEXTURE_SIZE), 8192);
+// Cap to whatever the GPU reports — 4090/16384, M-series Macs/16384, older
+// integrated/4096. The shader auto-downsamples sources larger than this.
+const GL_MAX_TEX = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+console.log('[transition-tool] GL MAX_TEXTURE_SIZE =', GL_MAX_TEX);
 
 function resizeCanvas() {
   if (!state.imgA && !state.imgB) return;
