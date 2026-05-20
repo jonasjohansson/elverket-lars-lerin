@@ -77,6 +77,8 @@ uniform float u_runDrip;           // vertical sample offset
 // Stroke bleed
 uniform float u_strokeReach;       // offset distance along stroke direction
 uniform float u_strokeSoftness;    // along-stroke blur
+// Wet advection (FBO sim) — display path reads from the simulated state tex
+uniform sampler2D u_advecState;
 
 uniform vec3  u_bg;
 uniform int   u_validA;
@@ -349,6 +351,13 @@ float maskAt(vec2 uv) {
 void main() {
   vec2 uv = v_uv;
 
+  // Wet advection mode: the heavy lifting happens in the sim shader writing to
+  // a ping-pong FBO. Here we just sample the simulated state and output it.
+  if (u_mode == 11) {
+    frag = vec4(texture(u_advecState, uv).rgb, 1.0);
+    return;
+  }
+
   // shape the timeline
   float t = applyCurve(u_t, u_curve);
   float env = pow(sin(3.14159265 * clamp(u_t, 0.0, 1.0)), 0.85);
@@ -544,10 +553,12 @@ const U = {
   bleedFinger: uni('u_bleedFinger'), bleedAmount: uni('u_bleedAmount'), bleedHalo: uni('u_bleedHalo'),
   runGravity: uni('u_runGravity'), runDrip: uni('u_runDrip'),
   strokeReach: uni('u_strokeReach'), strokeSoftness: uni('u_strokeSoftness'),
+  advecState: uni('u_advecState'),
   bg: uni('u_bg'), validA: uni('u_validA'), validB: uni('u_validB')
 };
 gl.uniform1i(U.texA, 0);
 gl.uniform1i(U.texB, 1);
+gl.uniform1i(U.advecState, 2);
 
 function makeTex() {
   const t = gl.createTexture();
@@ -567,6 +578,269 @@ function uploadImage(tex, img) {
   gl.bindTexture(gl.TEXTURE_2D, tex);
   gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+}
+
+// ============================================================================
+// Wet advection (FBO ping-pong): one diffusion step per pass, run K passes
+// per frame to advance from lastT toward state.t. Scrubbing backward triggers
+// a re-init of the state to A and a warm-up to the current t.
+// ============================================================================
+
+const SIM_FS = `#version 300 es
+precision highp float;
+uniform sampler2D u_state;
+uniform sampler2D u_texA;
+uniform sampler2D u_texB;
+uniform vec2 u_aspectA, u_offsetA;
+uniform vec2 u_aspectB, u_offsetB;
+uniform int  u_validA, u_validB;
+uniform vec2 u_pixel;
+uniform float u_t;
+uniform float u_visc;
+uniform float u_rate;
+uniform float u_seed;
+uniform float u_maskScale;
+uniform float u_organic;
+uniform float u_spread;
+uniform vec3  u_bg;
+in vec2 v_uv;
+out vec4 frag;
+
+float hash(vec2 p) { p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
+float vnoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  float a = hash(i);
+  float b = hash(i + vec2(1.0, 0.0));
+  float c = hash(i + vec2(0.0, 1.0));
+  float d = hash(i + vec2(1.0, 1.0));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+float fbm(vec2 p) {
+  float v = 0.0, a = 0.5;
+  for (int i = 0; i < 4; i++) { v += a * vnoise(p); p *= 2.03; a *= 0.5; }
+  return v;
+}
+float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+vec4 sampleFit(sampler2D tex, vec2 uv, vec2 scale, vec2 offset, int valid) {
+  if (valid == 0) return vec4(u_bg, 1.0);
+  vec2 q = (uv - offset) / scale;
+  if (q.x < 0.0 || q.x > 1.0 || q.y < 0.0 || q.y > 1.0) return vec4(u_bg, 1.0);
+  return texture(tex, q);
+}
+
+void main() {
+  vec2 uv = v_uv;
+
+  // 8-tap neighbour average for soft diffusion
+  vec3 cur = texture(u_state, uv).rgb;
+  vec3 nb = (
+    texture(u_state, uv + vec2(u_pixel.x, 0.0)).rgb +
+    texture(u_state, uv - vec2(u_pixel.x, 0.0)).rgb +
+    texture(u_state, uv + vec2(0.0, u_pixel.y)).rgb +
+    texture(u_state, uv - vec2(0.0, u_pixel.y)).rgb +
+    texture(u_state, uv + u_pixel * 0.7071).rgb +
+    texture(u_state, uv - u_pixel * 0.7071).rgb +
+    texture(u_state, uv + vec2(u_pixel.x, -u_pixel.y) * 0.7071).rgb +
+    texture(u_state, uv + vec2(-u_pixel.x, u_pixel.y) * 0.7071).rgb
+  ) * 0.125;
+  vec3 diffused = mix(cur, nb, u_visc);
+
+  // image-aware mask: noise + luma delta
+  vec3 cA = sampleFit(u_texA, uv, u_aspectA, u_offsetA, u_validA).rgb;
+  vec3 cB = sampleFit(u_texB, uv, u_aspectB, u_offsetB, u_validB).rgb;
+  float n = fbm(uv * u_maskScale + u_seed * 0.13);
+  float lA = luma(cA), lB = luma(cB);
+  float lumMask = 0.5 + 0.5 * (lB - lA);
+  float mask = mix(n, lumMask, u_organic);
+
+  float sp = mix(0.1, 0.5, u_spread);
+  float reveal = smoothstep(mask - sp, mask + sp * 0.3, u_t);
+  vec3 mixed = mix(diffused, cB, reveal * u_rate);
+
+  frag = vec4(mixed, 1.0);
+}`;
+
+const INIT_FS = `#version 300 es
+precision highp float;
+uniform sampler2D u_texA;
+uniform vec2 u_aspectA, u_offsetA;
+uniform int u_validA;
+uniform vec3 u_bg;
+in vec2 v_uv;
+out vec4 frag;
+vec4 sampleFit(sampler2D tex, vec2 uv, vec2 scale, vec2 offset, int valid) {
+  if (valid == 0) return vec4(u_bg, 1.0);
+  vec2 q = (uv - offset) / scale;
+  if (q.x < 0.0 || q.x > 1.0 || q.y < 0.0 || q.y > 1.0) return vec4(u_bg, 1.0);
+  return texture(tex, q);
+}
+void main() {
+  frag = vec4(sampleFit(u_texA, v_uv, u_aspectA, u_offsetA, u_validA).rgb, 1.0);
+}`;
+
+const simProg = program(VS, SIM_FS);
+gl.useProgram(simProg);
+{
+  const pl = gl.getAttribLocation(simProg, 'a_pos');
+  gl.enableVertexAttribArray(pl);
+  gl.vertexAttribPointer(pl, 2, gl.FLOAT, false, 0, 0);
+}
+const simUni = {
+  state:     gl.getUniformLocation(simProg, 'u_state'),
+  texA:      gl.getUniformLocation(simProg, 'u_texA'),
+  texB:      gl.getUniformLocation(simProg, 'u_texB'),
+  aspA:      gl.getUniformLocation(simProg, 'u_aspectA'),
+  offA:      gl.getUniformLocation(simProg, 'u_offsetA'),
+  aspB:      gl.getUniformLocation(simProg, 'u_aspectB'),
+  offB:      gl.getUniformLocation(simProg, 'u_offsetB'),
+  validA:    gl.getUniformLocation(simProg, 'u_validA'),
+  validB:    gl.getUniformLocation(simProg, 'u_validB'),
+  pixel:     gl.getUniformLocation(simProg, 'u_pixel'),
+  t:         gl.getUniformLocation(simProg, 'u_t'),
+  visc:      gl.getUniformLocation(simProg, 'u_visc'),
+  rate:      gl.getUniformLocation(simProg, 'u_rate'),
+  seed:      gl.getUniformLocation(simProg, 'u_seed'),
+  maskScale: gl.getUniformLocation(simProg, 'u_maskScale'),
+  organic:   gl.getUniformLocation(simProg, 'u_organic'),
+  spread:    gl.getUniformLocation(simProg, 'u_spread'),
+  bg:        gl.getUniformLocation(simProg, 'u_bg'),
+};
+gl.uniform1i(simUni.state, 2);
+gl.uniform1i(simUni.texA, 0);
+gl.uniform1i(simUni.texB, 1);
+
+const initProg = program(VS, INIT_FS);
+gl.useProgram(initProg);
+{
+  const pl = gl.getAttribLocation(initProg, 'a_pos');
+  gl.enableVertexAttribArray(pl);
+  gl.vertexAttribPointer(pl, 2, gl.FLOAT, false, 0, 0);
+}
+const initUni = {
+  texA:   gl.getUniformLocation(initProg, 'u_texA'),
+  aspA:   gl.getUniformLocation(initProg, 'u_aspectA'),
+  offA:   gl.getUniformLocation(initProg, 'u_offsetA'),
+  validA: gl.getUniformLocation(initProg, 'u_validA'),
+  bg:     gl.getUniformLocation(initProg, 'u_bg'),
+};
+gl.uniform1i(initUni.texA, 0);
+
+// FBO pair
+let fboA = null, fboB = null;
+let fboTexA = null, fboTexB = null;
+let fboW = 0, fboH = 0;
+
+function makeFBOTex(w, h) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return tex;
+}
+function makeFBO(tex) {
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  return fbo;
+}
+function ensureFBOs() {
+  const w = canvas.width, h = canvas.height;
+  if (w === fboW && h === fboH && fboA) return;
+  if (fboTexA) { gl.deleteTexture(fboTexA); gl.deleteFramebuffer(fboA); }
+  if (fboTexB) { gl.deleteTexture(fboTexB); gl.deleteFramebuffer(fboB); }
+  fboTexA = makeFBOTex(w, h);
+  fboA    = makeFBO(fboTexA);
+  fboTexB = makeFBOTex(w, h);
+  fboB    = makeFBO(fboTexB);
+  fboW = w; fboH = h;
+  advec.needsReset = true;
+}
+
+// Which FBO currently holds "source" state. Read from src, write to !src,
+// then swap so the just-written FBO becomes the next source.
+const advec = { src: 'A', lastT: 0, needsReset: true };
+
+function bindImageTextures() {
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texA);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texB);
+}
+
+function initAdvecState() {
+  ensureFBOs();
+  const dst = (advec.src === 'A') ? fboA : fboB;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, dst);
+  gl.viewport(0, 0, fboW, fboH);
+  gl.useProgram(initProg);
+  bindImageTextures();
+  const fA = fitInfo(state.imgA, fboW, fboH, state.fit);
+  gl.uniform2f(initUni.aspA, fA.sx, fA.sy);
+  gl.uniform2f(initUni.offA, fA.ox, fA.oy);
+  gl.uniform1i(initUni.validA, state.imgA ? 1 : 0);
+  const bg = hexToRgb(state.bg);
+  gl.uniform3f(initUni.bg, bg[0], bg[1], bg[2]);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+  advec.lastT = 0;
+  advec.needsReset = false;
+}
+
+function advecStep(tAt) {
+  const srcTex = (advec.src === 'A') ? fboTexA : fboTexB;
+  const dstFBO = (advec.src === 'A') ? fboB : fboA;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, dstFBO);
+  gl.viewport(0, 0, fboW, fboH);
+  gl.useProgram(simProg);
+  bindImageTextures();
+  gl.activeTexture(gl.TEXTURE2);
+  gl.bindTexture(gl.TEXTURE_2D, srcTex);
+
+  const fA = fitInfo(state.imgA, fboW, fboH, state.fit);
+  const fB = fitInfo(state.imgB, fboW, fboH, state.fit);
+  gl.uniform2f(simUni.aspA, fA.sx, fA.sy); gl.uniform2f(simUni.offA, fA.ox, fA.oy);
+  gl.uniform2f(simUni.aspB, fB.sx, fB.sy); gl.uniform2f(simUni.offB, fB.ox, fB.oy);
+  gl.uniform1i(simUni.validA, state.imgA ? 1 : 0);
+  gl.uniform1i(simUni.validB, state.imgB ? 1 : 0);
+  gl.uniform2f(simUni.pixel, 1.0 / fboW, 1.0 / fboH);
+  gl.uniform1f(simUni.t, tAt);
+  gl.uniform1f(simUni.visc, state.advecVisc);
+  gl.uniform1f(simUni.rate, state.advecRate);
+  gl.uniform1f(simUni.seed, state.seed);
+  gl.uniform1f(simUni.maskScale, state.maskScale);
+  gl.uniform1f(simUni.organic, state.organic);
+  gl.uniform1f(simUni.spread, state.spread);
+  const bg = hexToRgb(state.bg);
+  gl.uniform3f(simUni.bg, bg[0], bg[1], bg[2]);
+
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+  advec.src = (advec.src === 'A') ? 'B' : 'A';
+}
+
+function runAdvection() {
+  ensureFBOs();
+  if (!state.imgA || !state.imgB) return null;
+
+  // Reset if scrubbing backward, jumping, or first run.
+  if (advec.needsReset || state.t < advec.lastT - 0.03 || state.t === 0) {
+    initAdvecState();
+    const warm = Math.max(8, Math.round(state.advecSteps * 8));
+    for (let i = 0; i < warm; i++) {
+      advecStep(state.t * ((i + 1) / warm));
+    }
+  } else {
+    // Catch up from lastT → t, in N small steps
+    const N = Math.max(1, Math.round(state.advecSteps));
+    const startT = advec.lastT;
+    const endT = state.t;
+    for (let i = 0; i < N; i++) {
+      advecStep(startT + (endT - startT) * ((i + 1) / N));
+    }
+  }
+  advec.lastT = state.t;
+  // Return the texture that holds the current state
+  return (advec.src === 'A') ? fboTexA : fboTexB;
 }
 
 // ---------- state ----------
@@ -621,6 +895,9 @@ const state = {
   runDrip: 0.35,
   strokeReach: 0.35,
   strokeSoftness: 0.25,
+  advecVisc: 0.55,
+  advecRate: 0.18,
+  advecSteps: 3,
   fit: 'cover',
   bg: '#000000',
   exportFps: 24,
@@ -722,11 +999,30 @@ function render() {
     if (typeof bT !== 'undefined') bT.refresh();
   }
 
+  // Advection mode runs its sim into FBOs first, then we display the result.
+  let advecTex = null;
+  if (state.mode === 11) {
+    advecTex = runAdvection();
+  }
+
+  // Switch back to the default framebuffer (canvas)
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+
   gl.useProgram(prog);
   gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_2D, texA);
   gl.activeTexture(gl.TEXTURE1);
   gl.bindTexture(gl.TEXTURE_2D, texB);
+  if (advecTex) {
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, advecTex);
+  }
+  // Reselect the main program's attribute layout (sim/init may have left a
+  // different buffer bound — be safe and re-point the position attrib)
+  gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+  gl.enableVertexAttribArray(posLoc);
+  gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
 
   const cw = canvas.width, ch = canvas.height;
   const fA = fitInfo(state.imgA, cw, ch, state.fit);
@@ -823,6 +1119,7 @@ function loadFromUrl(url, slot) {
     canvas.classList.remove('empty');
     dropHint.classList.add('hidden');
     resizeCanvas();
+    advec.needsReset = true;
     if (typeof maybeAutoplay === 'function') maybeAutoplay();
   };
   img.src = url;
@@ -855,6 +1152,7 @@ document.getElementById('swap').addEventListener('click', () => {
   [state.imgA, state.imgB] = [state.imgB, state.imgA];
   if (state.imgA) uploadImage(texA, state.imgA);
   if (state.imgB) uploadImage(texB, state.imgB);
+  advec.needsReset = true;
   const sA = document.querySelector('.slot[data-slot="A"] img');
   const sB = document.querySelector('.slot[data-slot="B"] img');
   if (sA && sB)        { const tmp = sA.src; sA.src = sB.src; sB.src = tmp; }
@@ -960,6 +1258,7 @@ tip(
       'wet bleed':       8,
       'pigment run':     9,
       'stroke bleed':    10,
+      'wet advection':   11,
     },
   }).on('change', () => updateModeFolders()),
   'Watercolor behaviour layered on top of the dissolve.'
@@ -975,6 +1274,7 @@ const fIris   = fWater.addFolder({ title: 'Iris',           expanded: true });
 const fBleed  = fWater.addFolder({ title: 'Wet bleed',      expanded: true });
 const fRun    = fWater.addFolder({ title: 'Pigment run',    expanded: true });
 const fStroke = fWater.addFolder({ title: 'Stroke bleed',   expanded: true });
+const fAdvec  = fWater.addFolder({ title: 'Wet advection',  expanded: true });
 
 tip(fRim.addBinding(state, 'rimWidth', { min: 0, max: 0.4, step: 0.005, label: 'rim width' }),
     'Thickness of the dark settling band at the wet front.');
@@ -1064,6 +1364,14 @@ tip(fStroke.addBinding(state, 'strokeReach', { min: 0, max: 1, step: 0.01, label
 tip(fStroke.addBinding(state, 'strokeSoftness', { min: 0, max: 1, step: 0.01, label: 'softness' }),
     'Additional blur along the stroke direction. Higher = silkier, more diffuse streaks.');
 
+tip(fAdvec.addBinding(state, 'advecVisc', { min: 0, max: 1, step: 0.01, label: 'viscosity' }),
+    'How much each pixel averages with its neighbours per step. Higher = more spread, less crisp.');
+tip(fAdvec.addBinding(state, 'advecRate', { min: 0, max: 1, step: 0.01, label: 'mixing rate' }),
+    'Per-step strength of pulling the state toward B in the revealed region. Lower = slower, more painterly accumulation.');
+tip(fAdvec.addBinding(state, 'advecSteps', { min: 1, max: 8, step: 1, label: 'steps / frame' }),
+    'Diffusion iterations per rendered frame. More steps = smoother bleed but more GPU cost.');
+fAdvec.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
+
 function updateModeFolders() {
   fRim.hidden    = state.mode !== 1;
   fPaper.hidden  = state.mode !== 2;
@@ -1075,6 +1383,7 @@ function updateModeFolders() {
   fBleed.hidden  = state.mode !== 8;
   fRun.hidden    = state.mode !== 9;
   fStroke.hidden = state.mode !== 10;
+  fAdvec.hidden  = state.mode !== 11;
 }
 updateModeFolders();
 
@@ -1149,6 +1458,7 @@ const PRESET_KEYS = [
   'bleedFinger', 'bleedAmount', 'bleedHalo',
   'runGravity', 'runDrip',
   'strokeReach', 'strokeSoftness',
+  'advecVisc', 'advecRate', 'advecSteps',
   'organic', 'edges', 'spread', 'maskScale',
   'softness', 'glow', 'bloom', 'warmth', 'vignette',
 ];
