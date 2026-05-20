@@ -63,14 +63,21 @@ struct Params {
   irisFocus: vec2f, irisJitter: f32, _p0: f32,
   // -- 176..191 -- bleed, run scalars
   bleedFinger: f32, bleedAmount: f32, bleedHalo: f32, runGravity: f32,
-  // -- 192..207 -- run drip + padding
-  runDrip: f32, _p1: f32, _p2: f32, _p3: f32,
+  // -- 192..207 -- run drip + advection-family params (start)
+  runDrip: f32, advVariant: u32, advVisc: f32, advRate: f32,
+  // -- 208..223 -- gravity params
+  advGravity: f32, advGravBias: f32, advGravAngle: f32, advGravStreak: f32,
+  // -- 224..239 -- gravity lateral + curl + brush
+  advGravLateral: f32, advCurlStr: f32, advCurlScale: f32, advBrushFollow: f32,
+  // -- 240..255 -- seed
+  advSeedCount: u32, advSeedRadius: f32, _p4: f32, _p5: f32,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var texA: texture_2d<f32>;
 @group(0) @binding(2) var texB: texture_2d<f32>;
 @group(0) @binding(3) var samp: sampler;
+@group(0) @binding(4) var advState: texture_2d<f32>;
 
 @vertex fn vs(@builtin(vertex_index) idx: u32) -> VSOut {
   // 6-vertex fullscreen triangle pair, with UV in [0,1] (y up to match WebGL).
@@ -281,6 +288,13 @@ fn organicMask(uv: vec2f, lA: f32, lB: f32, edge: f32) -> f32 {
 
 @fragment fn fs(in: VSOut) -> @location(0) vec4f {
   let uv = in.uv;
+
+  // Advection family (modes 10..14): the compute pipeline writes a state
+  // texture each frame; here we just sample and present it.
+  if (p.mode >= 10u && p.mode <= 14u) {
+    return vec4f(textureSampleLevel(advState, samp, uv, 0.0).rgb, 1.0);
+  }
+
   let t = applyCurve(p.t, p.curve);
   let env = pow(sin(3.14159265 * clamp(p.t, 0.0, 1.0)), 0.85);
 
@@ -390,6 +404,7 @@ const bindGroupLayout = device.createBindGroupLayout({
     { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
     { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
     { binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+    { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
   ],
 });
 device.pushErrorScope('validation');
@@ -402,6 +417,236 @@ const pipeline = device.createRenderPipeline({
 });
 device.popErrorScope().then(err => { if (err) console.error('[pipeline error]', err.message); });
 
+// ============================================================================
+// Advection sim — render-to-texture ping-pong (mode 10..14)
+// ============================================================================
+const STATE_FORMAT = 'rgba16float';
+const SIM_SHADER = /* wgsl */`
+struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+struct Params {
+  t: f32, spread: f32, organic: f32, edges: f32,
+  maskScale: f32, seed: f32, validA: u32, validB: u32,
+  scaleA: vec2f, offsetA: vec2f, scaleB: vec2f, offsetB: vec2f,
+  bg: vec3f, mode: u32,
+  curve: u32, sedDirection: u32, sedSource: u32, saltSource: u32,
+  rimWidth: f32, rimDark: f32,
+  paperAngle: f32, paperAniso: f32, paperGranulation: f32,
+  bloomCount: u32, bloomRim: f32, bloomRate: f32,
+  diffStrength: f32, diffRadius: f32,
+  sedBands: f32, sedSoftness: f32,
+  saltDensity: f32, saltContrast: f32, saltBias: f32, saltImage: u32,
+  irisFocus: vec2f, irisJitter: f32, _p0: f32,
+  bleedFinger: f32, bleedAmount: f32, bleedHalo: f32, runGravity: f32,
+  runDrip: f32, advVariant: u32, advVisc: f32, advRate: f32,
+  advGravity: f32, advGravBias: f32, advGravAngle: f32, advGravStreak: f32,
+  advGravLateral: f32, advCurlStr: f32, advCurlScale: f32, advBrushFollow: f32,
+  advSeedCount: u32, advSeedRadius: f32, _p4: f32, _p5: f32,
+};
+
+@group(0) @binding(0) var<uniform> p: Params;
+@group(0) @binding(1) var texA: texture_2d<f32>;
+@group(0) @binding(2) var texB: texture_2d<f32>;
+@group(0) @binding(3) var samp: sampler;
+@group(0) @binding(4) var stateIn: texture_2d<f32>;
+
+@vertex fn vs(@builtin(vertex_index) idx: u32) -> VSOut {
+  let positions = array<vec2f, 6>(
+    vec2f(-1.0, -1.0), vec2f( 1.0, -1.0), vec2f(-1.0,  1.0),
+    vec2f(-1.0,  1.0), vec2f( 1.0, -1.0), vec2f( 1.0,  1.0),
+  );
+  let uvs = array<vec2f, 6>(
+    vec2f(0.0, 1.0), vec2f(1.0, 1.0), vec2f(0.0, 0.0),
+    vec2f(0.0, 0.0), vec2f(1.0, 1.0), vec2f(1.0, 0.0),
+  );
+  var out: VSOut;
+  out.pos = vec4f(positions[idx], 0.0, 1.0);
+  out.uv = uvs[idx];
+  return out;
+}
+
+fn hash21(q: vec2f) -> f32 {
+  var x = fract(q * vec2f(123.34, 456.21));
+  x += dot(x, x + 45.32);
+  return fract(x.x * x.y);
+}
+fn vnoise(q: vec2f) -> f32 {
+  let i = floor(q); let f = fract(q);
+  let u = f * f * (3.0 - 2.0 * f);
+  let a = hash21(i);
+  let b = hash21(i + vec2f(1.0, 0.0));
+  let c = hash21(i + vec2f(0.0, 1.0));
+  let d = hash21(i + vec2f(1.0, 1.0));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+fn fbm(q: vec2f) -> f32 {
+  var v = 0.0; var amp = 0.5; var pp = q;
+  for (var i = 0; i < 4; i = i + 1) { v += amp * vnoise(pp); pp *= 2.03; amp *= 0.5; }
+  return v;
+}
+fn luma(c: vec3f) -> f32 { return dot(c, vec3f(0.299, 0.587, 0.114)); }
+fn sampleFit(tex: texture_2d<f32>, uv: vec2f, scale: vec2f, offset: vec2f, valid: u32) -> vec4f {
+  if (valid == 0u) { return vec4f(p.bg, 1.0); }
+  let q = (uv - offset) / scale;
+  if (q.x < 0.0 || q.x > 1.0 || q.y < 0.0 || q.y > 1.0) { return vec4f(p.bg, 1.0); }
+  return textureSampleLevel(tex, samp, q, 0.0);
+}
+
+@fragment fn fs(in: VSOut) -> @location(0) vec4f {
+  let uv = in.uv;
+  // 1 / dims (we sample state via sampler so we need pixel size in UV space)
+  let dims = vec2f(textureDimensions(stateIn));
+  let px = 1.0 / dims;
+
+  // 8-tap neighbour average for soft isotropic diffusion (variant 0, baseline).
+  let cur = textureSampleLevel(stateIn, samp, uv, 0.0).rgb;
+  let nb = (
+    textureSampleLevel(stateIn, samp, uv + vec2f(px.x, 0.0), 0.0).rgb +
+    textureSampleLevel(stateIn, samp, uv - vec2f(px.x, 0.0), 0.0).rgb +
+    textureSampleLevel(stateIn, samp, uv + vec2f(0.0, px.y), 0.0).rgb +
+    textureSampleLevel(stateIn, samp, uv - vec2f(0.0, px.y), 0.0).rgb +
+    textureSampleLevel(stateIn, samp, uv + px * 0.7071, 0.0).rgb +
+    textureSampleLevel(stateIn, samp, uv - px * 0.7071, 0.0).rgb +
+    textureSampleLevel(stateIn, samp, uv + vec2f(px.x, -px.y) * 0.7071, 0.0).rgb +
+    textureSampleLevel(stateIn, samp, uv + vec2f(-px.x, px.y) * 0.7071, 0.0).rgb
+  ) * 0.125;
+  let diffused = mix(cur, nb, p.advVisc);
+
+  // image-aware mask: noise + luma delta
+  let cA = sampleFit(texA, uv, p.scaleA, p.offsetA, p.validA);
+  let cB = sampleFit(texB, uv, p.scaleB, p.offsetB, p.validB);
+  let n1 = fbm(uv * p.maskScale + p.seed * 0.13);
+  let n2 = fbm(uv * p.maskScale * 2.3 + 17.0 + p.seed * 0.09);
+  let noiseMask = mix(n1, n2, 0.35);
+  let lA = luma(cA.rgb); let lB = luma(cB.rgb);
+  let lumMask = 0.5 + 0.5 * (lB - lA);
+  let mask = mix(noiseMask, lumMask, p.organic);
+
+  let sp = mix(0.1, 0.5, p.spread);
+  let reveal = smoothstep(mask - sp, mask + sp * 0.3, p.t);
+  let mixed = mix(diffused, cB.rgb, reveal * p.advRate);
+  return vec4f(mixed, 1.0);
+}
+`;
+
+const INIT_SHADER = /* wgsl */`
+struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+struct Params {
+  // minimal — we only read fit + bg + validA here. Reuse full struct for layout.
+  t: f32, spread: f32, organic: f32, edges: f32,
+  maskScale: f32, seed: f32, validA: u32, validB: u32,
+  scaleA: vec2f, offsetA: vec2f, scaleB: vec2f, offsetB: vec2f,
+  bg: vec3f, mode: u32,
+  curve: u32, sedDirection: u32, sedSource: u32, saltSource: u32,
+  rimWidth: f32, rimDark: f32,
+  paperAngle: f32, paperAniso: f32, paperGranulation: f32,
+  bloomCount: u32, bloomRim: f32, bloomRate: f32,
+  diffStrength: f32, diffRadius: f32,
+  sedBands: f32, sedSoftness: f32,
+  saltDensity: f32, saltContrast: f32, saltBias: f32, saltImage: u32,
+  irisFocus: vec2f, irisJitter: f32, _p0: f32,
+  bleedFinger: f32, bleedAmount: f32, bleedHalo: f32, runGravity: f32,
+  runDrip: f32, advVariant: u32, advVisc: f32, advRate: f32,
+  advGravity: f32, advGravBias: f32, advGravAngle: f32, advGravStreak: f32,
+  advGravLateral: f32, advCurlStr: f32, advCurlScale: f32, advBrushFollow: f32,
+  advSeedCount: u32, advSeedRadius: f32, _p4: f32, _p5: f32,
+};
+@group(0) @binding(0) var<uniform> p: Params;
+@group(0) @binding(1) var texA: texture_2d<f32>;
+@group(0) @binding(2) var texB: texture_2d<f32>;
+@group(0) @binding(3) var samp: sampler;
+@group(0) @binding(4) var stateIn: texture_2d<f32>;
+@vertex fn vs(@builtin(vertex_index) idx: u32) -> VSOut {
+  let positions = array<vec2f, 6>(
+    vec2f(-1.0, -1.0), vec2f( 1.0, -1.0), vec2f(-1.0,  1.0),
+    vec2f(-1.0,  1.0), vec2f( 1.0, -1.0), vec2f( 1.0,  1.0),
+  );
+  let uvs = array<vec2f, 6>(
+    vec2f(0.0, 1.0), vec2f(1.0, 1.0), vec2f(0.0, 0.0),
+    vec2f(0.0, 0.0), vec2f(1.0, 1.0), vec2f(1.0, 0.0),
+  );
+  var out: VSOut;
+  out.pos = vec4f(positions[idx], 0.0, 1.0);
+  out.uv = uvs[idx];
+  return out;
+}
+@fragment fn fs(in: VSOut) -> @location(0) vec4f {
+  let uv = in.uv;
+  if (p.validA == 0u) { return vec4f(p.bg, 1.0); }
+  let q = (uv - p.offsetA) / p.scaleA;
+  if (q.x < 0.0 || q.x > 1.0 || q.y < 0.0 || q.y > 1.0) { return vec4f(p.bg, 1.0); }
+  return vec4f(textureSampleLevel(texA, samp, q, 0.0).rgb, 1.0);
+}
+`;
+
+const simModule  = device.createShaderModule({ code: SIM_SHADER });
+const initModule = device.createShaderModule({ code: INIT_SHADER });
+const simPipeline = device.createRenderPipeline({
+  label: 'sim-pipeline',
+  layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+  vertex:   { module: simModule, entryPoint: 'vs' },
+  fragment: { module: simModule, entryPoint: 'fs', targets: [{ format: STATE_FORMAT }] },
+  primitive: { topology: 'triangle-list' },
+});
+const initPipeline = device.createRenderPipeline({
+  label: 'init-pipeline',
+  layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+  vertex:   { module: initModule, entryPoint: 'vs' },
+  fragment: { module: initModule, entryPoint: 'fs', targets: [{ format: STATE_FORMAT }] },
+  primitive: { topology: 'triangle-list' },
+});
+
+let stateTexA = null, stateTexB = null;
+let stateW = 0, stateH = 0;
+const advec = { src: 'A', lastT: 0, needsReset: true };
+
+function ensureStateTextures() {
+  const w = canvas.width, h = canvas.height;
+  if (!w || !h) return;
+  if (w === stateW && h === stateH && stateTexA) return;
+  if (stateTexA) stateTexA.destroy();
+  if (stateTexB) stateTexB.destroy();
+  stateTexA = device.createTexture({
+    label: 'state-A',
+    size: [w, h, 1], format: STATE_FORMAT,
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
+  });
+  stateTexB = device.createTexture({
+    label: 'state-B',
+    size: [w, h, 1], format: STATE_FORMAT,
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
+  });
+  stateW = w; stateH = h;
+  advec.needsReset = true;
+}
+
+// Build bind groups dynamically — they must reference texA/texB/state textures
+// that all change at runtime. Cheap to recreate, so do it each step.
+function makeSimBindGroup(stateIn) {
+  return device.createBindGroup({
+    layout: bindGroupLayout,
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuffer } },
+      { binding: 1, resource: texA.createView() },
+      { binding: 2, resource: texB.createView() },
+      { binding: 3, resource: sampler },
+      { binding: 4, resource: stateIn.createView() },
+    ],
+  });
+}
+function makeDisplayBindGroup(finalState) {
+  return device.createBindGroup({
+    layout: bindGroupLayout,
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuffer } },
+      { binding: 1, resource: texA.createView() },
+      { binding: 2, resource: texB.createView() },
+      { binding: 3, resource: sampler },
+      { binding: 4, resource: finalState.createView() },
+    ],
+  });
+}
+
 // Uniform buffer — 208 bytes total, matches the Params struct in WGSL.
 // Offsets (in 4-byte units, which is the JS Float32Array / Uint32Array index):
 //   0  t            8   scaleA.x      16 bg.r          20 curve          24 rimWidth       32 diffStrength    40 irisFocus.x   44 bleedFinger    48 runDrip
@@ -412,7 +657,7 @@ device.popErrorScope().then(err => { if (err) console.error('[pipeline error]', 
 //   5  seed         13  scaleB.y                                          29 bloomCount     37 saltContrast
 //   6  validA       14  offsetB.x                                         30 bloomRim       38 saltBias
 //   7  validB       15  offsetB.y                                         31 bloomRate      39 saltImage
-const UBO_SIZE = 208;
+const UBO_SIZE = 256;
 const uniformBuffer = device.createBuffer({
   size: UBO_SIZE,
   usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -438,7 +683,15 @@ function makePlaceholderTexture() {
 let texA = makePlaceholderTexture();
 let texB = makePlaceholderTexture();
 
-function makeBindGroup() {
+// Placeholder state texture so the bind group is valid before sim runs.
+// Replaced with real ping-pong textures on first advection frame.
+let placeholderState = device.createTexture({
+  label: 'state-placeholder',
+  size: [1, 1, 1], format: STATE_FORMAT,
+  usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
+});
+
+function makeBindGroup(stateView) {
   return device.createBindGroup({
     layout: bindGroupLayout,
     entries: [
@@ -446,6 +699,7 @@ function makeBindGroup() {
       { binding: 1, resource: texA.createView() },
       { binding: 2, resource: texB.createView() },
       { binding: 3, resource: sampler },
+      { binding: 4, resource: stateView || placeholderState.createView() },
     ],
   });
 }
@@ -467,6 +721,7 @@ async function uploadImageToSlot(img, slot) {
   else              { texB.destroy(); texB = tex; }
   bitmap.close();
   bindGroup = makeBindGroup();
+  advec.needsReset = true;
   console.log(`[upload ${slot}] new bind group ready`);
 }
 
@@ -499,6 +754,13 @@ const state = {
   irisFocusX: 0.5, irisFocusY: 0.5, irisJitter: 0.35,
   bleedFinger: 0.5, bleedAmount: 0.45, bleedHalo: 0.5,
   runGravity: 0.5, runDrip: 0.35,
+  // advection family
+  advecVisc: 0.55, advecRate: 0.18, advecSteps: 3,
+  advecGravity: 0.6, advecGravBias: 0.5,
+  advecGravAngle: 0, advecGravStreak: 0.4, advecGravLateral: 0.3,
+  advecCurlStr: 0.5, advecCurlScale: 2.5,
+  advecBrushFollow: 0.7,
+  advecSeedCount: 5, advecSeedRadius: 0.45,
   // style / framing
   fit: 'cover',
   bg: '#000000',
@@ -621,7 +883,23 @@ function writeUniforms() {
   uboF32[47] = state.runGravity;
   // -- 48..51 --
   uboF32[48] = state.runDrip;
-  uboF32[49] = 0; uboF32[50] = 0; uboF32[51] = 0;
+  uboU32[49] = (state.mode >= 11 && state.mode <= 14) ? (state.mode - 10) : 0; // advVariant
+  uboF32[50] = state.advecVisc;
+  uboF32[51] = state.advecRate;
+  // -- 52..55 -- gravity
+  uboF32[52] = state.advecGravity;
+  uboF32[53] = state.advecGravBias;
+  uboF32[54] = state.advecGravAngle;
+  uboF32[55] = state.advecGravStreak;
+  // -- 56..59 -- lateral + curl + brush
+  uboF32[56] = state.advecGravLateral;
+  uboF32[57] = state.advecCurlStr;
+  uboF32[58] = state.advecCurlScale;
+  uboF32[59] = state.advecBrushFollow;
+  // -- 60..63 -- seed
+  uboU32[60] = state.advecSeedCount;
+  uboF32[61] = state.advecSeedRadius;
+  uboF32[62] = 0; uboF32[63] = 0;
 
   device.queue.writeBuffer(uniformBuffer, 0, uboHost);
 }
@@ -652,7 +930,48 @@ function render() {
 
   if (state.imgA || state.imgB) {
     writeUniforms();
+
+    const isAdvec = state.mode >= 10 && state.mode <= 14;
+    let finalState = null;
     const enc = device.createCommandEncoder();
+
+    if (isAdvec) {
+      ensureStateTextures();
+      // Detect reset condition: first run, scrubbing backward, or t == 0.
+      if (advec.needsReset || state.t < advec.lastT - 0.03 || state.t === 0) {
+        // Init pass: render texA into stateTexA via initPipeline.
+        const initPass = enc.beginRenderPass({
+          colorAttachments: [{
+            view: stateTexA.createView(),
+            clearValue: { r: 0, g: 0, b: 0, a: 1 },
+            loadOp: 'clear', storeOp: 'store',
+          }],
+        });
+        initPass.setPipeline(initPipeline);
+        initPass.setBindGroup(0, makeSimBindGroup(stateTexB));  // stateIn unused by init
+        initPass.draw(6);
+        initPass.end();
+        advec.src = 'A';
+        advec.lastT = 0;
+        advec.needsReset = false;
+        // Warm-up: run several sim steps so the state matches current t.
+        const warm = Math.max(8, Math.round(state.advecSteps * 8));
+        for (let i = 0; i < warm; i++) {
+          const tAt = state.t * ((i + 1) / warm);
+          runSimStepInto(enc, tAt);
+        }
+      } else {
+        const N = Math.max(1, Math.round(state.advecSteps));
+        const startT = advec.lastT, endT = state.t;
+        for (let i = 0; i < N; i++) {
+          runSimStepInto(enc, startT + (endT - startT) * ((i + 1) / N));
+        }
+      }
+      advec.lastT = state.t;
+      finalState = (advec.src === 'A') ? stateTexA : stateTexB;
+    }
+
+    const displayBG = isAdvec ? makeDisplayBindGroup(finalState) : bindGroup;
     const pass = enc.beginRenderPass({
       colorAttachments: [{
         view: ctx.getCurrentTexture().createView(),
@@ -661,12 +980,36 @@ function render() {
       }],
     });
     pass.setPipeline(pipeline);
-    pass.setBindGroup(0, bindGroup);
+    pass.setBindGroup(0, displayBG);
     pass.draw(6);
     pass.end();
     device.queue.submit([enc.finish()]);
   }
   requestAnimationFrame(render);
+}
+
+// Run one sim step into the off-source ping-pong texture, then swap which is
+// "current". Writes the current t into the uniform first (so successive steps
+// can interpolate from lastT to current).
+function runSimStepInto(encoder, tAt) {
+  // Patch uniform t for this step (rest of params unchanged from writeUniforms).
+  uboF32[0] = tAt;
+  device.queue.writeBuffer(uniformBuffer, 0, uboHost, 0, 4);
+
+  const srcTex = (advec.src === 'A') ? stateTexA : stateTexB;
+  const dstTex = (advec.src === 'A') ? stateTexB : stateTexA;
+  const pass = encoder.beginRenderPass({
+    colorAttachments: [{
+      view: dstTex.createView(),
+      clearValue: { r: 0, g: 0, b: 0, a: 1 },
+      loadOp: 'load', storeOp: 'store',
+    }],
+  });
+  pass.setPipeline(simPipeline);
+  pass.setBindGroup(0, makeSimBindGroup(srcTex));
+  pass.draw(6);
+  pass.end();
+  advec.src = (advec.src === 'A') ? 'B' : 'A';
 }
 requestAnimationFrame(render);
 
@@ -821,8 +1164,9 @@ fWater.addBinding(state, 'mode', {
     'iris':            7,
     'wet bleed':       8,
     'pigment run':     9,
+    'wet advection':   10,
   },
-}).on('change', () => updateModeFolders());
+}).on('change', () => { updateModeFolders(); advec.needsReset = true; });
 
 const fRim    = fWater.addFolder({ title: 'Pigment rim',    expanded: true });
 fRim.addBinding(state, 'rimWidth', { min: 0, max: 0.4, step: 0.005, label: 'rim width' });
@@ -881,6 +1225,12 @@ const fRun    = fWater.addFolder({ title: 'Pigment run',    expanded: true });
 fRun.addBinding(state, 'runGravity', { min: 0, max: 1, step: 0.01, label: 'gravity' });
 fRun.addBinding(state, 'runDrip',    { min: 0, max: 1, step: 0.01, label: 'drip' });
 
+const fAdvec  = fWater.addFolder({ title: 'Wet advection',  expanded: true });
+fAdvec.addBinding(state, 'advecVisc',  { min: 0, max: 1, step: 0.01, label: 'viscosity' });
+fAdvec.addBinding(state, 'advecRate',  { min: 0, max: 1, step: 0.01, label: 'mixing rate' });
+fAdvec.addBinding(state, 'advecSteps', { min: 1, max: 8, step: 1, label: 'steps / frame' });
+fAdvec.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
+
 function updateModeFolders() {
   fRim.hidden    = state.mode !== 1;
   fPaper.hidden  = state.mode !== 2;
@@ -891,6 +1241,7 @@ function updateModeFolders() {
   fIris.hidden   = state.mode !== 7;
   fBleed.hidden  = state.mode !== 8;
   fRun.hidden    = state.mode !== 9;
+  fAdvec.hidden  = state.mode !== 10;
 }
 updateModeFolders();
 
