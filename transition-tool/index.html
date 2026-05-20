@@ -29,13 +29,6 @@
     #drop-hint.hidden { display: none; }
     #drop-hint b { color: #888; font-weight: 500; }
 
-    #drop-overlay {
-      position: fixed; inset: 0; pointer-events: none;
-      background: rgba(20,20,20,0.85); border: 2px dashed #4af;
-      display: flex; align-items: center; justify-content: center;
-      color: #4af; font-size: 18px; z-index: 100; opacity: 0; transition: opacity 0.15s;
-    }
-    body.dragging #drop-overlay { opacity: 1; }
 
     /* right-side panel: thin custom strip for image slots, then Tweakpane below */
     #side {
@@ -122,8 +115,6 @@
   <div id="drop-hint">
     <div>Drop two images anywhere<br><br><b>or click a slot →</b></div>
   </div>
-  <div id="drop-overlay">Drop image(s) here</div>
-
   <button id="toggle-panel" title="Hide controls (Tab)">‹</button>
 
   <div id="side">

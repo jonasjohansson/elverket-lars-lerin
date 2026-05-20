@@ -1426,7 +1426,10 @@ document.getElementById('clear').addEventListener('click', () => {
   dropHint.classList.remove('hidden');
 });
 
-// drag-and-drop — per-slot targets first, window catches anything else.
+// drag-and-drop — only the A and B slots are drop targets. Dragging an image
+// elsewhere does nothing. We still need to prevent the browser's default file
+// open behaviour at the window level, otherwise dropping outside a slot would
+// navigate away from the page.
 document.querySelectorAll('.slot').forEach(s => {
   s.addEventListener('dragenter', e => { e.preventDefault(); e.stopPropagation(); s.classList.add('drop-target'); });
   s.addEventListener('dragover',  e => { e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = 'copy'; });
@@ -1434,31 +1437,13 @@ document.querySelectorAll('.slot').forEach(s => {
   s.addEventListener('drop', e => {
     e.preventDefault(); e.stopPropagation();
     s.classList.remove('drop-target');
-    document.body.classList.remove('dragging');
     const files = [...e.dataTransfer.files].filter(f => f.type.startsWith('image/'));
     if (files.length === 0) return;
     loadFile(files[0], s.dataset.slot);
   });
 });
-
-window.addEventListener('dragenter', e => { e.preventDefault(); document.body.classList.add('dragging'); });
-window.addEventListener('dragover',  e => { e.preventDefault(); });
-window.addEventListener('dragleave', e => { if (e.clientX === 0 && e.clientY === 0) document.body.classList.remove('dragging'); });
-window.addEventListener('drop', e => {
-  e.preventDefault();
-  document.body.classList.remove('dragging');
-  const files = [...e.dataTransfer.files].filter(f => f.type.startsWith('image/'));
-  if (files.length === 0) return;
-  // Fallback when dropped outside either slot: fill the empty slot first,
-  // otherwise replace A; two files go to A and B in order.
-  if (files.length === 1) {
-    const target = !state.imgA ? 'A' : (!state.imgB ? 'B' : 'A');
-    loadFile(files[0], target);
-  } else {
-    loadFile(files[0], 'A');
-    loadFile(files[1], 'B');
-  }
-});
+window.addEventListener('dragover', e => e.preventDefault());
+window.addEventListener('drop',     e => e.preventDefault());
 
 window.addEventListener('resize', resizeCanvas);
 
@@ -1792,7 +1777,7 @@ fExp.addBinding(state, 'exportSizeMode', {
     '960 wide':          '960',
   },
 });
-const btnRecord = fExp.addButton({ title: 'Record .webm' });
+const btnRecord = fExp.addButton({ title: 'Record video' });
 btnRecord.on('click', () => startRecording());
 const btnBatch = fExp.addButton({ title: 'Batch record presets (15 s each)' });
 btnBatch.on('click', batchRecordPresets);
@@ -1967,8 +1952,26 @@ function makeFilename() {
   else if (m === 13) parts.push(`follow=${fixed(state.advecBrushFollow)}`);
   else if (m === 14) parts.push(`from=${SALT_SOURCE_NAMES[state.advecSeedSource] || 'random'}`, `n=${state.advecSeedCount}`, `r=${fixed(state.advecSeedRadius)}`);
   parts.push(`${Math.round(state.duration)}s`);
-  return `morph__${parts.join('__')}.webm`;
+  return `morph__${parts.join('__')}`;  // extension added by recorder based on codec
 }
+
+// Prefer mp4 if Chrome/Safari supports it (plays natively on macOS QuickTime),
+// otherwise fall back to webm.
+const RECORDER_MIMES = [
+  'video/mp4;codecs=avc1.42E01E',
+  'video/mp4;codecs=avc1',
+  'video/mp4',
+  'video/webm;codecs=vp9',
+  'video/webm;codecs=vp8',
+  'video/webm',
+];
+function pickRecorderMime() {
+  for (const m of RECORDER_MIMES) {
+    if (MediaRecorder.isTypeSupported(m)) return m;
+  }
+  return 'video/webm';
+}
+function mimeToExt(mime) { return mime.startsWith('video/mp4') ? 'mp4' : 'webm'; }
 
 async function startRecording(opts = {}) {
   if (state.recording) return;
@@ -1988,8 +1991,7 @@ async function startRecording(opts = {}) {
   const offCtx = off.getContext('2d');
 
   const stream = off.captureStream(fps);
-  const mimes = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
-  const mime = mimes.find(m => MediaRecorder.isTypeSupported(m)) || 'video/webm';
+  const mime = pickRecorderMime();
   const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 12_000_000 });
   const chunks = [];
   rec.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
@@ -2018,7 +2020,9 @@ async function startRecording(opts = {}) {
 
   const blob = new Blob(chunks, { type: mime });
   const url = URL.createObjectURL(blob);
-  const filename = opts.filename || makeFilename();
+  const ext = mimeToExt(mime);
+  const base = opts.filename || makeFilename();
+  const filename = /\.(mp4|webm)$/i.test(base) ? base : `${base}.${ext}`;
   const a = document.createElement('a');
   a.href = url; a.download = filename; a.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
@@ -2061,7 +2065,7 @@ async function batchRecordPresets() {
   state.duration = beforeDuration;
   pane.refresh();
   advec.needsReset = true;
-  btnRecord.title = 'Record .webm';
+  btnRecord.title = 'Record video';
 }
 
 // Synchronous draw (used by the recorder so we don't depend on rAF cadence)
@@ -2077,4 +2081,9 @@ function drawOnce() {
   pushUniforms();
   gl.drawArrays(gl.TRIANGLES, 0, 6);
 }
+
+
+// Automation hook — small global so headless scripts can drive the tool
+// without going through the Tweakpane DOM. Not used by the human UI.
+window.__tool = { state, pane, advec, startRecording, snapshotState, applyPreset, FACTORY_PRESETS, makeFilename, recomputeSeedPositions };
 
