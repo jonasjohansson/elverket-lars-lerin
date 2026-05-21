@@ -4,109 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Transition v1</title>
-  <style>
-    :root { color-scheme: dark; }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    html, body { width: 100%; height: 100%; background: #0a0a0a; color: #ccc; font: 12px/1.5 -apple-system, system-ui, monospace; overflow: hidden; }
-
-    #stage {
-      position: fixed; inset: 0 360px 0 0;
-      display: flex; align-items: center; justify-content: center; padding: 16px;
-      transition: inset 0.18s ease;
-    }
-    body.minimized #stage { inset: 0; padding: 0; }
-    body.minimized #canvas { box-shadow: none; }
-    #canvas { max-width: 100%; max-height: 100%; background: #000; box-shadow: 0 0 60px rgba(0,0,0,0.6); }
-    body.minimized #canvas { max-width: 100vw; max-height: 100vh; }
-    #canvas.empty { display: none; }
-
-    #drop-hint {
-      position: fixed; inset: 16px 376px 16px 16px;
-      display: flex; align-items: center; justify-content: center;
-      border: 1px dashed #333; color: #555; pointer-events: none;
-      text-align: center; padding: 32px;
-    }
-    #drop-hint.hidden { display: none; }
-    #drop-hint b { color: #888; font-weight: 500; }
-
-
-    /* right-side panel: thin custom strip for image slots, then Tweakpane below */
-    #side {
-      position: fixed; top: 0; right: 0; bottom: 0; width: 360px;
-      background: #0d0d0d; border-left: 1px solid #1a1a1a;
-      display: flex; flex-direction: column;
-      overflow: hidden;
-      transition: transform 0.18s ease;
-    }
-    body.minimized #side { transform: translateX(100%); }
-
-    /* floating toggle button — visible whether the panel is shown or hidden */
-    #toggle-panel {
-      position: fixed; top: 10px; right: 10px; z-index: 200;
-      width: 26px; height: 26px; border-radius: 4px;
-      background: rgba(20,20,20,0.85); color: #aaa;
-      border: 1px solid #2a2a2a; cursor: pointer;
-      font: inherit; font-size: 13px; line-height: 22px;
-      padding: 0; transition: background 0.1s, color 0.1s;
-    }
-    #toggle-panel:hover { background: rgba(40,40,40,0.95); color: #fff; border-color: #444; }
-    body:not(.minimized) #toggle-panel { right: 370px; }
-    #slot-bar { padding: 10px 10px 6px; display: flex; flex-direction: column; gap: 6px; }
-    .slots { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
-    .slot {
-      aspect-ratio: 4/3; background: #1a1a1a; border: 1px solid #222;
-      position: relative; cursor: pointer; overflow: hidden;
-      display: flex; align-items: center; justify-content: center;
-      color: #555; font-size: 10px;
-    }
-    .slot:hover { border-color: #444; color: #888; }
-    .slot.drop-target { border-color: #4af; box-shadow: 0 0 0 1px #4af inset; }
-    .slot.drop-target * { pointer-events: none; }
-    .slot img { width: 100%; height: 100%; object-fit: cover; display: block; }
-    .slot .lab { position: absolute; top: 3px; left: 4px; color: #fff;
-      background: rgba(0,0,0,0.6); padding: 1px 5px; font-size: 9px; pointer-events: none; }
-    .row-btns { display: flex; gap: 4px; }
-    .row-btns button {
-      flex: 1; background: #1a1a1a; color: #ccc; border: 1px solid #222;
-      padding: 4px 6px; cursor: pointer; font: inherit; font-size: 10.5px;
-    }
-    .row-btns button:hover { background: #222; border-color: #444; color: #fff; }
-
-    #tp-host {
-      flex: 1; min-height: 0; overflow-y: auto;
-      padding: 4px 10px 10px;
-    }
-
-    /* Tweakpane theming — match the minimal dark monospace aesthetic */
-    .tp-dfwv {
-      --tp-base-background-color: hsl(0, 0%, 7%);
-      --tp-base-shadow-color: rgba(0, 0, 0, 0.5);
-      --tp-button-background-color: hsl(0, 0%, 14%);
-      --tp-button-background-color-active: hsl(210, 60%, 30%);
-      --tp-button-background-color-focus: hsl(0, 0%, 18%);
-      --tp-button-background-color-hover: hsl(0, 0%, 18%);
-      --tp-button-foreground-color: hsl(0, 0%, 85%);
-      --tp-container-background-color: hsl(0, 0%, 11%);
-      --tp-container-background-color-active: hsl(0, 0%, 16%);
-      --tp-container-background-color-focus: hsl(0, 0%, 14%);
-      --tp-container-background-color-hover: hsl(0, 0%, 14%);
-      --tp-container-foreground-color: hsl(0, 0%, 75%);
-      --tp-groove-foreground-color: hsl(0, 0%, 20%);
-      --tp-input-background-color: hsl(0, 0%, 10%);
-      --tp-input-background-color-active: hsl(0, 0%, 14%);
-      --tp-input-background-color-focus: hsl(0, 0%, 14%);
-      --tp-input-background-color-hover: hsl(0, 0%, 14%);
-      --tp-input-foreground-color: hsl(0, 0%, 85%);
-      --tp-label-foreground-color: hsl(0, 0%, 60%);
-      --tp-monitor-background-color: hsl(0, 0%, 10%);
-      --tp-monitor-foreground-color: hsl(0, 0%, 60%);
-      width: 100% !important;
-      font-family: -apple-system, system-ui, monospace;
-      font-size: 10.5px;
-    }
-    /* tighter rows */
-    .tp-lblv { padding-top: 2px !important; padding-bottom: 2px !important; }
-  </style>
+  <link rel="stylesheet" href="./style.css">
 </head>
 <body>
   <div id="stage">
@@ -132,7 +30,7 @@
     <div id="tp-host"></div>
   </div>
 
-  <input type="file" id="filepicker" accept="image/*" style="display:none">
+  <input type="file" id="filepicker" accept="image/*">
   <script type="importmap">
   { "imports": { "tweakpane": "https://esm.sh/tweakpane@4.0.5" } }
   </script>

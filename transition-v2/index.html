@@ -4,78 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Transition v2</title>
-  <style>
-    :root { color-scheme: dark; }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    html, body { width: 100%; height: 100%; background: #0a0a0a; color: #ccc; font: 12px/1.5 -apple-system, system-ui, monospace; overflow: hidden; }
-
-    #stage {
-      position: fixed; inset: 0 360px 0 0;
-      display: flex; align-items: center; justify-content: center; padding: 16px;
-      transition: inset 0.18s ease;
-    }
-    body.minimized #stage { inset: 0; padding: 0; }
-    body.minimized #canvas { box-shadow: none; }
-    #canvas { max-width: 100%; max-height: 100%; background: #000; box-shadow: 0 0 60px rgba(0,0,0,0.6); }
-    body.minimized #canvas { max-width: 100vw; max-height: 100vh; }
-    #canvas.empty { display: none; }
-
-    #side {
-      position: fixed; top: 0; right: 0; bottom: 0; width: 360px;
-      background: #0d0d0d; border-left: 1px solid #1a1a1a;
-      display: flex; flex-direction: column;
-      overflow: hidden;
-      transition: transform 0.18s ease;
-    }
-    body.minimized #side { transform: translateX(100%); }
-
-    #toggle-panel {
-      position: fixed; top: 10px; right: 10px; z-index: 200;
-      width: 26px; height: 26px; border-radius: 4px;
-      background: rgba(20,20,20,0.85); color: #aaa;
-      border: 1px solid #2a2a2a; cursor: pointer;
-      font: inherit; font-size: 13px; line-height: 22px;
-      padding: 0;
-    }
-    #toggle-panel:hover { background: rgba(40,40,40,0.95); color: #fff; border-color: #444; }
-    body:not(.minimized) #toggle-panel { right: 370px; }
-
-    #slot-bar { padding: 10px 10px 6px; display: flex; flex-direction: column; gap: 6px; }
-    .slots { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
-    .slot {
-      aspect-ratio: 4/3; background: #1a1a1a; border: 1px solid #222;
-      position: relative; cursor: pointer; overflow: hidden;
-      display: flex; align-items: center; justify-content: center;
-      color: #555; font-size: 10px;
-    }
-    .slot:hover { border-color: #444; color: #888; }
-    .slot.drop-target { border-color: #4af; box-shadow: 0 0 0 1px #4af inset; }
-    .slot.drop-target * { pointer-events: none; }
-    .slot img { width: 100%; height: 100%; object-fit: cover; display: block; }
-    .slot .lab { position: absolute; top: 3px; left: 4px; color: #fff;
-      background: rgba(0,0,0,0.6); padding: 1px 5px; font-size: 9px; pointer-events: none; }
-    .row-btns { display: flex; gap: 4px; }
-    .row-btns button {
-      flex: 1; background: #1a1a1a; color: #ccc; border: 1px solid #222;
-      padding: 4px 6px; cursor: pointer; font: inherit; font-size: 10.5px;
-    }
-    .row-btns button:hover { background: #222; border-color: #444; color: #fff; }
-
-    #tp-host { flex: 1; min-height: 0; overflow-y: auto; padding: 4px 10px 10px; }
-
-    #gpu-error {
-      position: fixed; inset: 0; display: none;
-      align-items: center; justify-content: center; flex-direction: column;
-      background: #0a0a0a; color: #ccc; padding: 32px; text-align: center;
-      z-index: 1000; gap: 12px;
-    }
-    #gpu-error.show { display: flex; }
-    #gpu-error b { color: #fff; }
-    #gpu-error a { color: #4af; text-decoration: none; }
-
-    .tp-dfwv { width: 100% !important; font-family: -apple-system, system-ui, monospace; font-size: 10.5px; }
-    .tp-lblv { padding-top: 2px !important; padding-bottom: 2px !important; }
-  </style>
+  <link rel="stylesheet" href="./style.css">
 </head>
 <body>
   <div id="stage">
@@ -105,7 +34,7 @@
     <div>Use <a href="../transition-v1/">the WebGL2 version</a> instead.</div>
   </div>
 
-  <input type="file" id="filepicker" accept="image/*" style="display:none">
+  <input type="file" id="filepicker" accept="image/*">
   <script type="importmap">
   {
     "imports": {
