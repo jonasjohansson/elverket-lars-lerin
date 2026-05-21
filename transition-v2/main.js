@@ -1,4 +1,4 @@
-// WebGPU port of the painterly morph tool.
+// WebGPU port of the transition tool.
 //
 // Milestone 1: scaffold + smooth organic crossfade.
 // The JS shell (state, Tweakpane, slots, recorder, presets) mirrors the WebGL2
@@ -1541,7 +1541,7 @@ function makeFilenameV2() {
   else if (m === 10) parts.push(`visc=${fx(state.advecVisc)}`, `rate=${fx(state.advecRate)}`);
   // duration / fps / dimensions / pad are appended by the recorder using
   // the actual output values (after any encoder downscale).
-  return `morph__${parts.join('__')}`;
+  return `transition__${parts.join('__')}`;
 }
 
 let recording = false;

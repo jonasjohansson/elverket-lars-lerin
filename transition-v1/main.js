@@ -1534,9 +1534,9 @@ function tip(binding, text) { if (binding && binding.element) binding.element.ti
 // PLAYBACK ------------------------------------------------------------------
 const fPlay = pane.addFolder({ title: 'Playback', expanded: true });
 const bT = fPlay.addBinding(state, 't', { min: 0, max: 1, step: 0.001, label: 'progress' });
-tip(bT, 'Scrub the transition. Updates as the morph plays back.');
+tip(bT, 'Scrub the transition. Updates as the transition plays back.');
 tip(fPlay.addBinding(state, 'duration', { min: 0.5, max: 30, step: 0.1 }),
-    'Total duration of the morph in seconds.');
+    'Total duration of the transition in seconds.');
 
 const btnPlay = fPlay.addButton({ title: 'Pause' });
 const btnRestart = fPlay.addButton({ title: 'Restart from start' });
@@ -1730,7 +1730,7 @@ addResetBtn(fRun, 9);
 tip(fAdvec.addBinding(state, 'advecVisc', { min: 0, max: 1, step: 0.01, label: 'viscosity' }),
     'How much each pixel averages with its neighbours per step. Higher = more spread, less crisp.');
 tip(fAdvec.addBinding(state, 'advecRate', { min: 0, max: 1, step: 0.01, label: 'mixing rate' }),
-    'Per-step strength of pulling the state toward B in the revealed region. Lower = slower, more painterly accumulation.');
+    'Per-step strength of pulling the state toward B in the revealed region. Lower = slower, softer accumulation.');
 tip(fAdvec.addBinding(state, 'advecSteps', { min: 1, max: 8, step: 1, label: 'steps / frame' }),
     'Diffusion iterations per rendered frame. More steps = smoother bleed but more GPU cost.');
 addResetBtn(fAdvec, 10);
@@ -2075,7 +2075,7 @@ function makeFilename() {
   else if (m === 14) parts.push(`from=${SALT_SOURCE_NAMES[state.advecSeedSource] || 'random'}`, `n=${state.advecSeedCount}`, `r=${fixed(state.advecSeedRadius)}`);
   // duration / fps / dimensions / pad are appended by the recorder so they
   // reflect the actual encoded size (after any encoder downscale).
-  return `morph__${parts.join('__')}`;
+  return `transition__${parts.join('__')}`;
 }
 
 // Prefer HEVC (H.265) for the wider encoder dimension headroom (~7680 vs
@@ -2220,7 +2220,7 @@ async function batchRecordPresets() {
     await new Promise(r => requestAnimationFrame(r));
     await new Promise(r => requestAnimationFrame(r));
     const safe = name.replace(/[^a-z0-9-]+/gi, '-').toLowerCase();
-    const fname = `morph__${safe}__${makeFilename().replace(/^morph__/, '')}`;
+    const fname = `transition__${safe}__${makeFilename().replace(/^transition__/, '')}`;
     await startRecording({
       filename: fname,
       statusPrefix: `[${i + 1}/${names.length}]`,
