@@ -1841,6 +1841,21 @@ fExp.addBinding(state, 'exportSizeMode', {
     '960 wide':          '960',
   },
 });
+const padPresetsV1 = { _v: 0 };
+const bPadPresetV1 = fExp.addBinding(padPresetsV1, '_v', {
+  label: 'pad preset',
+  options: {
+    'none':                  0,
+    'half (0.5)':            0.5,
+    'full (1.0)':            1.0,
+    'Elverket panorama':     1.416,
+    'double (2.0)':          2.0,
+  },
+});
+bPadPresetV1.on('change', e => {
+  state.exportPadBottom = e.value;
+  pane.refresh();
+});
 fExp.addBinding(state, 'exportPadBottom', { min: 0, max: 3, step: 0.001, label: 'pad below (× h)' });
 const btnRecord = fExp.addButton({ title: 'Record video' });
 btnRecord.on('click', () => startRecording());

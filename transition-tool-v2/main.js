@@ -1512,7 +1512,24 @@ fExp.addBinding(state, 'exportSizeMode', {
     '2560 wide': '2560', '1920 wide': '1920', '1280 wide': '1280', '960 wide': '960',
   },
 });
-fExp.addBinding(state, 'exportPadBottom', { min: 0, max: 3, step: 0.001, label: 'pad below (× h)' });
+// Preset dropdown that writes into state.exportPadBottom on change. Slider
+// stays available for fine-tuning.
+const padPresets = { _v: 0 };
+const bPadPreset = fExp.addBinding(padPresets, '_v', {
+  label: 'pad preset',
+  options: {
+    'none':                  0,
+    'half (0.5)':            0.5,
+    'full (1.0)':            1.0,
+    'Elverket panorama':     1.416,
+    'double (2.0)':          2.0,
+  },
+});
+bPadPreset.on('change', e => {
+  state.exportPadBottom = e.value;
+  pane.refresh();
+});
+const bPad = fExp.addBinding(state, 'exportPadBottom', { min: 0, max: 3, step: 0.001, label: 'pad below (× h)' });
 const btnRecord = fExp.addButton({ title: 'Record video' });
 btnRecord.on('click', () => startRecording());
 
