@@ -2073,9 +2073,9 @@ function makeFilename() {
   else if (m === 12) parts.push(`curl=${fixed(state.advecCurlStr)}`, `scale=${fixed(state.advecCurlScale, 1)}`);
   else if (m === 13) parts.push(`follow=${fixed(state.advecBrushFollow)}`);
   else if (m === 14) parts.push(`from=${SALT_SOURCE_NAMES[state.advecSeedSource] || 'random'}`, `n=${state.advecSeedCount}`, `r=${fixed(state.advecSeedRadius)}`);
-  parts.push(`${Math.round(state.duration)}s`);
-  if (state.exportPadBottom > 0) parts.push(`pad=${fixed(state.exportPadBottom)}`);
-  return `morph__${parts.join('__')}`;  // extension added by recorder based on codec
+  // duration / fps / dimensions / pad are appended by the recorder so they
+  // reflect the actual encoded size (after any encoder downscale).
+  return `morph__${parts.join('__')}`;
 }
 
 // Prefer HEVC (H.265) for the wider encoder dimension headroom (~7680 vs
@@ -2183,7 +2183,16 @@ async function startRecording(opts = {}) {
 
   const url = URL.createObjectURL(blob);
   const ext = mimeToExt(mime);
-  const base = opts.filename || makeFilename();
+  let base = opts.filename || makeFilename();
+  if (!/\.(mp4|webm)$/i.test(base)) {
+    const tail = [
+      `${Math.round(state.duration)}s`,
+      `${fps}fps`,
+      `${offW}x${totalH}`,
+    ];
+    if (state.exportPadBottom > 0) tail.push(`pad=${fixed(state.exportPadBottom)}`);
+    base = `${base}__${tail.join('__')}`;
+  }
   const filename = /\.(mp4|webm)$/i.test(base) ? base : `${base}.${ext}`;
   const a = document.createElement('a');
   a.href = url; a.download = filename; a.click();

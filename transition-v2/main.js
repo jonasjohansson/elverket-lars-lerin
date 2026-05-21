@@ -1539,8 +1539,8 @@ function makeFilenameV2() {
   else if (m === 8)  parts.push(`fing=${fx(state.bleedFinger)}`, `amt=${fx(state.bleedAmount)}`, `halo=${fx(state.bleedHalo)}`);
   else if (m === 9)  parts.push(`grav=${fx(state.runGravity)}`, `drip=${fx(state.runDrip)}`);
   else if (m === 10) parts.push(`visc=${fx(state.advecVisc)}`, `rate=${fx(state.advecRate)}`);
-  parts.push(`${Math.round(state.duration)}s`);
-  if (state.exportPadBottom > 0) parts.push(`pad=${fx(state.exportPadBottom)}`);
+  // duration / fps / dimensions / pad are appended by the recorder using
+  // the actual output values (after any encoder downscale).
   return `morph__${parts.join('__')}`;
 }
 
@@ -1558,7 +1558,7 @@ fExp.addBinding(state, 'exportSizeMode', {
 });
 // Preset dropdown that writes into state.exportPadBottom on change. Slider
 // stays available for fine-tuning.
-const padPresets = { _v: 0 };
+const padPresets = { _v: state.exportPadBottom };
 const bPadPreset = fExp.addBinding(padPresets, '_v', {
   label: 'pad preset',
   options: {
@@ -1574,6 +1574,15 @@ bPadPreset.on('change', e => {
   pane.refresh();
 });
 const bPad = fExp.addBinding(state, 'exportPadBottom', { min: 0, max: 3, step: 0.001, label: 'pad below (× h)' });
+// Slider → preset: keep the dropdown showing the matching preset (or 'none')
+// when the slider lands on a value we have a preset for.
+bPad.on('change', () => {
+  const v = state.exportPadBottom;
+  const presets = [0, 0.5, 1.0, 1.416, 2.0];
+  const match = presets.find(p => Math.abs(p - v) < 0.001);
+  padPresets._v = match !== undefined ? match : 0;
+  bPadPreset.refresh();
+});
 const btnRecord = fExp.addButton({ title: 'Record video' });
 btnRecord.on('click', () => startRecording());
 
@@ -1721,7 +1730,19 @@ async function startRecording(opts = {}) {
   }
 
   const url = URL.createObjectURL(blob);
-  const base = opts.filename || makeFilenameV2();
+  // Build filename with duration, fps, actual output dimensions, and pad
+  // (appended here so the actual encoded size is reflected, not the
+  // pre-scale request).
+  let base = opts.filename || makeFilenameV2();
+  if (!/\.mp4$/i.test(base)) {
+    const tail = [
+      `${Math.round(state.duration)}s`,
+      `${fps}fps`,
+      `${offW}x${totalH}`,
+    ];
+    if (state.exportPadBottom > 0) tail.push(`pad=${fx(state.exportPadBottom)}`);
+    base = `${base}__${tail.join('__')}`;
+  }
   const filename = /\.mp4$/i.test(base) ? base : `${base}.mp4`;
   const a = document.createElement('a');
   a.href = url; a.download = filename; a.click();
@@ -1885,6 +1906,10 @@ function loadSession() {
     const s = JSON.parse(localStorage.getItem(SESSION_LS_KEY) || 'null');
     if (!s) return;
     for (const k of PERSIST_KEYS) if (k in s) state[k] = s[k];
+    // sync the pad-preset dropdown to whatever the restored slider value is
+    const presets = [0, 0.5, 1.0, 1.416, 2.0];
+    const match = presets.find(p => Math.abs(p - state.exportPadBottom) < 0.001);
+    padPresets._v = match !== undefined ? match : 0;
     pane.refresh();
     updateModeFolders();
     if (state.mode >= 10 && state.mode <= 14) advec.needsReset = true;
