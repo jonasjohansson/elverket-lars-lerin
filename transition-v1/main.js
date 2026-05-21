@@ -988,7 +988,7 @@ const state = {
   reverse: false,
   loop: true,
   startTime: 0,
-  duration: 10.0,
+  duration: 15.0,
   softness: 0.0,
   glow: 0.0,
   bloom: 0.0,
@@ -1015,7 +1015,7 @@ const state = {
   sedSoftness: 0.35,
   sedDirection: 0,                 // 0 low values first, 1 high values first
   sedSource: 0,                    // 0 luma, 1 saturation, 2 hue, 3 detail, 4 temperature
-  saltDensity: 0.55,
+  saltDensity: 0.0,
   saltContrast: 0.55,
   saltSparkle: 0.0,
   saltSource: 1,      // 0 none, 1 light, 2 dark, 3 coloured, 4 edges
@@ -1592,6 +1592,34 @@ tip(
   'Watercolor behaviour layered on top of the dissolve.'
 );
 
+// Per-mode default values for the "Reset defaults" button.
+const MODE_DEFAULTS = {
+  1:  { rimWidth: 0.12, rimDark: 0.6 },
+  2:  { paperAngle: 0, paperAniso: 4, paperGranulation: 0.5 },
+  3:  { bloomCount: 8, bloomRim: 0.6, bloomRate: 0.55 },
+  4:  { diffStrength: 0.55, diffRadius: 0.45 },
+  5:  { sedBands: 6, sedSoftness: 0.35, sedDirection: 0, sedSource: 0 },
+  6:  { saltDensity: 0.0, saltContrast: 0.55, saltSource: 1, saltBias: 0.6, saltImage: 2 },
+  7:  { irisFocusX: 0.5, irisFocusY: 0.5, irisJitter: 0.35 },
+  8:  { bleedFinger: 0.5, bleedAmount: 0.45, bleedHalo: 0.5 },
+  9:  { runGravity: 0.5, runDrip: 0.35 },
+  10: { advecVisc: 0.55, advecRate: 0.18, advecSteps: 3 },
+  11: { advecGravity: 0.6, advecGravBias: 0.5, advecGravAngle: 0, advecGravStreak: 0.4, advecGravLateral: 0.3 },
+  12: { advecCurlStr: 0.5, advecCurlScale: 2.5 },
+  13: { advecBrushFollow: 0.7 },
+  14: { advecSeedCount: 5, advecSeedRadius: 0.45 },
+};
+function resetModeDefaults(modeId) {
+  const d = MODE_DEFAULTS[modeId];
+  if (!d) return;
+  for (const [k, v] of Object.entries(d)) state[k] = v;
+  if (modeId >= 10 && modeId <= 14) advec.needsReset = true;
+  pane.refresh();
+}
+function addResetBtn(folder, modeId) {
+  folder.addButton({ title: 'Reset defaults' }).on('click', () => resetModeDefaults(modeId));
+}
+
 const fRim    = fWater.addFolder({ title: 'Pigment rim',    expanded: true });
 const fPaper  = fWater.addFolder({ title: 'Paper grain',    expanded: true });
 const fBlooms = fWater.addFolder({ title: 'Backrun blooms', expanded: true });
@@ -1611,6 +1639,7 @@ tip(fRim.addBinding(state, 'rimWidth', { min: 0, max: 0.4, step: 0.005, label: '
     'Thickness of the dark settling band at the wet front.');
 tip(fRim.addBinding(state, 'rimDark', { min: 0, max: 1, step: 0.01, label: 'rim dark' }),
     'How dark the settled pigment band is.');
+addResetBtn(fRim, 1);
 
 tip(fPaper.addBinding(state, 'paperAngle', { min: 0, max: 1, step: 0.005, label: 'fiber angle' }),
     'Paper-fiber direction: 0 = horizontal grain, 0.5 = vertical.');
@@ -1618,6 +1647,7 @@ tip(fPaper.addBinding(state, 'paperAniso', { min: 1, max: 10, step: 0.1, label: 
     'How elongated the fibers are. Higher = longer streaks along the grain.');
 tip(fPaper.addBinding(state, 'paperGranulation', { min: 0, max: 1, step: 0.01, label: 'granulation' }),
     'Fine speckle of pigment grains settling in the paper tooth.');
+addResetBtn(fPaper, 2);
 
 tip(fBlooms.addBinding(state, 'bloomCount', { min: 1, max: 24, step: 1, label: 'count' }),
     'Number of bloom seed points growing across the canvas.');
@@ -1625,11 +1655,13 @@ tip(fBlooms.addBinding(state, 'bloomRate', { min: 0.1, max: 2, step: 0.01, label
     'How fast each bloom expands. Lower = slower, larger fronts overlap less.');
 tip(fBlooms.addBinding(state, 'bloomRim', { min: 0, max: 1, step: 0.01, label: 'rim dark' }),
     'Darkness of the settling rim at each bloom front.');
+addResetBtn(fBlooms, 3);
 
 tip(fDiff.addBinding(state, 'diffStrength', { min: 0, max: 1, step: 0.01, label: 'strength' }),
     'How strongly B\'s pigment bleeds outward into A\'s still-dry region.');
 tip(fDiff.addBinding(state, 'diffRadius', { min: 0, max: 1, step: 0.01, label: 'radius' }),
     'How far the wet pigment reaches when bleeding.');
+addResetBtn(fDiff, 4);
 
 tip(fSed.addBinding(state, 'sedSource', {
   label: 'decompose by',
@@ -1649,6 +1681,7 @@ tip(fSed.addBinding(state, 'sedDirection', {
   label: 'order',
   options: { 'low → high': 0, 'high → low': 1 },
 }), 'Reveal direction. e.g. for luminance: low → high means shadows first.');
+addResetBtn(fSed, 5);
 
 tip(fSalt.addBinding(state, 'saltDensity', { min: 0, max: 1, step: 0.01, label: 'grain' }),
     'Grain size of the salt texture. Low = few large blobs, high = fine speckle. Controls the look of the dissolve regardless of whether the image is driving it.');
@@ -1670,6 +1703,7 @@ tip(fSalt.addBinding(state, 'saltImage', {
 }), 'Which painting the bias reads from.');
 tip(fSalt.addBinding(state, 'saltBias', { min: 0, max: 1, step: 0.01, label: 'bias amount' }),
     'How strongly the image steers the reveal. 0 = pure random salt; 1 = image fully drives timing while grain still controls the visible texture.');
+addResetBtn(fSalt, 6);
 
 tip(fIris.addBinding(state, 'irisFocusX', { min: 0, max: 1, step: 0.005, label: 'focus x' }),
     'Horizontal position of the iris focal point (0 = left, 1 = right).');
@@ -1677,6 +1711,7 @@ tip(fIris.addBinding(state, 'irisFocusY', { min: 0, max: 1, step: 0.005, label: 
     'Vertical position of the iris focal point (0 = bottom, 1 = top).');
 tip(fIris.addBinding(state, 'irisJitter', { min: 0, max: 1, step: 0.01, label: 'jitter' }),
     'Irregularity of the iris front. Higher = breathes more instead of expanding as a perfect circle.');
+addResetBtn(fIris, 7);
 
 tip(fBleed.addBinding(state, 'bleedFinger', { min: 0, max: 1, step: 0.01, label: 'finger' }),
     'Anisotropy / frequency of the fingering protrusions. Low = chunky fronts, high = fine threads.');
@@ -1684,11 +1719,13 @@ tip(fBleed.addBinding(state, 'bleedAmount', { min: 0, max: 1, step: 0.01, label:
     'How strongly the wet front breaks into finger-like protrusions.');
 tip(fBleed.addBinding(state, 'bleedHalo', { min: 0, max: 1, step: 0.01, label: 'wet halo' }),
     'Saturated wet halo just inside the front — the sheen of recently-soaked pigment.');
+addResetBtn(fBleed, 8);
 
 tip(fRun.addBinding(state, 'runGravity', { min: 0, max: 1, step: 0.01, label: 'gravity' }),
     '0 = A\'s shadows alone determine reveal order; 1 = pure top-to-bottom run (pigment flows downhill).');
 tip(fRun.addBinding(state, 'runDrip', { min: 0, max: 1, step: 0.01, label: 'drip' }),
     'Vertical trail of B\'s pigment carried down from just above the front — like wet paint running.');
+addResetBtn(fRun, 9);
 
 tip(fAdvec.addBinding(state, 'advecVisc', { min: 0, max: 1, step: 0.01, label: 'viscosity' }),
     'How much each pixel averages with its neighbours per step. Higher = more spread, less crisp.');
@@ -1696,6 +1733,7 @@ tip(fAdvec.addBinding(state, 'advecRate', { min: 0, max: 1, step: 0.01, label: '
     'Per-step strength of pulling the state toward B in the revealed region. Lower = slower, more painterly accumulation.');
 tip(fAdvec.addBinding(state, 'advecSteps', { min: 1, max: 8, step: 1, label: 'steps / frame' }),
     'Diffusion iterations per rendered frame. More steps = smoother bleed but more GPU cost.');
+addResetBtn(fAdvec, 10);
 fAdvec.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
 
 // Gravity variant
@@ -1709,6 +1747,7 @@ tip(fAdvecG.addBinding(state, 'advecGravLateral', { min: 0, max: 1, step: 0.01, 
     'Perpendicular bleed. Low = narrow streams, high = wider gentle washes.');
 tip(fAdvecG.addBinding(state, 'advecGravBias', { min: 0, max: 1, step: 0.01, label: 'shadow ↔ flow' }),
     '0 = A\'s shadows attract pigment first; 1 = pure spatial flow regardless of image content.');
+addResetBtn(fAdvecG, 11);
 fAdvecG.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
 
 // Curl variant
@@ -1716,11 +1755,13 @@ tip(fAdvecC.addBinding(state, 'advecCurlStr', { min: 0, max: 1, step: 0.01, labe
     'How strongly pigment is carried along the curl velocity field. Higher = more swirling.');
 tip(fAdvecC.addBinding(state, 'advecCurlScale', { min: 0.5, max: 8, step: 0.1, label: 'eddy scale' }),
     'Scale of the eddies. Low = a few large swirls, high = many small turbulent ones.');
+addResetBtn(fAdvecC, 12);
 fAdvecC.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
 
 // Brush-channel variant
 tip(fAdvecB.addBinding(state, 'advecBrushFollow', { min: 0, max: 1, step: 0.01, label: 'follow strokes' }),
     'How strongly diffusion is aligned with A\'s local brush direction. 0 = isotropic, 1 = pigment travels almost exclusively along strokes.');
+addResetBtn(fAdvecB, 13);
 fAdvecB.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
 
 // Seed-point variant
@@ -1744,6 +1785,7 @@ tip(fAdvecS.addBinding(state, 'advecSeedCount', { min: 1, max: 16, step: 1, labe
     'How many drop-points B\'s pigment seeps from.');
 tip(fAdvecS.addBinding(state, 'advecSeedRadius', { min: 0.1, max: 1, step: 0.01, label: 'reach' }),
     'How far each seed\'s wash spreads through the canvas (relative to image size).');
+addResetBtn(fAdvecS, 14);
 fAdvecS.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
 
 function updateModeFolders() {
@@ -2202,5 +2244,32 @@ function drawOnce() {
 
 // Automation hook — small global so headless scripts can drive the tool
 // without going through the Tweakpane DOM. Not used by the human UI.
+// ----- Auto-persist all settings to localStorage -----
+const SESSION_LS_KEY = 'transition-tool:session';
+const PERSIST_KEYS = [
+  ...PRESET_KEYS,
+  'fit', 'bg',
+  'exportFps', 'exportSizeMode', 'exportPadBottom',
+];
+function saveSession() {
+  try {
+    const out = {};
+    for (const k of PERSIST_KEYS) out[k] = state[k];
+    localStorage.setItem(SESSION_LS_KEY, JSON.stringify(out));
+  } catch {}
+}
+function loadSession() {
+  try {
+    const s = JSON.parse(localStorage.getItem(SESSION_LS_KEY) || 'null');
+    if (!s) return;
+    for (const k of PERSIST_KEYS) if (k in s) state[k] = s[k];
+    pane.refresh();
+    updateModeFolders();
+    if (state.mode >= 10 && state.mode <= 14) advec.needsReset = true;
+  } catch {}
+}
+loadSession();
+pane.on('change', () => saveSession());
+
 window.__tool = { state, pane, advec, startRecording, snapshotState, applyPreset, FACTORY_PRESETS, makeFilename, recomputeSeedPositions };
 

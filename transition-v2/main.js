@@ -828,7 +828,7 @@ const state = {
   loop: true,
   startTime: 0,
   reverse: false,
-  duration: 10.0,
+  duration: 15.0,
   organic: 0.65,
   edges: 0.25,
   spread: 0.55,
@@ -842,7 +842,7 @@ const state = {
   bloomCount: 8, bloomRim: 0.6, bloomRate: 0.55,
   diffStrength: 0.55, diffRadius: 0.45,
   sedBands: 6, sedSoftness: 0.35, sedDirection: 0, sedSource: 0,
-  saltDensity: 0.55, saltContrast: 0.55,
+  saltDensity: 0.0, saltContrast: 0.55,
   saltSource: 1, saltBias: 0.6, saltImage: 2,
   irisFocusX: 0.5, irisFocusY: 0.5, irisJitter: 0.35,
   bleedFinger: 0.5, bleedAmount: 0.45, bleedHalo: 0.5,
@@ -1298,6 +1298,35 @@ btnLoop.on('click', () => {
   btnLoop.title = 'Loop: ' + (state.loop ? 'on' : 'off');
 });
 
+// Per-mode default values — used by the "Reset defaults" button in each
+// mode folder to restore that mode's params without touching anything else.
+const MODE_DEFAULTS = {
+  1:  { rimWidth: 0.12, rimDark: 0.6 },
+  2:  { paperAngle: 0, paperAniso: 4, paperGranulation: 0.5 },
+  3:  { bloomCount: 8, bloomRim: 0.6, bloomRate: 0.55 },
+  4:  { diffStrength: 0.55, diffRadius: 0.45 },
+  5:  { sedBands: 6, sedSoftness: 0.35, sedDirection: 0, sedSource: 0 },
+  6:  { saltDensity: 0.0, saltContrast: 0.55, saltSource: 1, saltBias: 0.6, saltImage: 2 },
+  7:  { irisFocusX: 0.5, irisFocusY: 0.5, irisJitter: 0.35 },
+  8:  { bleedFinger: 0.5, bleedAmount: 0.45, bleedHalo: 0.5 },
+  9:  { runGravity: 0.5, runDrip: 0.35 },
+  10: { advecVisc: 0.55, advecRate: 0.18, advecSteps: 3 },
+  11: { advecGravity: 0.6, advecGravBias: 0.5, advecGravAngle: 0, advecGravStreak: 0.4, advecGravLateral: 0.3 },
+  12: { advecCurlStr: 0.5, advecCurlScale: 2.5 },
+  13: { advecBrushFollow: 0.7 },
+  14: { advecSeedCount: 5, advecSeedRadius: 0.45 },
+};
+function resetModeDefaults(modeId) {
+  const d = MODE_DEFAULTS[modeId];
+  if (!d) return;
+  for (const [k, v] of Object.entries(d)) state[k] = v;
+  if (modeId >= 10 && modeId <= 14) advec.needsReset = true;
+  pane.refresh();
+}
+function addResetBtn(folder, modeId) {
+  folder.addButton({ title: 'Reset defaults' }).on('click', () => resetModeDefaults(modeId));
+}
+
 // ----- Watercolor mode + per-mode controls -----
 const fWater = pane.addFolder({ title: 'Watercolor', expanded: true });
 fWater.addBinding(state, 'mode', {
@@ -1324,20 +1353,24 @@ fWater.addBinding(state, 'mode', {
 const fRim    = fWater.addFolder({ title: 'Pigment rim',    expanded: true });
 fRim.addBinding(state, 'rimWidth', { min: 0, max: 0.4, step: 0.005, label: 'rim width' });
 fRim.addBinding(state, 'rimDark',  { min: 0, max: 1, step: 0.01, label: 'rim dark' });
+addResetBtn(fRim, 1);
 
 const fPaper  = fWater.addFolder({ title: 'Paper grain',    expanded: true });
 fPaper.addBinding(state, 'paperAngle',       { min: 0, max: 1, step: 0.005, label: 'fiber angle' });
 fPaper.addBinding(state, 'paperAniso',       { min: 1, max: 10, step: 0.1, label: 'anisotropy' });
 fPaper.addBinding(state, 'paperGranulation', { min: 0, max: 1, step: 0.01, label: 'granulation' });
+addResetBtn(fPaper, 2);
 
 const fBlooms = fWater.addFolder({ title: 'Backrun blooms', expanded: true });
 fBlooms.addBinding(state, 'bloomCount', { min: 1, max: 24, step: 1, label: 'count' });
 fBlooms.addBinding(state, 'bloomRate',  { min: 0.1, max: 2, step: 0.01, label: 'growth rate' });
 fBlooms.addBinding(state, 'bloomRim',   { min: 0, max: 1, step: 0.01, label: 'rim dark' });
+addResetBtn(fBlooms, 3);
 
 const fDiff   = fWater.addFolder({ title: 'Wet diffusion',  expanded: true });
 fDiff.addBinding(state, 'diffStrength', { min: 0, max: 1, step: 0.01, label: 'strength' });
 fDiff.addBinding(state, 'diffRadius',   { min: 0, max: 1, step: 0.01, label: 'radius' });
+addResetBtn(fDiff, 4);
 
 const fSed    = fWater.addFolder({ title: 'Tonal sediment', expanded: true });
 fSed.addBinding(state, 'sedSource', {
@@ -1350,6 +1383,7 @@ fSed.addBinding(state, 'sedDirection', {
   label: 'order',
   options: { 'low → high': 0, 'high → low': 1 },
 });
+addResetBtn(fSed, 5);
 
 const fSalt   = fWater.addFolder({ title: 'Salt',           expanded: true });
 fSalt.addBinding(state, 'saltDensity',  { min: 0, max: 1, step: 0.01, label: 'grain' });
@@ -1363,25 +1397,30 @@ fSalt.addBinding(state, 'saltImage', {
   options: { 'A': 0, 'B': 1, 'both': 2 },
 });
 fSalt.addBinding(state, 'saltBias',     { min: 0, max: 1, step: 0.01, label: 'bias amount' });
+addResetBtn(fSalt, 6);
 
 const fIris   = fWater.addFolder({ title: 'Iris',           expanded: true });
 fIris.addBinding(state, 'irisFocusX', { min: 0, max: 1, step: 0.005, label: 'focus x' });
 fIris.addBinding(state, 'irisFocusY', { min: 0, max: 1, step: 0.005, label: 'focus y' });
 fIris.addBinding(state, 'irisJitter', { min: 0, max: 1, step: 0.01, label: 'jitter' });
+addResetBtn(fIris, 7);
 
 const fBleed  = fWater.addFolder({ title: 'Wet bleed',      expanded: true });
 fBleed.addBinding(state, 'bleedFinger', { min: 0, max: 1, step: 0.01, label: 'finger' });
 fBleed.addBinding(state, 'bleedAmount', { min: 0, max: 1, step: 0.01, label: 'amount' });
 fBleed.addBinding(state, 'bleedHalo',   { min: 0, max: 1, step: 0.01, label: 'wet halo' });
+addResetBtn(fBleed, 8);
 
 const fRun    = fWater.addFolder({ title: 'Pigment run',    expanded: true });
 fRun.addBinding(state, 'runGravity', { min: 0, max: 1, step: 0.01, label: 'gravity' });
 fRun.addBinding(state, 'runDrip',    { min: 0, max: 1, step: 0.01, label: 'drip' });
+addResetBtn(fRun, 9);
 
 const fAdvec  = fWater.addFolder({ title: 'Wet advection',  expanded: true });
 fAdvec.addBinding(state, 'advecVisc',  { min: 0, max: 1, step: 0.01, label: 'viscosity' });
 fAdvec.addBinding(state, 'advecRate',  { min: 0, max: 1, step: 0.01, label: 'mixing rate' });
 fAdvec.addBinding(state, 'advecSteps', { min: 1, max: 8, step: 1, label: 'steps / frame' });
+addResetBtn(fAdvec, 10);
 fAdvec.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
 
 const fAdvecG = fWater.addFolder({ title: 'Gravity advection', expanded: true });
@@ -1390,20 +1429,24 @@ fAdvecG.addBinding(state, 'advecGravity',     { min: 0, max: 1, step: 0.01, labe
 fAdvecG.addBinding(state, 'advecGravStreak',  { min: 0, max: 1, step: 0.01, label: 'streak' });
 fAdvecG.addBinding(state, 'advecGravLateral', { min: 0, max: 1, step: 0.01, label: 'lateral spread' });
 fAdvecG.addBinding(state, 'advecGravBias',    { min: 0, max: 1, step: 0.01, label: 'shadow ↔ flow' });
+addResetBtn(fAdvecG, 11);
 fAdvecG.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
 
 const fAdvecC = fWater.addFolder({ title: 'Curl-noise eddies', expanded: true });
 fAdvecC.addBinding(state, 'advecCurlStr',   { min: 0, max: 1, step: 0.01, label: 'eddy strength' });
 fAdvecC.addBinding(state, 'advecCurlScale', { min: 0.5, max: 8, step: 0.1, label: 'eddy scale' });
+addResetBtn(fAdvecC, 12);
 fAdvecC.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
 
 const fAdvecB = fWater.addFolder({ title: 'Brush-channel advection', expanded: true });
 fAdvecB.addBinding(state, 'advecBrushFollow', { min: 0, max: 1, step: 0.01, label: 'follow strokes' });
+addResetBtn(fAdvecB, 13);
 fAdvecB.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
 
 const fAdvecS = fWater.addFolder({ title: 'Seed-point injection', expanded: true });
 fAdvecS.addBinding(state, 'advecSeedCount',  { min: 1, max: 16, step: 1, label: 'seed count' });
 fAdvecS.addBinding(state, 'advecSeedRadius', { min: 0.1, max: 1, step: 0.01, label: 'reach' });
+addResetBtn(fAdvecS, 14);
 fAdvecS.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
 
 function updateModeFolders() {
@@ -1762,5 +1805,32 @@ window.addEventListener('keydown', e => {
 });
 
 // Expose for headless / automation experiments
+// ----- Auto-persist all settings to localStorage -----
+const SESSION_LS_KEY = 'transition-tool-v2:session';
+const PERSIST_KEYS = [
+  ...PRESET_KEYS,
+  'fit', 'bg',
+  'exportFps', 'exportSizeMode', 'exportPadBottom',
+];
+function saveSession() {
+  try {
+    const out = {};
+    for (const k of PERSIST_KEYS) out[k] = state[k];
+    localStorage.setItem(SESSION_LS_KEY, JSON.stringify(out));
+  } catch {}
+}
+function loadSession() {
+  try {
+    const s = JSON.parse(localStorage.getItem(SESSION_LS_KEY) || 'null');
+    if (!s) return;
+    for (const k of PERSIST_KEYS) if (k in s) state[k] = s[k];
+    pane.refresh();
+    updateModeFolders();
+    if (state.mode >= 10 && state.mode <= 14) advec.needsReset = true;
+  } catch {}
+}
+loadSession();
+pane.on('change', () => saveSession());
+
 window.__tool = { state, pane, device, adapter };
 console.log('[transition-tool-v2] WebGPU ready, format:', presentationFormat);
