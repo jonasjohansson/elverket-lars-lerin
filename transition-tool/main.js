@@ -1050,6 +1050,7 @@ const state = {
   zoomB: 1.0, panBx: 0.0, panBy: 0.0,
   exportFps: 24,
   exportSizeMode: 'src',
+  exportPadBottom: 0,  // 0 = no padding; 1 = full-h black below; 1.416 ≈ Elverket floor:wall ratio
   recording: false,
 };
 
@@ -1840,6 +1841,7 @@ fExp.addBinding(state, 'exportSizeMode', {
     '960 wide':          '960',
   },
 });
+fExp.addBinding(state, 'exportPadBottom', { min: 0, max: 3, step: 0.001, label: 'pad below (× h)' });
 const btnRecord = fExp.addButton({ title: 'Record video' });
 btnRecord.on('click', () => startRecording());
 const btnBatch = fExp.addButton({ title: 'Batch record presets (15 s each)' });
@@ -2015,6 +2017,7 @@ function makeFilename() {
   else if (m === 13) parts.push(`follow=${fixed(state.advecBrushFollow)}`);
   else if (m === 14) parts.push(`from=${SALT_SOURCE_NAMES[state.advecSeedSource] || 'random'}`, `n=${state.advecSeedCount}`, `r=${fixed(state.advecSeedRadius)}`);
   parts.push(`${Math.round(state.duration)}s`);
+  if (state.exportPadBottom > 0) parts.push(`pad=${fixed(state.exportPadBottom)}`);
   return `morph__${parts.join('__')}`;  // extension added by recorder based on codec
 }
 
@@ -2048,10 +2051,17 @@ async function startRecording(opts = {}) {
     const h = Math.round(w * canvas.height / canvas.width);
     recW = w; recH = h;
   }
+  const padPx = Math.round(recH * state.exportPadBottom);
+  // h264 needs even dimensions
+  const totalH = (recH + padPx) + ((recH + padPx) % 2);
+  const offW = recW + (recW % 2);
 
   const off = document.createElement('canvas');
-  off.width = recW; off.height = recH;
+  off.width = offW; off.height = totalH;
   const offCtx = off.getContext('2d');
+  // Fill black once so the bottom padding stays black across all frames.
+  offCtx.fillStyle = '#000';
+  offCtx.fillRect(0, 0, off.width, off.height);
 
   const stream = off.captureStream(fps);
   const mime = pickRecorderMime();

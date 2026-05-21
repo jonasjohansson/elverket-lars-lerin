@@ -1443,6 +1443,7 @@ fImg.addBinding(state, 'panBy', { min: -1, max: 1, step: 0.005, label: 'B pan y'
 // ----- Export / Record -----
 state.exportFps = 24;
 state.exportSizeMode = '1920';
+state.exportPadBottom = 0;  // 0 = no padding; 1 = add full-height black below; 1.416 ≈ Elverket floor ratio
 
 const RECORDER_MIMES = [
   'video/mp4;codecs=avc1.42E01E', 'video/mp4;codecs=avc1', 'video/mp4',
@@ -1477,6 +1478,7 @@ function makeFilenameV2() {
   else if (m === 9)  parts.push(`grav=${fx(state.runGravity)}`, `drip=${fx(state.runDrip)}`);
   else if (m === 10) parts.push(`visc=${fx(state.advecVisc)}`, `rate=${fx(state.advecRate)}`);
   parts.push(`${Math.round(state.duration)}s`);
+  if (state.exportPadBottom > 0) parts.push(`pad=${fx(state.exportPadBottom)}`);
   return `morph__${parts.join('__')}`;
 }
 
@@ -1492,6 +1494,7 @@ fExp.addBinding(state, 'exportSizeMode', {
     '2560 wide': '2560', '1920 wide': '1920', '1280 wide': '1280', '960 wide': '960',
   },
 });
+fExp.addBinding(state, 'exportPadBottom', { min: 0, max: 3, step: 0.001, label: 'pad below (× h)' });
 const btnRecord = fExp.addButton({ title: 'Record video' });
 btnRecord.on('click', () => startRecording());
 
@@ -1501,16 +1504,24 @@ async function startRecording(opts = {}) {
 
   const fps = state.exportFps;
   const sizeMode = state.exportSizeMode;
+  // morph area dimensions (the canvas content), then pad below with black so
+  // the final video has aspect (canvas + padBottom × canvas.h) tall.
   let recW = canvas.width, recH = canvas.height;
   if (sizeMode !== 'src') {
     const w = parseInt(sizeMode, 10);
     const h = Math.round(w * canvas.height / canvas.width);
     recW = w; recH = h;
   }
+  const padPx = Math.round(recH * state.exportPadBottom);
+  // h264 needs even dimensions
+  const totalH = (recH + padPx) + ((recH + padPx) % 2);
 
   const off = document.createElement('canvas');
-  off.width = recW; off.height = recH;
+  off.width = recW + (recW % 2);
+  off.height = totalH;
   const offCtx = off.getContext('2d');
+  offCtx.fillStyle = '#000';
+  offCtx.fillRect(0, 0, off.width, off.height);
 
   const stream = off.captureStream(fps);
   const mime = pickRecorderMime();
