@@ -1445,15 +1445,33 @@ state.exportFps = 24;
 state.exportSizeMode = '1920';
 state.exportPadBottom = 0;  // 0 = no padding; 1 = add full-height black below; 1.416 ≈ Elverket floor ratio
 
+// Prefer HEVC (H.265) over H.264 — HEVC headroom is ~7680 vs ~3840 for AVC, so
+// wide panoramas survive without aggressive downscaling. Falls back gracefully.
 const RECORDER_MIMES = [
-  'video/mp4;codecs=avc1.42E01E', 'video/mp4;codecs=avc1', 'video/mp4',
-  'video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm',
+  'video/mp4;codecs=hvc1.1.6.L120.B0',  // HEVC Main L4 — Chrome 126+ on macOS
+  'video/mp4;codecs=hev1.1.6.L120.B0',
+  'video/mp4;codecs=hvc1',
+  'video/mp4;codecs=hev1',
+  'video/mp4;codecs=avc1.42E01E',        // H.264 fallback
+  'video/mp4;codecs=avc1',
+  'video/mp4',
+  'video/webm;codecs=vp9',
+  'video/webm;codecs=vp8',
+  'video/webm',
 ];
 function pickRecorderMime() {
   for (const m of RECORDER_MIMES) if (MediaRecorder.isTypeSupported(m)) return m;
   return 'video/webm';
 }
 const mimeToExt = m => m.startsWith('video/mp4') ? 'mp4' : 'webm';
+// Encoder-specific maximum dimension. H.265 hardware encoders handle 8K, H.264
+// usually 4K, VP9 ~8K. We probe with the actual picked mime so the cap matches.
+function encoderMaxDim(mime) {
+  if (/hev|hvc/.test(mime)) return 7680;
+  if (/vp9/.test(mime))     return 7680;
+  if (/avc|h264/.test(mime)) return 3840;
+  return 3840;
+}
 
 const MODE_NAMES_V2 = {
   0: 'off', 1: 'rim', 2: 'paper', 3: 'blooms', 4: 'diffusion',
@@ -1512,26 +1530,39 @@ async function startRecording(opts = {}) {
     const h = Math.round(w * canvas.height / canvas.width);
     recW = w; recH = h;
   }
+  const padPx0 = Math.round(recH * state.exportPadBottom);
+  const mime = pickRecorderMime();
+  const ENCODER_MAX = encoderMaxDim(mime);
+  let scale = 1;
+  const maxDim = Math.max(recW, recH + padPx0);
+  const origReqW = recW, origReqH = recH;
+  if (maxDim > ENCODER_MAX) {
+    scale = ENCODER_MAX / maxDim;
+    recW = Math.round(recW * scale);
+    recH = Math.round(recH * scale);
+  }
   const padPx = Math.round(recH * state.exportPadBottom);
-  // h264 needs even dimensions
   const totalH = (recH + padPx) + ((recH + padPx) % 2);
+  const offW = recW + (recW % 2);
 
   const off = document.createElement('canvas');
-  off.width = recW + (recW % 2);
-  off.height = totalH;
+  off.width = offW; off.height = totalH;
   const offCtx = off.getContext('2d');
   offCtx.fillStyle = '#000';
   offCtx.fillRect(0, 0, off.width, off.height);
+  console.log(`[record] morph ${recW}×${recH}, total ${offW}×${totalH}` + (scale < 1 ? `  (scaled from ${canvas.width}×${canvas.height} for encoder limit)` : ''));
 
   const stream = off.captureStream(fps);
-  const mime = pickRecorderMime();
   const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 12_000_000 });
+  console.log('[record] codec:', mime);
   const chunks = [];
   rec.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
 
   recording = true;
   const originalTitle = btnRecord.title;
-  btnRecord.title = 'Recording…';
+  btnRecord.title = scale < 1
+    ? `Scaled to ${recW}×${totalH} (encoder limit ${ENCODER_MAX}). Recording…`
+    : 'Recording…';
 
   const totalFrames = Math.max(2, Math.round(state.duration * fps));
   const wasPlaying = state.playing;
@@ -1555,6 +1586,18 @@ async function startRecording(opts = {}) {
   await new Promise(r => { rec.onstop = r; });
 
   const blob = new Blob(chunks, { type: mime });
+  recording = false;
+  state.t = prevT;
+  state.playing = wasPlaying;
+
+  if (blob.size < 1024) {
+    // Encoder rejected the dimensions or otherwise failed silently.
+    btnRecord.title = `FAILED — output too large for codec, try smaller size`;
+    setTimeout(() => { btnRecord.title = originalTitle; }, 4000);
+    console.error('[record] empty blob — likely encoder dimension limit. Try a smaller export size.');
+    return;
+  }
+
   const url = URL.createObjectURL(blob);
   const ext = mimeToExt(mime);
   const base = opts.filename || makeFilenameV2();
@@ -1563,11 +1606,8 @@ async function startRecording(opts = {}) {
   a.href = url; a.download = filename; a.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 
-  recording = false;
   btnRecord.title = `saved (${(blob.size / 1024 / 1024).toFixed(1)} MB)`;
   setTimeout(() => { btnRecord.title = originalTitle; }, 2500);
-  state.t = prevT;
-  state.playing = wasPlaying;
 }
 
 const fStyle = pane.addFolder({ title: 'Style', expanded: false });

@@ -2021,9 +2021,13 @@ function makeFilename() {
   return `morph__${parts.join('__')}`;  // extension added by recorder based on codec
 }
 
-// Prefer mp4 if Chrome/Safari supports it (plays natively on macOS QuickTime),
-// otherwise fall back to webm.
+// Prefer HEVC (H.265) for the wider encoder dimension headroom (~7680 vs
+// ~3840 for H.264), then mp4/H.264, then webm. Falls back gracefully.
 const RECORDER_MIMES = [
+  'video/mp4;codecs=hvc1.1.6.L120.B0',
+  'video/mp4;codecs=hev1.1.6.L120.B0',
+  'video/mp4;codecs=hvc1',
+  'video/mp4;codecs=hev1',
   'video/mp4;codecs=avc1.42E01E',
   'video/mp4;codecs=avc1',
   'video/mp4',
@@ -2036,6 +2040,12 @@ function pickRecorderMime() {
     if (MediaRecorder.isTypeSupported(m)) return m;
   }
   return 'video/webm';
+}
+function encoderMaxDim(mime) {
+  if (/hev|hvc/.test(mime)) return 7680;
+  if (/vp9/.test(mime))     return 7680;
+  if (/avc|h264/.test(mime)) return 3840;
+  return 3840;
 }
 function mimeToExt(mime) { return mime.startsWith('video/mp4') ? 'mp4' : 'webm'; }
 
@@ -2051,27 +2061,38 @@ async function startRecording(opts = {}) {
     const h = Math.round(w * canvas.height / canvas.width);
     recW = w; recH = h;
   }
+  const padPx0 = Math.round(recH * state.exportPadBottom);
+  // Hardware encoders fail silently above their max dimension. Cap the largest
+  // axis and scale everything proportionally so wide panoramas still record.
+  const mime = pickRecorderMime();
+  const ENCODER_MAX = encoderMaxDim(mime);
+  let scale = 1;
+  const maxDim = Math.max(recW, recH + padPx0);
+  if (maxDim > ENCODER_MAX) {
+    scale = ENCODER_MAX / maxDim;
+    recW = Math.round(recW * scale);
+    recH = Math.round(recH * scale);
+  }
   const padPx = Math.round(recH * state.exportPadBottom);
-  // h264 needs even dimensions
   const totalH = (recH + padPx) + ((recH + padPx) % 2);
   const offW = recW + (recW % 2);
 
   const off = document.createElement('canvas');
   off.width = offW; off.height = totalH;
   const offCtx = off.getContext('2d');
-  // Fill black once so the bottom padding stays black across all frames.
   offCtx.fillStyle = '#000';
   offCtx.fillRect(0, 0, off.width, off.height);
+  console.log(`[record] codec ${mime}, output ${offW}×${totalH}` + (scale < 1 ? `  (scaled from ${canvas.width}×${canvas.height} for encoder limit)` : ''));
 
   const stream = off.captureStream(fps);
-  const mime = pickRecorderMime();
   const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 12_000_000 });
   const chunks = [];
   rec.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
 
   state.recording = true;
   const originalTitle = btnRecord.title;
-  btnRecord.title = opts.statusPrefix ? `${opts.statusPrefix} Recording…` : 'Recording…';
+  btnRecord.title = (opts.statusPrefix ? `${opts.statusPrefix} ` : '')
+    + (scale < 1 ? `Scaled to ${offW}×${totalH}. Recording…` : 'Recording…');
 
   const totalFrames = Math.max(2, Math.round(state.duration * fps));
   rec.start();
@@ -2092,6 +2113,17 @@ async function startRecording(opts = {}) {
   await new Promise(r => { rec.onstop = r; });
 
   const blob = new Blob(chunks, { type: mime });
+  state.recording = false;
+  state.t = prevT;
+  state.playing = wasPlaying;
+
+  if (blob.size < 1024) {
+    btnRecord.title = 'FAILED — output too large for codec, try smaller size';
+    setTimeout(() => { btnRecord.title = originalTitle; }, 4000);
+    console.error('[record] empty blob — encoder likely rejected dimensions. Try a smaller export size.');
+    return;
+  }
+
   const url = URL.createObjectURL(blob);
   const ext = mimeToExt(mime);
   const base = opts.filename || makeFilename();
@@ -2100,11 +2132,8 @@ async function startRecording(opts = {}) {
   a.href = url; a.download = filename; a.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 
-  state.recording = false;
   btnRecord.title = `saved (${(blob.size / 1024 / 1024).toFixed(1)} MB)`;
   if (!opts.keepTitle) setTimeout(() => { btnRecord.title = originalTitle; }, 2500);
-  state.t = prevT;
-  state.playing = wasPlaying;
 }
 
 // Iterate every factory preset, force 15 s duration, record each to disk with
