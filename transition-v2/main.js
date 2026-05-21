@@ -6,6 +6,7 @@
 // subsequent milestones; right now only the default smooth dissolve runs.
 
 import { Pane } from 'tweakpane';
+import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
 
 const canvas = document.getElementById('canvas');
 
@@ -1576,14 +1577,47 @@ const bPad = fExp.addBinding(state, 'exportPadBottom', { min: 0, max: 3, step: 0
 const btnRecord = fExp.addButton({ title: 'Record video' });
 btnRecord.on('click', () => startRecording());
 
+// Try a series of VideoEncoder configs in descending order of profile/level so
+// we pick the highest-headroom one this machine actually supports.
+async function pickEncoderConfig(width, height, framerate, bitrate) {
+  if (typeof VideoEncoder === 'undefined') return null;
+  const candidates = [
+    { codec: 'hev1.1.6.L153.B0', muxer: 'hevc' }, // HEVC Main L5.1 — 8K
+    { codec: 'hev1.1.6.L120.B0', muxer: 'hevc' }, // HEVC Main L4   — 4K
+    { codec: 'avc1.640033',      muxer: 'avc'  }, // H.264 High L5.1
+    { codec: 'avc1.640028',      muxer: 'avc'  }, // H.264 High L4
+    { codec: 'avc1.42E01E',      muxer: 'avc'  }, // H.264 Baseline L3
+  ];
+  for (const c of candidates) {
+    try {
+      const cfg = {
+        codec: c.codec, width, height, framerate, bitrate,
+        hardwareAcceleration: 'prefer-hardware',
+      };
+      const r = await VideoEncoder.isConfigSupported(cfg);
+      if (r && r.supported) return { config: cfg, muxerCodec: c.muxer };
+    } catch {}
+  }
+  return null;
+}
+
+// Maximum dimension a given codec / level can encode. Use these to scale the
+// recording before configuring the encoder.
+function codecMaxDim(codecString) {
+  if (codecString.includes('L153')) return 8192;   // HEVC L5.1
+  if (codecString.includes('L120')) return 4096;   // HEVC L4 or AVC L4
+  if (codecString.includes('L033')) return 8192;   // (informational)
+  if (codecString.includes('640033')) return 8192; // AVC High L5.1
+  if (codecString.includes('640028')) return 4096; // AVC High L4
+  return 3840;
+}
+
 async function startRecording(opts = {}) {
   if (recording) return;
   if (!state.imgA || !state.imgB) return;
 
   const fps = state.exportFps;
   const sizeMode = state.exportSizeMode;
-  // morph area dimensions (the canvas content), then pad below with black so
-  // the final video has aspect (canvas + padBottom × canvas.h) tall.
   let recW = canvas.width, recH = canvas.height;
   if (sizeMode !== 'src') {
     const w = parseInt(sizeMode, 10);
@@ -1591,80 +1625,104 @@ async function startRecording(opts = {}) {
     recW = w; recH = h;
   }
   const padPx0 = Math.round(recH * state.exportPadBottom);
-  const mime = pickRecorderMime();
-  const ENCODER_MAX = encoderMaxDim(mime);
+
+  recording = true;
+  const originalTitle = btnRecord.title;
+  btnRecord.title = 'Preparing…';
+
+  // Probe encoder support at the requested size; scale down if needed and re-probe.
   let scale = 1;
-  const maxDim = Math.max(recW, recH + padPx0);
-  const origReqW = recW, origReqH = recH;
-  if (maxDim > ENCODER_MAX) {
-    scale = ENCODER_MAX / maxDim;
-    recW = Math.round(recW * scale);
-    recH = Math.round(recH * scale);
+  let pick = null;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const tryW = (recW + (recW % 2));
+    const tryH = ((recH + padPx0 * scale) + ((recH + padPx0 * scale) % 2));
+    pick = await pickEncoderConfig(tryW, Math.round(tryH), fps, 12_000_000);
+    if (pick) {
+      const cap = codecMaxDim(pick.config.codec);
+      if (Math.max(tryW, tryH) <= cap) break;
+    }
+    scale *= 0.75;
+    recW = Math.round(recW * 0.75);
+    recH = Math.round(recH * 0.75);
   }
+  if (!pick) {
+    btnRecord.title = 'FAILED — no usable video encoder';
+    setTimeout(() => { btnRecord.title = originalTitle; }, 4000);
+    recording = false;
+    return;
+  }
+
   const padPx = Math.round(recH * state.exportPadBottom);
   const totalH = (recH + padPx) + ((recH + padPx) % 2);
   const offW = recW + (recW % 2);
-
   const off = document.createElement('canvas');
   off.width = offW; off.height = totalH;
   const offCtx = off.getContext('2d');
   offCtx.fillStyle = '#000';
   offCtx.fillRect(0, 0, off.width, off.height);
-  console.log(`[record] morph ${recW}×${recH}, total ${offW}×${totalH}` + (scale < 1 ? `  (scaled from ${canvas.width}×${canvas.height} for encoder limit)` : ''));
 
-  const stream = off.captureStream(fps);
-  const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 12_000_000 });
-  console.log('[record] codec:', mime);
-  const chunks = [];
-  rec.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+  console.log(`[record] codec ${pick.config.codec}  ${offW}×${totalH}  ${fps}fps` + (scale < 1 ? `  (scaled ×${scale.toFixed(2)} from canvas ${canvas.width}×${canvas.height})` : ''));
 
-  recording = true;
-  const originalTitle = btnRecord.title;
-  btnRecord.title = scale < 1
-    ? `Scaled to ${recW}×${totalH} (encoder limit ${ENCODER_MAX}). Recording…`
-    : 'Recording…';
+  // Set up muxer + encoder.
+  const muxer = new Muxer({
+    target: new ArrayBufferTarget(),
+    video: { codec: pick.muxerCodec, width: offW, height: totalH, frameRate: fps },
+    fastStart: 'in-memory',
+  });
+  const encoder = new VideoEncoder({
+    output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+    error: e => console.error('[encoder]', e),
+  });
+  encoder.configure({ ...pick.config, width: offW, height: totalH });
 
   const totalFrames = Math.max(2, Math.round(state.duration * fps));
+  const frameDuration = 1_000_000 / fps; // microseconds
   const wasPlaying = state.playing;
   const prevT = state.t;
   state.playing = false;
-  // Force advection reset so the sim warms up from t=0 again.
   if (state.mode >= 10 && state.mode <= 14) advec.needsReset = true;
 
-  rec.start();
+  btnRecord.title = scale < 1
+    ? `Scaled to ${offW}×${totalH}. Recording…`
+    : 'Recording…';
+
   for (let i = 0; i < totalFrames; i++) {
     state.t = i / (totalFrames - 1);
     renderFrame();
-    // WebGPU canvases only "present" the latest submitted frame at a rAF
-    // boundary — onSubmittedWorkDone() resolves before that, so drawImage()
-    // would grab the previous (black) front buffer. Wait one rAF to let the
-    // swap-chain commit, *then* copy.
+    // wait one rAF so the WebGPU swap-chain commits the just-submitted frame
     await new Promise(r => requestAnimationFrame(r));
     offCtx.drawImage(canvas, 0, 0, recW, recH);
-    btnRecord.title = `frame ${i + 1} / ${totalFrames}`;
-    // Pace via rAF so we don't accidentally outrun the compositor either.
-    await new Promise(r => requestAnimationFrame(r));
-  }
-  rec.stop();
-  await new Promise(r => { rec.onstop = r; });
 
-  const blob = new Blob(chunks, { type: mime });
+    const vf = new VideoFrame(off, {
+      timestamp: Math.round(i * frameDuration),
+      duration: Math.round(frameDuration),
+    });
+    encoder.encode(vf);
+    vf.close();
+
+    btnRecord.title = `frame ${i + 1} / ${totalFrames}`;
+    // Back-pressure: if the encoder queue is getting long, let it drain.
+    if (encoder.encodeQueueSize > 16) {
+      await new Promise(r => setTimeout(r, 0));
+    }
+  }
+  await encoder.flush();
+  muxer.finalize();
+
   recording = false;
   state.t = prevT;
   state.playing = wasPlaying;
 
+  const blob = new Blob([muxer.target.buffer], { type: 'video/mp4' });
   if (blob.size < 1024) {
-    // Encoder rejected the dimensions or otherwise failed silently.
-    btnRecord.title = `FAILED — output too large for codec, try smaller size`;
+    btnRecord.title = 'FAILED — empty output';
     setTimeout(() => { btnRecord.title = originalTitle; }, 4000);
-    console.error('[record] empty blob — likely encoder dimension limit. Try a smaller export size.');
     return;
   }
 
   const url = URL.createObjectURL(blob);
-  const ext = mimeToExt(mime);
   const base = opts.filename || makeFilenameV2();
-  const filename = /\.(mp4|webm)$/i.test(base) ? base : `${base}.${ext}`;
+  const filename = /\.mp4$/i.test(base) ? base : `${base}.mp4`;
   const a = document.createElement('a');
   a.href = url; a.download = filename; a.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
