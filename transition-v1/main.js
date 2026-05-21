@@ -1869,7 +1869,7 @@ fStyle.addBinding(state, 'bg', { view: 'color' });
 const fExp = pane.addFolder({ title: 'Export', expanded: true });
 fExp.addBinding(state, 'exportFps', {
   label: 'fps',
-  options: { '24 fps': 24, '30 fps': 30, '60 fps': 60 },
+  options: { '24 fps': 24, '25 fps': 25, '30 fps': 30, '50 fps': 50, '60 fps': 60 },
 });
 fExp.addBinding(state, 'exportSizeMode', {
   label: 'size',

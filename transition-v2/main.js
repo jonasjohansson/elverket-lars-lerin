@@ -1546,7 +1546,7 @@ function makeFilenameV2() {
 let recording = false;
 const fExp = pane.addFolder({ title: 'Export', expanded: true });
 fExp.addBinding(state, 'exportFps', {
-  label: 'fps', options: { '24 fps': 24, '30 fps': 30, '60 fps': 60 },
+  label: 'fps', options: { '24 fps': 24, '25 fps': 25, '30 fps': 30, '50 fps': 50, '60 fps': 60 },
 });
 fExp.addBinding(state, 'exportSizeMode', {
   label: 'size',
@@ -1635,12 +1635,15 @@ async function startRecording(opts = {}) {
   for (let i = 0; i < totalFrames; i++) {
     state.t = i / (totalFrames - 1);
     renderFrame();
-    // Let the GPU finish then copy to the 2D off-canvas so the captureStream
-    // sees a fresh frame.
-    await device.queue.onSubmittedWorkDone();
+    // WebGPU canvases only "present" the latest submitted frame at a rAF
+    // boundary — onSubmittedWorkDone() resolves before that, so drawImage()
+    // would grab the previous (black) front buffer. Wait one rAF to let the
+    // swap-chain commit, *then* copy.
+    await new Promise(r => requestAnimationFrame(r));
     offCtx.drawImage(canvas, 0, 0, recW, recH);
     btnRecord.title = `frame ${i + 1} / ${totalFrames}`;
-    await new Promise(r => setTimeout(r, 1000 / fps));
+    // Pace via rAF so we don't accidentally outrun the compositor either.
+    await new Promise(r => requestAnimationFrame(r));
   }
   rec.stop();
   await new Promise(r => { rec.onstop = r; });
