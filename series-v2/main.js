@@ -437,7 +437,7 @@ async function init() {
   });
 
   // ─── GUI ───
-  const gui = new GUI({ title: 'Storm Sweep' });
+  const gui = new GUI({ title: 'series-v2' });
 
   const fR = gui.addFolder('Rendering');
   fR.add(params, 'particleSize', 0.5, 8, 0.1).name('Particle Size').onChange(v => uSize.value = v);

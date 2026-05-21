@@ -1,31 +1,31 @@
-# Elverket × Lars Lerin — Particle Dissolution Prototypes
+# Elverket × Lars Lerin
 
-Three approaches to image → particle → dissolution for an immersive installation.
+Browser-based prototypes for image-to-image transitions, point clouds, and particle systems based on Lars Lerin watercolours. Built for the Elverket installation.
 
-## Usage
+Open `index.html` in a browser through a local server to see the index of prototypes.
 
-Open any approach's `index.html` in a browser (via local server). Press F for fullscreen.
+## Tools
 
-- `approach-a-webgl/` — Raw WebGL + GLSL shaders
-- `approach-b-gsplat/` — Gaussian splatting with instanced quads
-- `approach-c-hybrid/` — Splat-aesthetic sprites on Three.js
+- `transition-v2/` — A→B image transition, WebGPU
+- `transition-v1/` — A→B image transition, WebGL2
+
+## Other prototypes
+
+- `birds-v1/` — particle flock with image-based waypoints
+- `series-v1/`, `series-v2/` — image-series transitions
+- `pointcloud-v1`–`v6`, `pointcloud/` — point-cloud experiments
+- `approach-a-webgl/` through `approach-f-splat/` — earlier rendering experiments
 
 ## Images
 
-Drop still images into `shared/images/`. Supported: jpg, png.
-If no images found, a generated gradient placeholder is used.
+The transition tools auto-load defaults from each tool's `defaults/` folder and let you upload your own through the UI. The older prototypes read from `shared/images/`.
 
-## Local Server
+## Local server
 
-Each approach needs a local server for ES modules:
+ES-module pages need a local HTTP server. From the repo root:
 
 ```bash
-# Approach A
-cd approach-a-webgl && python3 -m http.server 8001
-
-# Approach B
-cd approach-b-gsplat && python3 -m http.server 8002
-
-# Approach C
-cd approach-c-hybrid && python3 -m http.server 8003
+python3 -m http.server 8000
 ```
+
+Then visit `http://localhost:8000/`.

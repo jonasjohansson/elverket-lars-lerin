@@ -604,7 +604,7 @@ async function init() {
 
   postProcessing.outputNode = dofPass.mul(vignetteFactor);
 
-  info.textContent = `${(PARTICLE_COUNT / 1e6).toFixed(1)}M · Slow disintegration · Hover: wither · Click: expand · Right-click: vortex · Space: dissolve · T: transition`;
+  info.textContent = `${(PARTICLE_COUNT / 1e6).toFixed(1)}M · Hover, click, right-click for cursor effects · Space: rebuild · T: transition`;
 
   // ─── GUI ───
   const gui = new GUI({ title: 'Point Cloud' });

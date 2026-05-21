@@ -1,5 +1,5 @@
-# Shared Images
+# shared/images
 
-Drop jpg/png images here for the particle dissolution prototypes.
+Source images used by the older prototypes (`approach-*`, `birds-*`, `series-*`, `pointcloud-*`). Drop jpg / png files here.
 
-If this folder is empty, each approach will use a generated gradient as a fallback.
+The newer transition tools (`transition-v1/`, `transition-v2/`) load defaults from their own `defaults/` folder instead.
