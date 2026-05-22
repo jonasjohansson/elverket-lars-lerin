@@ -60,8 +60,8 @@ struct Params {
   diffStrength: f32, diffRadius: f32,
   sedBands: f32, sedSoftness: f32,
   saltDensity: f32, saltContrast: f32, saltBias: f32, saltImage: u32,
-  // -- 160..175 -- iris (vec2 align 8) + jitter
-  irisFocus: vec2f, irisJitter: f32, _p0: f32,
+  // -- 160..175 -- iris (vec2 align 8) + jitter + uniform-circle toggle
+  irisFocus: vec2f, irisJitter: f32, irisUniform: u32,
   // -- 176..191 -- bleed, run scalars
   bleedFinger: f32, bleedAmount: f32, bleedHalo: f32, runGravity: f32,
   // -- 192..207 -- run drip + advection-family params (start)
@@ -70,8 +70,28 @@ struct Params {
   advGravity: f32, advGravBias: f32, advGravAngle: f32, advGravStreak: f32,
   // -- 224..239 -- gravity lateral + curl + brush
   advGravLateral: f32, advCurlStr: f32, advCurlScale: f32, advBrushFollow: f32,
-  // -- 240..255 -- seed
-  advSeedCount: u32, advSeedRadius: f32, _p4: f32, _p5: f32,
+  // -- 240..255 -- seed + canvas aspect (w/h) used by uniform-circle iris
+  advSeedCount: u32, advSeedRadius: f32, canvasAspect: f32, _p5: f32,
+  // -- 256..271 -- wet edge (mode 15): rect ingress
+  weEdgeScale: f32, weEdgeWobble: f32, weDryRing: f32, weBleed: f32,
+  // -- 272..287 -- wet edge: tendrils
+  weTendrilCount: u32, weTendrilReach: f32, weTendrilWidth: f32, weTendrilStrength: f32,
+  // -- 288..303 -- wet edge: detail bias + future padding
+  weDetailBias: f32, _p6: f32, _p7: f32, _p8: f32,
+  // -- 304..319 -- mold tendrils (mode 22): Gray-Scott RD
+  moldFeed: f32, moldKill: f32, moldSeedCount: u32, moldSeedRadius: f32,
+  // -- 320..335 -- new painterly modes 16..21: stroke / glaze
+  strokeScale: f32, strokeAniso: f32, glazeBands: f32, glazeSoftness: f32,
+  // -- 336..351 -- glaze direction + warm tint / edge-first + dabs
+  glazeDirection: u32, glazeWarm: f32, edgeFirstInk: f32, edgeFirstFade: f32,
+  // -- 352..367 -- edge-first scale / flow / dabs count + reach
+  edgeFirstScale: f32, flowAmount: f32, dabsCount: u32, dabsReach: f32,
+  // -- 368..383 -- dabs wobble / density / global paper grain
+  dabsWobble: f32, densityGravity: f32, densitySmear: f32, paperGrain: f32,
+  formStrokeCount: u32, formStrokeSize: f32, formStrokeWobble: f32, _f1: f32,
+  bloomLightBias: f32, bloomWobble: f32, bloomPaperShow: f32, _b1: f32,
+  stageBands: f32, stageOverlap: f32, _s1: f32, _s2: f32,
+  migrationStrength: f32, migrationDir: u32, migrationTurb: f32, _m1: f32,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -253,8 +273,15 @@ fn saltMask(uv: vec2f, cA: vec3f, cB: vec3f) -> f32 {
 }
 
 fn irisMask(uv: vec2f) -> f32 {
-  let d = (uv - p.irisFocus) * 1.4142;
-  let r = length(d);
+  var d = uv - p.irisFocus;
+  var norm = 1.4142;
+  if (p.irisUniform == 1u) {
+    // Aspect-correct so the iris is a circle in pixel space (not stretched
+    // along the wider canvas axis). Renormalize so corners still reach r=1.
+    d.x = d.x * p.canvasAspect;
+    norm = 2.0 / sqrt(p.canvasAspect * p.canvasAspect + 1.0);
+  }
+  let r = length(d) * norm;
   let jit = (fbm(uv * 3.5 + p.seed * 0.21) - 0.5) * p.irisJitter * 0.3;
   return clamp(r + jit, 0.0, 1.0);
 }
@@ -273,6 +300,215 @@ fn pigmentRunMask(uv: vec2f, lA: f32) -> f32 {
   let m = mix(lA, uv.y, p.runGravity);
   let n = (fbm(uv * 2.5 + p.seed * 0.11) - 0.5) * 0.06;
   return clamp(m + n, 0.0, 1.0);
+}
+
+fn paperFiber(uv: vec2f) -> f32 {
+  // Multi-octave fine fibers. Returns signed [-0.5..0.5]-ish modulation.
+  let f1 = vnoise(uv * 300.0 + p.seed * 1.7) - 0.5;
+  let f2 = vnoise(uv *  80.0 + p.seed * 0.4) - 0.5;
+  let f3 = vnoise(uv * 700.0 + p.seed * 0.9) - 0.5;
+  return f1 * 0.4 + f2 * 0.3 + f3 * 0.3;
+}
+
+fn strokeFollowMask(uv: vec2f) -> f32 {
+  // Local gradient of B's luma → perpendicular is the local stroke direction.
+  let e = 0.003;
+  let gx = luma(sampleFit(texB, uv + vec2f( e, 0.0), p.scaleB, p.offsetB, p.validB).rgb)
+         - luma(sampleFit(texB, uv - vec2f( e, 0.0), p.scaleB, p.offsetB, p.validB).rgb);
+  let gy = luma(sampleFit(texB, uv + vec2f(0.0,  e), p.scaleB, p.offsetB, p.validB).rgb)
+         - luma(sampleFit(texB, uv - vec2f(0.0,  e), p.scaleB, p.offsetB, p.validB).rgb);
+  let grad = vec2f(gx, gy);
+  let glen = length(grad);
+  let strokeDir = select(vec2f(1.0, 0.0), vec2f(-grad.y, grad.x) / glen, glen > 1e-4);
+  let perpDir = vec2f(-strokeDir.y, strokeDir.x);
+  // Anisotropic noise space: long along strokes, narrow across them.
+  let alongScale  = max(0.5, p.strokeScale);
+  let acrossScale = alongScale * max(1.0, p.strokeAniso);
+  let aco = vec2f(dot(uv - 0.5, strokeDir) * alongScale,
+                  dot(uv - 0.5, perpDir)  * acrossScale) + p.seed * 0.13;
+  let n = fbm(aco);
+  let grain = (vnoise(uv * 110.0 + p.seed * 1.7) - 0.5) * 0.06;
+  return clamp(n + grain, 0.0, 1.0);
+}
+
+fn tonalGlazeMask(uv: vec2f) -> f32 {
+  let cB = sampleFit(texB, uv, p.scaleB, p.offsetB, p.validB);
+  let L = luma(cB.rgb);
+  let v = select(L, 1.0 - L, p.glazeDirection == 1u);
+  let bands = max(2.0, p.glazeBands);
+  let q = floor(v * bands) / max(1.0, bands - 1.0);
+  // glazeSoftness = 1 → continuous wash; 0 → hard bands.
+  let m = mix(q, v, p.glazeSoftness);
+  // Per-band wet wobble (the v term shifts the noise per tonal region).
+  let wob = (fbm(uv * 3.5 + v * 7.3 + p.seed * 0.21) - 0.5) * 0.12;
+  let grain = (vnoise(uv * 130.0 + p.seed * 0.7) - 0.5) * 0.05;
+  return clamp(m + wob + grain, 0.0, 1.0);
+}
+
+fn edgeFirstMask(uv: vec2f) -> f32 {
+  let eB = edgeMag(texB, uv, p.scaleB, p.offsetB, p.validB);
+  // Edges reveal early (low mask), flat areas reveal late.
+  let base = clamp(1.0 - eB * 2.5, 0.0, 1.0);
+  let wob = (fbm(uv * max(1.0, p.edgeFirstScale) + p.seed * 0.13) - 0.5) * 0.18;
+  let grain = (vnoise(uv * 120.0 + p.seed * 1.3) - 0.5) * 0.05;
+  return clamp(base + wob + grain, 0.0, 1.0);
+}
+
+fn dabsMask(uv: vec2f) -> f32 {
+  var minReveal = 1.0;
+  for (var i = 0u; i < 128u; i = i + 1u) {
+    if (i >= p.dabsCount) { break; }
+    let fi = f32(i) + p.seed * 0.07 + 1.0;
+    let sp = vec2f(hash21(vec2f(fi * 1.3, 13.0)), hash21(vec2f(fi * 2.7, 47.0)));
+    let startT = hash21(vec2f(fi, 91.0)) * 0.5;
+    let sizeJit = 0.6 + 0.8 * hash21(vec2f(fi, 11.0));
+    let d = distance(uv, sp);
+    let w1 = (fbm(uv * 3.0 + fi * 5.0) - 0.5) * p.dabsWobble * 0.08;
+    let w2 = (vnoise(uv * 12.0 + fi * 2.0) - 0.5) * p.dabsWobble * 0.02;
+    let reveal = startT + (d + w1 + w2) * (1.0 / max(p.dabsReach * sizeJit, 0.05));
+    minReveal = min(minReveal, reveal);
+  }
+  let grain = (vnoise(uv * 120.0 + p.seed * 1.7) - 0.5) * 0.05;
+  return clamp(minReveal + grain, 0.0, 1.0);
+}
+
+fn wetDensityMask(uv: vec2f) -> f32 {
+  let cB = sampleFit(texB, uv, p.scaleB, p.offsetB, p.validB);
+  let mx = max(max(cB.r, cB.g), cB.b);
+  let mn = min(min(cB.r, cB.g), cB.b);
+  let sat = select(0.0, (mx - mn) / mx, mx > 1e-4);
+  let density = clamp((1.0 - luma(cB.rgb)) * 0.65 + sat * 0.35, 0.0, 1.0);
+  // uv.y near 1.0 is the bottom of the canvas in this UV layout. Bottom-heavy pigment pools earliest.
+  let bottomBias = uv.y * p.densityGravity * 0.5;
+  let m = 1.0 - density - bottomBias * density;
+  let wob = (fbm(uv * 3.0 + p.seed * 0.13) - 0.5) * 0.12;
+  let grain = (vnoise(uv * 120.0 + p.seed * 1.7) - 0.5) * 0.05;
+  return clamp(m + wob + grain, 0.0, 1.0);
+}
+
+fn watercolorFormationMask(uv: vec2f) -> f32 {
+  // Many strokes painted across the canvas, each oriented along B's local gradient.
+  var bestT = 1.0;
+  let nStrokes = p.formStrokeCount;
+  let size = max(0.005, p.formStrokeSize);
+  for (var i = 0u; i < 64u; i = i + 1u) {
+    if (i >= nStrokes) { break; }
+    let fi = f32(i) + p.seed * 0.07 + 1.0;
+    let sp = vec2f(hash21(vec2f(fi * 1.3, 13.0)), hash21(vec2f(fi * 2.7, 47.0)));
+    let startT = hash21(vec2f(fi, 91.0)) * 0.7;
+    // Orientation: perpendicular to B's gradient at the stroke origin.
+    let e = 0.005;
+    let gx = luma(sampleFit(texB, sp + vec2f(e, 0.0), p.scaleB, p.offsetB, p.validB).rgb)
+           - luma(sampleFit(texB, sp - vec2f(e, 0.0), p.scaleB, p.offsetB, p.validB).rgb);
+    let gy = luma(sampleFit(texB, sp + vec2f(0.0, e), p.scaleB, p.offsetB, p.validB).rgb)
+           - luma(sampleFit(texB, sp - vec2f(0.0, e), p.scaleB, p.offsetB, p.validB).rgb);
+    let grad = vec2f(gx, gy);
+    let glen = length(grad);
+    let strokeDir = select(vec2f(1.0, 0.0), vec2f(-grad.y, grad.x) / glen, glen > 1e-4);
+    let perpDir = vec2f(-strokeDir.y, strokeDir.x);
+    let sizeJit = 0.6 + 0.7 * hash21(vec2f(fi, 11.0));
+    let strokeLen = size * 3.0 * sizeJit;
+    let strokeWid = size * 1.0 * sizeJit;
+    let rel = uv - sp;
+    let along  = dot(rel, strokeDir) / strokeLen;
+    let across = dot(rel, perpDir)   / strokeWid;
+    // Wobble the elliptical edge with fbm so strokes have torn watercolor borders.
+    let wob = (fbm(uv * 8.0 + fi * 3.0) - 0.5) * p.formStrokeWobble * 0.5;
+    let d = sqrt(along * along + across * across) * (1.0 + wob);
+    if (d < 1.0) {
+      let revealT = startT + d * 0.2;
+      bestT = min(bestT, revealT);
+    }
+  }
+  let grain = (fbm(uv * 60.0 + p.seed * 1.7) - 0.5) * 0.05;
+  return clamp(bestT + grain, 0.0, 1.0);
+}
+
+fn cauliflowerBloomMask(uv: vec2f) -> f32 {
+  // B's lightest pixels are the bloom origins (paper-show-through). Multi-octave
+  // wobble breaks the iso-luma contours into cauliflower shapes.
+  let cB = sampleFit(texB, uv, p.scaleB, p.offsetB, p.validB);
+  let L = luma(cB.rgb);
+  let base = mix(0.5, 1.0 - L, p.bloomLightBias);
+  let w1 = (fbm(uv * 2.0 + p.seed * 0.13) - 0.5) * 0.20 * p.bloomWobble;
+  let w2 = (fbm(uv * 6.0 + p.seed * 0.27) - 0.5) * 0.10 * p.bloomWobble;
+  let w3 = (vnoise(uv * 30.0 + p.seed * 0.71) - 0.5) * 0.04;
+  let grain = (vnoise(uv * 130.0 + p.seed * 0.5) - 0.5) * 0.04;
+  return clamp(base + w1 + w2 + w3 + grain, 0.0, 1.0);
+}
+
+fn wetStageMask(uv: vec2f) -> f32 {
+  // Watercolor painting stages: lightest wash first, darkest accents last.
+  let cB = sampleFit(texB, uv, p.scaleB, p.offsetB, p.validB);
+  let L = luma(cB.rgb);
+  let v = 1.0 - L;
+  let bands = max(2.0, p.stageBands);
+  let stage = floor(v * bands);
+  let withinStage = fract(v * bands);
+  let stageBlend = mix(stage / bands, (stage + withinStage) / bands, p.stageOverlap);
+  let wob = (fbm(uv * 3.0 + v * 5.0 + p.seed * 0.21) - 0.5) * 0.15;
+  let grain = (vnoise(uv * 130.0 + p.seed * 0.7) - 0.5) * 0.04;
+  return clamp(stageBlend + wob + grain, 0.0, 1.0);
+}
+
+fn wetEdgeMask(uv: vec2f) -> f32 {
+  // No B → nothing to bleed in.
+  if (p.validB == 0u) { return 0.0; }
+  // Work in B-local coords so the "rectangle" is always B's image bounds.
+  let q = (uv - p.offsetB) / p.scaleB;
+  // Outside B's rect → stay as A (mask > 1 keeps the smoothstep window above t).
+  if (q.x < 0.0 || q.x > 1.0 || q.y < 0.0 || q.y > 1.0) { return 10.0; }
+
+  // Distance from B's rectangular border, B-local. 0 at edge → 0.5 at center.
+  let dbX = min(q.x, 1.0 - q.x);
+  let dbY = min(q.y, 1.0 - q.y);
+  let db  = min(dbX, dbY);
+
+  // Wavy wet front — fbm perturbs the iso-distance contours.
+  let wob = (fbm(q * p.weEdgeScale + p.seed * 0.13) - 0.5) * p.weEdgeWobble * 0.18;
+
+  // Normalize: border → 0, center → ~1.
+  var m = (db + wob) * 2.0;
+
+  // Capillary tendrils: pick seed points on the border, each growing inward.
+  if (p.weTendrilCount > 0u && p.weTendrilStrength > 0.001) {
+    var bestInfluence = 0.0;
+    for (var i = 0u; i < 32u; i = i + 1u) {
+      if (i >= p.weTendrilCount) { break; }
+      let fi = f32(i) + p.seed * 0.07 + 1.0;
+      let side = u32(hash21(vec2f(fi * 1.3, 3.1)) * 4.0) % 4u;
+      let bp = hash21(vec2f(fi * 1.7, 7.2));
+      var sp: vec2f;
+      var dir: vec2f;
+      if (side == 0u)      { sp = vec2f(bp,   0.0); dir = vec2f(0.0,  1.0); }
+      else if (side == 1u) { sp = vec2f(1.0,  bp ); dir = vec2f(-1.0, 0.0); }
+      else if (side == 2u) { sp = vec2f(bp,   1.0); dir = vec2f(0.0, -1.0); }
+      else                  { sp = vec2f(0.0,  bp ); dir = vec2f(1.0,  0.0); }
+      let perpDir = vec2f(-dir.y, dir.x);
+      // Wobble the tendril's path so it curves like a paint feeler.
+      let wig = (fbm(q * 5.5 + fi * 4.3) - 0.5) * 0.05;
+      let qw = q + perpDir * wig;
+      let rel = qw - sp;
+      let along = dot(rel, dir);
+      let perp  = dot(rel, perpDir);
+      let reach = max(0.01, p.weTendrilReach);
+      let width = max(0.002, p.weTendrilWidth * 0.04);
+      if (along > 0.0 && along < reach) {
+        let perpFall  = exp(-(perp * perp) / (width * width));
+        let alongFall = 1.0 - along / reach;
+        bestInfluence = max(bestInfluence, perpFall * alongFall);
+      }
+    }
+    m = m - bestInfluence * p.weTendrilStrength * 0.5;
+  }
+
+  // Detail bias — A's high-detail regions reveal earlier (paint hangs in soft areas).
+  if (p.weDetailBias > 0.001) {
+    let eA = edgeMag(texA, uv, p.scaleA, p.offsetA, p.validA);
+    m = m - eA * p.weDetailBias * 0.35;
+  }
+
+  return clamp(m, 0.0, 1.0);
 }
 
 fn organicMask(uv: vec2f, lA: f32, lB: f32, edge: f32) -> f32 {
@@ -294,6 +530,20 @@ fn organicMask(uv: vec2f, lA: f32, lB: f32, edge: f32) -> f32 {
   // texture each frame; here we just sample and present it.
   if (p.mode >= 10u && p.mode <= 14u) {
     return vec4f(textureSampleLevel(advState, samp, uv, 0.0).rgb, 1.0);
+  }
+  // Mold tendrils (mode 22): RD state's V channel controls reveal; mid-V
+  // values get a dark olive tint before settling to B (the "rot" phase).
+  if (p.mode == 22u) {
+    let st = textureSampleLevel(advState, samp, uv, 0.0);
+    let V = clamp(st.g, 0.0, 1.0);
+    let cAv = sampleFit(texA, uv, p.scaleA, p.offsetA, p.validA).rgb;
+    let cBv = sampleFit(texB, uv, p.scaleB, p.offsetB, p.validB).rgb;
+    let revealAmt = smoothstep(0.10, 0.32, V);
+    let moldTint = vec3f(0.05, 0.065, 0.04);
+    let darkening = smoothstep(0.03, 0.16, V) * (1.0 - smoothstep(0.16, 0.34, V)) * 0.55;
+    var outc = mix(cAv, cBv, revealAmt);
+    outc = mix(outc, moldTint, darkening);
+    return vec4f(outc, 1.0);
   }
 
   // Stretch t so the per-pixel smoothstep window (mask±spread) is fully
@@ -327,6 +577,35 @@ fn organicMask(uv: vec2f, lA: f32, lB: f32, edge: f32) -> f32 {
     mask = wetBleedMask(uv, lA, lB);
   } else if (p.mode == 9u) {
     mask = pigmentRunMask(uv, lA);
+  } else if (p.mode == 15u) {
+    mask = wetEdgeMask(uv);
+  } else if (p.mode == 16u) {
+    mask = strokeFollowMask(uv);
+  } else if (p.mode == 17u) {
+    mask = tonalGlazeMask(uv);
+  } else if (p.mode == 18u) {
+    mask = edgeFirstMask(uv);
+  } else if (p.mode == 19u) {
+    // Painterly flow: simple organic mask. The character comes from the
+    // gradient-warped B sample below, not the mask.
+    let n = fbm(uv * 1.8 + p.seed * 0.13);
+    let grain = (vnoise(uv * 120.0 + p.seed * 1.7) - 0.5) * 0.05;
+    mask = clamp(n + grain, 0.0, 1.0);
+  } else if (p.mode == 20u) {
+    mask = dabsMask(uv);
+  } else if (p.mode == 21u) {
+    mask = wetDensityMask(uv);
+  } else if (p.mode == 23u) {
+    mask = watercolorFormationMask(uv);
+  } else if (p.mode == 24u) {
+    mask = cauliflowerBloomMask(uv);
+  } else if (p.mode == 25u) {
+    mask = wetStageMask(uv);
+  } else if (p.mode == 26u) {
+    // Pigment migration uses a soft organic mask; the cB warp below does the work.
+    let n = fbm(uv * 1.5 + p.seed * 0.13);
+    let grain = (vnoise(uv * 120.0 + p.seed * 1.7) - 0.5) * 0.04;
+    mask = clamp(n + grain, 0.0, 1.0);
   } else {
     let eA = edgeMag(texA, uv, p.scaleA, p.offsetA, p.validA);
     let eB = edgeMag(texB, uv, p.scaleB, p.offsetB, p.validB);
@@ -337,6 +616,22 @@ fn organicMask(uv: vec2f, lA: f32, lB: f32, edge: f32) -> f32 {
 
   // ---- wet diffusion (mode 4): anticipatory tint of B into A ----
   var colA_eff = cA.rgb;
+  // ---- wet edge (mode 15): anticipatory bleed of B into A ahead of the front ----
+  if (p.mode == 15u && p.weBleed > 0.001) {
+    let anticipate = smoothstep(mask - 0.35, mask + 0.05, t);
+    let bR = 0.02;
+    var acc = sampleFit(texB, uv, p.scaleB, p.offsetB, p.validB).rgb;
+    var wsum = 1.0;
+    for (var i = 0u; i < 6u; i = i + 1u) {
+      let a = f32(i) * (6.2831853 / 6.0) + p.seed * 0.017;
+      let d = vec2f(cos(a), sin(a));
+      acc = acc + sampleFit(texB, uv + d * bR, p.scaleB, p.offsetB, p.validB).rgb;
+      wsum = wsum + 1.0;
+    }
+    let bleedB = acc / wsum;
+    let dry = 1.0 - mixT;
+    colA_eff = mix(cA.rgb, bleedB, anticipate * dry * p.weBleed * 0.4);
+  }
   if (p.mode == 4u && p.diffStrength > 0.001) {
     let anticipate = smoothstep(mask - 0.45, mask + 0.05, t);
     let bR = 0.025 + p.diffRadius * 0.08;
@@ -356,7 +651,56 @@ fn organicMask(uv: vec2f, lA: f32, lB: f32, edge: f32) -> f32 {
     colA_eff = mix(cA.rgb, bleedB, anticipate * dry * p.diffStrength * 0.55);
   }
 
-  var outc = mix(colA_eff, cB.rgb, mixT);
+  // Mode 19 (painterly flow): sample B at a position warped along its own
+  // gradient field, so paint "flows into place" as t→1.
+  var cB_eff = cB.rgb;
+  if (p.mode == 19u) {
+    let ee = 0.005;
+    let gx = luma(sampleFit(texB, uv + vec2f( ee, 0.0), p.scaleB, p.offsetB, p.validB).rgb)
+           - luma(sampleFit(texB, uv - vec2f( ee, 0.0), p.scaleB, p.offsetB, p.validB).rgb);
+    let gy = luma(sampleFit(texB, uv + vec2f(0.0,  ee), p.scaleB, p.offsetB, p.validB).rgb)
+           - luma(sampleFit(texB, uv - vec2f(0.0,  ee), p.scaleB, p.offsetB, p.validB).rgb);
+    let grad = vec2f(gx, gy);
+    let glen = length(grad);
+    if (glen > 1e-4) {
+      let flowDir = vec2f(-grad.y, grad.x) / glen;
+      let baseAmt = (1.0 - tCurve) * p.flowAmount * 0.18;
+      // Wobble the warp amount so streaks aren't uniform — analog feel.
+      let wob = (fbm(uv * 4.0 + p.seed * 0.21) - 0.5) * 0.5;
+      cB_eff = sampleFit(texB, uv + flowDir * baseAmt * (1.0 + wob), p.scaleB, p.offsetB, p.validB).rgb;
+    }
+  }
+
+  // Mode 26 (pigment migration): sample B at a position offset along (or
+  // perpendicular to) B's own gradient; offset shrinks as t→1 so pigment
+  // "flows into place".
+  if (p.mode == 26u) {
+    let ee = 0.005;
+    let gx = luma(sampleFit(texB, uv + vec2f( ee, 0.0), p.scaleB, p.offsetB, p.validB).rgb)
+           - luma(sampleFit(texB, uv - vec2f( ee, 0.0), p.scaleB, p.offsetB, p.validB).rgb);
+    let gy = luma(sampleFit(texB, uv + vec2f(0.0,  ee), p.scaleB, p.offsetB, p.validB).rgb)
+           - luma(sampleFit(texB, uv - vec2f(0.0,  ee), p.scaleB, p.offsetB, p.validB).rgb);
+    let grad = vec2f(gx, gy);
+    let glen = length(grad);
+    if (glen > 1e-4) {
+      let dirAlong = select(grad / glen, vec2f(-grad.y, grad.x) / glen, p.migrationDir == 1u);
+      let baseAmt = (1.0 - tCurve) * p.migrationStrength * 0.28;
+      // Multi-scale turbulence on the displacement magnitude.
+      let turb1 = (fbm(uv * 3.0  + p.seed * 0.21) - 0.5) * 0.6;
+      let turb2 = (fbm(uv * 12.0 + p.seed * 0.47) - 0.5) * 0.3;
+      let turbMul = 1.0 + (turb1 + turb2) * p.migrationTurb;
+      cB_eff = sampleFit(texB, uv + dirAlong * baseAmt * turbMul, p.scaleB, p.offsetB, p.validB).rgb;
+    }
+  }
+
+  var outc = mix(colA_eff, cB_eff, mixT);
+
+  // Tonal glaze warm tint (mode 17): pull glaze color slightly toward warm
+  // pigment as it dries — a faint chromatic "settling" you see in real paint.
+  if (p.mode == 17u && p.glazeWarm > 0.001) {
+    let warmTint = outc * vec3f(1.04, 1.0, 0.94);
+    outc = mix(outc, warmTint, p.glazeWarm * mixT);
+  }
 
   // ---- rim post-process (modes 1 and 3) ----
   if ((p.mode == 1u || p.mode == 3u) && env > 0.02) {
@@ -383,11 +727,69 @@ fn organicMask(uv: vec2f, lA: f32, lB: f32, edge: f32) -> f32 {
     outc = mix(outc, saturated, band * p.bleedHalo * env * 0.4);
   }
 
+  // ---- wet edge dry-ring (mode 15): dark watercolor bead at the wet front ----
+  if (p.mode == 15u && p.weDryRing > 0.001 && env > 0.02) {
+    let ringW = 0.03;
+    let band = exp(-pow((t - mask) / ringW, 2.0));
+    let base = mix(cA.rgb, cB.rgb, 0.6);
+    let lm = luma(base);
+    let darker = clamp(base * 0.4 + vec3f(lm * 0.08), vec3f(0.0), vec3f(1.0));
+    outc = mix(outc, darker, band * p.weDryRing * env * 0.55);
+  }
+
   // ---- pigment run drip (mode 9) ----
   if (p.mode == 9u && p.runDrip > 0.001 && env > 0.02 && t > mask) {
     let dripBand = exp(-pow((t - mask) / 0.08, 2.0));
     let dripB = sampleFit(texB, uv + vec2f(0.0, p.runDrip * 0.05), p.scaleB, p.offsetB, p.validB).rgb;
     outc = mix(outc, dripB, dripBand * p.runDrip * env * 0.35);
+  }
+
+  // ---- edge underdrawing sketch overlay (mode 18) ----
+  if (p.mode == 18u && p.edgeFirstInk > 0.001) {
+    let eB = edgeMag(texB, uv, p.scaleB, p.offsetB, p.validB);
+    // Ink ramps in fast, then fades as color floods in.
+    let inUp = smoothstep(0.0, 0.18, p.t);
+    let inDn = 1.0 - smoothstep(p.edgeFirstFade, p.edgeFirstFade + 0.18, p.t);
+    let inkColor = vec3f(0.04, 0.03, 0.025);
+    let inkAmt = clamp(eB * 3.0, 0.0, 1.0) * inUp * inDn * p.edgeFirstInk;
+    outc = mix(outc, inkColor, inkAmt);
+  }
+
+  // ---- wet-density vertical smear (mode 21) ----
+  if (p.mode == 21u && p.densitySmear > 0.001 && env > 0.02) {
+    let anticipate = smoothstep(mask - 0.25, mask + 0.05, t) * (1.0 - mixT);
+    let smearB = sampleFit(texB, uv - vec2f(0.0, 0.025), p.scaleB, p.offsetB, p.validB).rgb;
+    outc = mix(outc, smearB, anticipate * p.densitySmear * env * 0.5);
+  }
+
+  // ---- watercolor character (modes 23..26): dark wet rim + paper-show pop + granulation ----
+  if (p.mode >= 23u && p.mode <= 26u && env > 0.02) {
+    // Cauliflower-style dark rim at the wet front
+    let rimW = 0.04;
+    let band = exp(-pow((t - mask) / rimW, 2.0));
+    let baseRim = mix(cA.rgb, cB_eff, 0.55);
+    let darker = clamp(baseRim * 0.42, vec3f(0.0), vec3f(1.0));
+    outc = mix(outc, darker, band * env * 0.45);
+    // Paper-show-through pop: B's brightest pixels briefly flash even brighter
+    // (mimics paper exposed through the wash)
+    let lumB = luma(cB_eff);
+    let popThresh = 0.7;
+    let popPhase = smoothstep(0.2, 0.5, mixT) * (1.0 - smoothstep(0.65, 0.95, mixT));
+    let popAmt = max(0.0, lumB - popThresh) / max(1e-4, 1.0 - popThresh);
+    outc = mix(outc, vec3f(0.95, 0.93, 0.88), popAmt * popPhase * 0.65);
+    // Granulation: high-freq + mid-freq per-pixel value variation
+    let g1 = (vnoise(uv * 220.0 + p.seed * 1.7) - 0.5) * 0.08;
+    let g2 = (vnoise(uv *  70.0 + p.seed * 0.7) - 0.5) * 0.04;
+    outc = clamp(outc + vec3f(g1 + g2) * mixT * 0.65, vec3f(0.0), vec3f(1.0));
+  }
+
+  // ---- global paper grain (all modes, opt-in) ----
+  if (p.paperGrain > 0.001) {
+    let fib = paperFiber(uv);
+    let mul = 1.0 + fib * p.paperGrain * 0.18;
+    outc = clamp(outc * mul, vec3f(0.0), vec3f(1.0));
+    let warmShift = outc * vec3f(1.02, 0.995, 0.96);
+    outc = mix(outc, warmShift, p.paperGrain * 0.15);
   }
 
   return vec4f(clamp(outc, vec3f(0.0), vec3f(1.0)), 1.0);
@@ -441,12 +843,24 @@ struct Params {
   diffStrength: f32, diffRadius: f32,
   sedBands: f32, sedSoftness: f32,
   saltDensity: f32, saltContrast: f32, saltBias: f32, saltImage: u32,
-  irisFocus: vec2f, irisJitter: f32, _p0: f32,
+  irisFocus: vec2f, irisJitter: f32, irisUniform: u32,
   bleedFinger: f32, bleedAmount: f32, bleedHalo: f32, runGravity: f32,
   runDrip: f32, advVariant: u32, advVisc: f32, advRate: f32,
   advGravity: f32, advGravBias: f32, advGravAngle: f32, advGravStreak: f32,
   advGravLateral: f32, advCurlStr: f32, advCurlScale: f32, advBrushFollow: f32,
-  advSeedCount: u32, advSeedRadius: f32, _p4: f32, _p5: f32,
+  advSeedCount: u32, advSeedRadius: f32, canvasAspect: f32, _p5: f32,
+  weEdgeScale: f32, weEdgeWobble: f32, weDryRing: f32, weBleed: f32,
+  weTendrilCount: u32, weTendrilReach: f32, weTendrilWidth: f32, weTendrilStrength: f32,
+  weDetailBias: f32, _p6: f32, _p7: f32, _p8: f32,
+  moldFeed: f32, moldKill: f32, moldSeedCount: u32, moldSeedRadius: f32,
+  strokeScale: f32, strokeAniso: f32, glazeBands: f32, glazeSoftness: f32,
+  glazeDirection: u32, glazeWarm: f32, edgeFirstInk: f32, edgeFirstFade: f32,
+  edgeFirstScale: f32, flowAmount: f32, dabsCount: u32, dabsReach: f32,
+  dabsWobble: f32, densityGravity: f32, densitySmear: f32, paperGrain: f32,
+  formStrokeCount: u32, formStrokeSize: f32, formStrokeWobble: f32, _f1: f32,
+  bloomLightBias: f32, bloomWobble: f32, bloomPaperShow: f32, _b1: f32,
+  stageBands: f32, stageOverlap: f32, _s1: f32, _s2: f32,
+  migrationStrength: f32, migrationDir: u32, migrationTurb: f32, _m1: f32,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -511,6 +925,33 @@ fn curlField(uv: vec2f) -> vec2f {
   let uv = in.uv;
   let dims = vec2f(textureDimensions(stateIn));
   let px = 1.0 / dims;
+
+  // Variant 5 — Gray-Scott reaction-diffusion (mold tendrils).
+  // State channels: R = substrate U, G = activator/mold V.
+  if (p.advVariant == 5u) {
+    let s = textureSampleLevel(stateIn, samp, uv, 0.0);
+    let U = s.r;
+    let V = s.g;
+    // 5-point laplacian (center subtracted; cardinal neighbors averaged).
+    let lU = (
+      textureSampleLevel(stateIn, samp, uv + vec2f(px.x, 0.0), 0.0).r +
+      textureSampleLevel(stateIn, samp, uv - vec2f(px.x, 0.0), 0.0).r +
+      textureSampleLevel(stateIn, samp, uv + vec2f(0.0, px.y), 0.0).r +
+      textureSampleLevel(stateIn, samp, uv - vec2f(0.0, px.y), 0.0).r
+    ) * 0.25 - U;
+    let lV = (
+      textureSampleLevel(stateIn, samp, uv + vec2f(px.x, 0.0), 0.0).g +
+      textureSampleLevel(stateIn, samp, uv - vec2f(px.x, 0.0), 0.0).g +
+      textureSampleLevel(stateIn, samp, uv + vec2f(0.0, px.y), 0.0).g +
+      textureSampleLevel(stateIn, samp, uv - vec2f(0.0, px.y), 0.0).g
+    ) * 0.25 - V;
+    let reaction = U * V * V;
+    let dU = 1.0 * lU - reaction + p.moldFeed * (1.0 - U);
+    let dV = 0.5 * lV + reaction - (p.moldFeed + p.moldKill) * V;
+    let newU = clamp(U + dU, 0.0, 1.0);
+    let newV = clamp(V + dV, 0.0, 1.0);
+    return vec4f(newU, newV, 0.0, 1.0);
+  }
 
   let cA = sampleFit(texA, uv, p.scaleA, p.offsetA, p.validA);
   let cB = sampleFit(texB, uv, p.scaleB, p.offsetB, p.validB);
@@ -638,12 +1079,24 @@ struct Params {
   diffStrength: f32, diffRadius: f32,
   sedBands: f32, sedSoftness: f32,
   saltDensity: f32, saltContrast: f32, saltBias: f32, saltImage: u32,
-  irisFocus: vec2f, irisJitter: f32, _p0: f32,
+  irisFocus: vec2f, irisJitter: f32, irisUniform: u32,
   bleedFinger: f32, bleedAmount: f32, bleedHalo: f32, runGravity: f32,
   runDrip: f32, advVariant: u32, advVisc: f32, advRate: f32,
   advGravity: f32, advGravBias: f32, advGravAngle: f32, advGravStreak: f32,
   advGravLateral: f32, advCurlStr: f32, advCurlScale: f32, advBrushFollow: f32,
-  advSeedCount: u32, advSeedRadius: f32, _p4: f32, _p5: f32,
+  advSeedCount: u32, advSeedRadius: f32, canvasAspect: f32, _p5: f32,
+  weEdgeScale: f32, weEdgeWobble: f32, weDryRing: f32, weBleed: f32,
+  weTendrilCount: u32, weTendrilReach: f32, weTendrilWidth: f32, weTendrilStrength: f32,
+  weDetailBias: f32, _p6: f32, _p7: f32, _p8: f32,
+  moldFeed: f32, moldKill: f32, moldSeedCount: u32, moldSeedRadius: f32,
+  strokeScale: f32, strokeAniso: f32, glazeBands: f32, glazeSoftness: f32,
+  glazeDirection: u32, glazeWarm: f32, edgeFirstInk: f32, edgeFirstFade: f32,
+  edgeFirstScale: f32, flowAmount: f32, dabsCount: u32, dabsReach: f32,
+  dabsWobble: f32, densityGravity: f32, densitySmear: f32, paperGrain: f32,
+  formStrokeCount: u32, formStrokeSize: f32, formStrokeWobble: f32, _f1: f32,
+  bloomLightBias: f32, bloomWobble: f32, bloomPaperShow: f32, _b1: f32,
+  stageBands: f32, stageOverlap: f32, _s1: f32, _s2: f32,
+  migrationStrength: f32, migrationDir: u32, migrationTurb: f32, _m1: f32,
 };
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var texA: texture_2d<f32>;
@@ -664,8 +1117,27 @@ struct Params {
   out.uv = uvs[idx];
   return out;
 }
+fn hash21i(q: vec2f) -> f32 {
+  var x = fract(q * vec2f(123.34, 456.21));
+  x += dot(x, x + 45.32);
+  return fract(x.x * x.y);
+}
 @fragment fn fs(in: VSOut) -> @location(0) vec4f {
   let uv = in.uv;
+  // RD init (variant 5): U starts saturated everywhere; V seeded with a few small spots.
+  if (p.advVariant == 5u) {
+    let count = max(1u, p.moldSeedCount);
+    let r = max(0.005, p.moldSeedRadius * 0.04);
+    var V = 0.0;
+    for (var i = 0u; i < 32u; i = i + 1u) {
+      if (i >= count) { break; }
+      let fi = f32(i) + p.seed * 0.07 + 1.0;
+      let sp = vec2f(hash21i(vec2f(fi * 1.3, 13.0)), hash21i(vec2f(fi * 2.7, 47.0)));
+      let d = distance(uv, sp);
+      V = max(V, exp(-pow(d / r, 2.0)) * 0.6);
+    }
+    return vec4f(1.0, V, 0.0, 1.0);
+  }
   if (p.validA == 0u) { return vec4f(p.bg, 1.0); }
   let q = (uv - p.offsetA) / p.scaleA;
   if (q.x < 0.0 || q.x > 1.0 || q.y < 0.0 || q.y > 1.0) { return vec4f(p.bg, 1.0); }
@@ -751,7 +1223,7 @@ function makeDisplayBindGroup(finalState) {
 //   5  seed         13  scaleB.y                                          29 bloomCount     37 saltContrast
 //   6  validA       14  offsetB.x                                         30 bloomRim       38 saltBias
 //   7  validB       15  offsetB.y                                         31 bloomRate      39 saltImage
-const UBO_SIZE = 256;
+const UBO_SIZE = 448;
 const uniformBuffer = device.createBuffer({
   size: UBO_SIZE,
   usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -845,7 +1317,7 @@ const state = {
   sedBands: 6, sedSoftness: 0.35, sedDirection: 0, sedSource: 0,
   saltDensity: 0.0, saltContrast: 0.55,
   saltSource: 1, saltBias: 0.6, saltImage: 2,
-  irisFocusX: 0.5, irisFocusY: 0.5, irisJitter: 0.35,
+  irisFocusX: 0.5, irisFocusY: 0.5, irisJitter: 0.35, irisUniform: true,
   bleedFinger: 0.5, bleedAmount: 0.45, bleedHalo: 0.5,
   runGravity: 0.5, runDrip: 0.35,
   // advection family
@@ -855,6 +1327,36 @@ const state = {
   advecCurlStr: 0.5, advecCurlScale: 2.5,
   advecBrushFollow: 0.7,
   advecSeedCount: 5, advecSeedRadius: 0.45,
+  // wet edge (mode 15)
+  weEdgeScale: 6.0, weEdgeWobble: 0.55,
+  weDryRing: 0.45, weBleed: 0.5,
+  weTendrilCount: 6, weTendrilReach: 0.4, weTendrilWidth: 0.5, weTendrilStrength: 0.55,
+  weDetailBias: 0.35,
+  // stroke follow (mode 16)
+  strokeScale: 6.0, strokeAniso: 4.0,
+  // tonal glaze (mode 17)
+  glazeBands: 3.0, glazeSoftness: 0.55, glazeDirection: 0, glazeWarm: 0.35,
+  // edge underdrawing (mode 18)
+  edgeFirstInk: 0.55, edgeFirstFade: 0.35, edgeFirstScale: 3.0,
+  // painterly flow (mode 19)
+  flowAmount: 0.55,
+  // color-pool dabs (mode 20)
+  dabsCount: 28, dabsReach: 0.32, dabsWobble: 0.6,
+  // wet-density gravity (mode 21)
+  densityGravity: 0.45, densitySmear: 0.45,
+  // global paper grain (Style folder)
+  paperGrain: 0.25,
+  // mold tendrils (mode 22) — Gray-Scott RD
+  moldFeed: 0.039, moldKill: 0.065, moldSeedCount: 6, moldSeedRadius: 0.4,
+  moldSteps: 30,
+  // mode 23 watercolor formation
+  formStrokeCount: 32, formStrokeSize: 0.05, formStrokeWobble: 0.5,
+  // mode 24 cauliflower bloom storm
+  bloomLightBias: 0.85, bloomWobble: 0.5, bloomPaperShow: 0.6,
+  // mode 25 wet-stage layering
+  stageBands: 4, stageOverlap: 0.5,
+  // mode 26 pigment migration
+  migrationStrength: 0.6, migrationDir: 0, migrationTurb: 0.5,
   // style / framing
   fit: 'cover',
   bg: '#000000',
@@ -969,7 +1471,7 @@ function writeUniforms() {
   uboF32[40] = state.irisFocusX;
   uboF32[41] = state.irisFocusY;
   uboF32[42] = state.irisJitter;
-  uboF32[43] = 0;  // _p0
+  uboU32[43] = state.irisUniform ? 1 : 0;
   // -- 44..47 -- bleed + run
   uboF32[44] = state.bleedFinger;
   uboF32[45] = state.bleedAmount;
@@ -977,7 +1479,8 @@ function writeUniforms() {
   uboF32[47] = state.runGravity;
   // -- 48..51 --
   uboF32[48] = state.runDrip;
-  uboU32[49] = (state.mode >= 11 && state.mode <= 14) ? (state.mode - 10) : 0; // advVariant
+  uboU32[49] = (state.mode >= 11 && state.mode <= 14) ? (state.mode - 10)
+             : (state.mode === 22 ? 5 : 0); // advVariant
   uboF32[50] = state.advecVisc;
   uboF32[51] = state.advecRate;
   // -- 52..55 -- gravity
@@ -990,10 +1493,62 @@ function writeUniforms() {
   uboF32[57] = state.advecCurlStr;
   uboF32[58] = state.advecCurlScale;
   uboF32[59] = state.advecBrushFollow;
-  // -- 60..63 -- seed
+  // -- 60..63 -- seed + canvas aspect
   uboU32[60] = state.advecSeedCount;
   uboF32[61] = state.advecSeedRadius;
-  uboF32[62] = 0; uboF32[63] = 0;
+  uboF32[62] = ch > 0 ? cw / ch : 1.0;
+  uboF32[63] = 0;
+  // -- 64..67 -- wet edge (mode 15): rect ingress
+  uboF32[64] = state.weEdgeScale;
+  uboF32[65] = state.weEdgeWobble;
+  uboF32[66] = state.weDryRing;
+  uboF32[67] = state.weBleed;
+  // -- 68..71 -- wet edge: tendrils
+  uboU32[68] = state.weTendrilCount;
+  uboF32[69] = state.weTendrilReach;
+  uboF32[70] = state.weTendrilWidth;
+  uboF32[71] = state.weTendrilStrength;
+  // -- 72..75 -- detail bias + padding
+  uboF32[72] = state.weDetailBias;
+  uboF32[73] = 0; uboF32[74] = 0; uboF32[75] = 0;
+  // -- 76..79 -- mold tendrils (mode 22)
+  uboF32[76] = state.moldFeed;
+  uboF32[77] = state.moldKill;
+  uboU32[78] = state.moldSeedCount;
+  uboF32[79] = state.moldSeedRadius;
+  // -- 96..111 -- new strong watercolor modes (23..26)
+  uboU32[96]  = state.formStrokeCount;
+  uboF32[97]  = state.formStrokeSize;
+  uboF32[98]  = state.formStrokeWobble;
+  uboF32[99]  = 0;
+  uboF32[100] = state.bloomLightBias;
+  uboF32[101] = state.bloomWobble;
+  uboF32[102] = state.bloomPaperShow;
+  uboF32[103] = 0;
+  uboF32[104] = state.stageBands;
+  uboF32[105] = state.stageOverlap;
+  uboF32[106] = 0; uboF32[107] = 0;
+  uboF32[108] = state.migrationStrength;
+  uboU32[109] = state.migrationDir;
+  uboF32[110] = state.migrationTurb;
+  uboF32[111] = 0;
+  // -- 80..95 -- new painterly modes (16..21) + global paper grain
+  uboF32[80] = state.strokeScale;
+  uboF32[81] = state.strokeAniso;
+  uboF32[82] = state.glazeBands;
+  uboF32[83] = state.glazeSoftness;
+  uboU32[84] = state.glazeDirection;
+  uboF32[85] = state.glazeWarm;
+  uboF32[86] = state.edgeFirstInk;
+  uboF32[87] = state.edgeFirstFade;
+  uboF32[88] = state.edgeFirstScale;
+  uboF32[89] = state.flowAmount;
+  uboU32[90] = state.dabsCount;
+  uboF32[91] = state.dabsReach;
+  uboF32[92] = state.dabsWobble;
+  uboF32[93] = state.densityGravity;
+  uboF32[94] = state.densitySmear;
+  uboF32[95] = state.paperGrain;
 
   device.queue.writeBuffer(uniformBuffer, 0, uboHost);
 }
@@ -1030,7 +1585,8 @@ function renderFrame() {
   if (!state.imgA && !state.imgB) return;
   writeUniforms();
 
-  const isAdvec = state.mode >= 10 && state.mode <= 14;
+  const isAdvec = (state.mode >= 10 && state.mode <= 14) || state.mode === 22;
+  const isRD = state.mode === 22;
   let finalState = null;
   const enc = device.createCommandEncoder();
 
@@ -1051,12 +1607,17 @@ function renderFrame() {
       advec.src = 'A';
       advec.lastT = 0;
       advec.needsReset = false;
-      const warm = Math.max(8, Math.round(state.advecSteps * 8));
+      // RD needs many more iterations than color advection to evolve tendrils.
+      const warm = isRD
+        ? Math.max(50, Math.round(state.moldSteps * state.t * 4))
+        : Math.max(8, Math.round(state.advecSteps * 8));
       for (let i = 0; i < warm; i++) {
         runSimStepInto(enc, state.t * ((i + 1) / warm));
       }
     } else {
-      const N = Math.max(1, Math.round(state.advecSteps));
+      const N = isRD
+        ? Math.max(1, Math.round(state.moldSteps))
+        : Math.max(1, Math.round(state.advecSteps));
       const startT = advec.lastT, endT = state.t;
       for (let i = 0; i < N; i++) {
         runSimStepInto(enc, startT + (endT - startT) * ((i + 1) / N));
@@ -1308,7 +1869,7 @@ const MODE_DEFAULTS = {
   4:  { diffStrength: 0.55, diffRadius: 0.45 },
   5:  { sedBands: 6, sedSoftness: 0.35, sedDirection: 0, sedSource: 0 },
   6:  { saltDensity: 0.0, saltContrast: 0.55, saltSource: 1, saltBias: 0.6, saltImage: 2 },
-  7:  { irisFocusX: 0.5, irisFocusY: 0.5, irisJitter: 0.35 },
+  7:  { irisFocusX: 0.5, irisFocusY: 0.5, irisJitter: 0.35, irisUniform: true },
   8:  { bleedFinger: 0.5, bleedAmount: 0.45, bleedHalo: 0.5 },
   9:  { runGravity: 0.5, runDrip: 0.35 },
   10: { advecVisc: 0.55, advecRate: 0.18, advecSteps: 3 },
@@ -1316,12 +1877,29 @@ const MODE_DEFAULTS = {
   12: { advecCurlStr: 0.5, advecCurlScale: 2.5 },
   13: { advecBrushFollow: 0.7 },
   14: { advecSeedCount: 5, advecSeedRadius: 0.45 },
+  15: {
+    weEdgeScale: 6.0, weEdgeWobble: 0.55,
+    weDryRing: 0.45, weBleed: 0.5,
+    weTendrilCount: 6, weTendrilReach: 0.4, weTendrilWidth: 0.5, weTendrilStrength: 0.55,
+    weDetailBias: 0.35,
+  },
+  16: { strokeScale: 6.0, strokeAniso: 4.0 },
+  17: { glazeBands: 3.0, glazeSoftness: 0.55, glazeDirection: 0, glazeWarm: 0.35 },
+  18: { edgeFirstInk: 0.55, edgeFirstFade: 0.35, edgeFirstScale: 3.0 },
+  19: { flowAmount: 0.55 },
+  20: { dabsCount: 28, dabsReach: 0.32, dabsWobble: 0.6 },
+  21: { densityGravity: 0.45, densitySmear: 0.45 },
+  22: { moldFeed: 0.039, moldKill: 0.065, moldSeedCount: 6, moldSeedRadius: 0.4, moldSteps: 30 },
+  23: { formStrokeCount: 32, formStrokeSize: 0.05, formStrokeWobble: 0.5 },
+  24: { bloomLightBias: 0.85, bloomWobble: 0.5, bloomPaperShow: 0.6 },
+  25: { stageBands: 4, stageOverlap: 0.5 },
+  26: { migrationStrength: 0.6, migrationDir: 0, migrationTurb: 0.5 },
 };
 function resetModeDefaults(modeId) {
   const d = MODE_DEFAULTS[modeId];
   if (!d) return;
   for (const [k, v] of Object.entries(d)) state[k] = v;
-  if (modeId >= 10 && modeId <= 14) advec.needsReset = true;
+  if ((modeId >= 10 && modeId <= 14) || modeId === 22) advec.needsReset = true;
   pane.refresh();
 }
 function addResetBtn(folder, modeId) {
@@ -1348,6 +1926,18 @@ fWater.addBinding(state, 'mode', {
     'curl-noise eddies':      12,
     'brush-channel advection': 13,
     'seed-point injection':   14,
+    'wet edge (rect ingress)': 15,
+    'stroke-follow':           16,
+    'tonal wash':              17,
+    'edge underdrawing':       18,
+    'painterly flow':          19,
+    'color-pool dabs':         20,
+    'wet-density gravity':     21,
+    'mold tendrils':           22,
+    'watercolor formation':    23,
+    'cauliflower bloom storm': 24,
+    'wet-stage layering':      25,
+    'pigment migration':       26,
   },
 }).on('change', () => { updateModeFolders(); advec.needsReset = true; });
 
@@ -1401,6 +1991,7 @@ fSalt.addBinding(state, 'saltBias',     { min: 0, max: 1, step: 0.01, label: 'bi
 addResetBtn(fSalt, 6);
 
 const fIris   = fWater.addFolder({ title: 'Iris',           expanded: true });
+fIris.addBinding(state, 'irisUniform', { label: 'uniform circle' });
 fIris.addBinding(state, 'irisFocusX', { min: 0, max: 1, step: 0.005, label: 'focus x' });
 fIris.addBinding(state, 'irisFocusY', { min: 0, max: 1, step: 0.005, label: 'focus y' });
 fIris.addBinding(state, 'irisJitter', { min: 0, max: 1, step: 0.01, label: 'jitter' });
@@ -1450,6 +2041,99 @@ fAdvecS.addBinding(state, 'advecSeedRadius', { min: 0.1, max: 1, step: 0.01, lab
 addResetBtn(fAdvecS, 14);
 fAdvecS.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
 
+const fWetEdge = fWater.addFolder({ title: 'Wet edge (rect)', expanded: true });
+fWetEdge.addBinding(state, 'weEdgeScale',       { min: 1,    max: 16, step: 0.1,  label: 'edge scale' });
+fWetEdge.addBinding(state, 'weEdgeWobble',      { min: 0,    max: 1,  step: 0.01, label: 'edge wobble' });
+fWetEdge.addBinding(state, 'weTendrilCount',    { min: 0,    max: 32, step: 1,    label: 'tendril count' });
+fWetEdge.addBinding(state, 'weTendrilReach',    { min: 0.02, max: 1,  step: 0.01, label: 'tendril reach' });
+fWetEdge.addBinding(state, 'weTendrilWidth',    { min: 0.02, max: 1,  step: 0.01, label: 'tendril width' });
+fWetEdge.addBinding(state, 'weTendrilStrength', { min: 0,    max: 1,  step: 0.01, label: 'tendril strength' });
+fWetEdge.addBinding(state, 'weDetailBias',      { min: 0,    max: 1,  step: 0.01, label: 'detail bias (A)' });
+fWetEdge.addBinding(state, 'weDryRing',         { min: 0,    max: 1,  step: 0.01, label: 'dry-ring dark' });
+fWetEdge.addBinding(state, 'weBleed',           { min: 0,    max: 1,  step: 0.01, label: 'anticipatory bleed' });
+addResetBtn(fWetEdge, 15);
+
+const fStroke = fWater.addFolder({ title: 'Stroke-follow', expanded: true });
+fStroke.addBinding(state, 'strokeScale', { min: 0.5, max: 20, step: 0.1, label: 'stroke scale' });
+fStroke.addBinding(state, 'strokeAniso', { min: 1,   max: 12, step: 0.1, label: 'anisotropy' });
+addResetBtn(fStroke, 16);
+
+const fGlaze = fWater.addFolder({ title: 'Tonal wash', expanded: true });
+fGlaze.addBinding(state, 'glazeBands',    { min: 2, max: 8, step: 1,    label: 'washes' });
+fGlaze.addBinding(state, 'glazeSoftness', { min: 0, max: 1, step: 0.01, label: 'softness' });
+fGlaze.addBinding(state, 'glazeDirection', {
+  label: 'order',
+  options: { 'darks first': 0, 'lights first': 1 },
+});
+fGlaze.addBinding(state, 'glazeWarm', { min: 0, max: 1, step: 0.01, label: 'warm dry-shift' });
+addResetBtn(fGlaze, 17);
+
+const fEdgeFirst = fWater.addFolder({ title: 'Edge underdrawing', expanded: true });
+fEdgeFirst.addBinding(state, 'edgeFirstInk',   { min: 0,    max: 1,  step: 0.01, label: 'ink' });
+fEdgeFirst.addBinding(state, 'edgeFirstFade',  { min: 0.05, max: 0.9, step: 0.01, label: 'sketch fades at t=' });
+fEdgeFirst.addBinding(state, 'edgeFirstScale', { min: 1,    max: 10, step: 0.1,  label: 'mask scale' });
+addResetBtn(fEdgeFirst, 18);
+
+const fFlow = fWater.addFolder({ title: 'Painterly flow', expanded: true });
+fFlow.addBinding(state, 'flowAmount', { min: 0, max: 1, step: 0.01, label: 'flow amount' });
+addResetBtn(fFlow, 19);
+
+const fDabs = fWater.addFolder({ title: 'Color-pool dabs', expanded: true });
+fDabs.addBinding(state, 'dabsCount',  { min: 1,    max: 128, step: 1,    label: 'dab count' });
+fDabs.addBinding(state, 'dabsReach',  { min: 0.05, max: 1,   step: 0.01, label: 'reach' });
+fDabs.addBinding(state, 'dabsWobble', { min: 0,    max: 1,   step: 0.01, label: 'edge wobble' });
+addResetBtn(fDabs, 20);
+
+const fDensity = fWater.addFolder({ title: 'Wet-density gravity', expanded: true });
+fDensity.addBinding(state, 'densityGravity', { min: 0, max: 1, step: 0.01, label: 'gravity bias' });
+fDensity.addBinding(state, 'densitySmear',   { min: 0, max: 1, step: 0.01, label: 'wet smear' });
+addResetBtn(fDensity, 21);
+
+const fMold = fWater.addFolder({ title: 'Mold tendrils (RD)', expanded: true });
+fMold.addBinding(state, 'moldFeed',       { min: 0.01, max: 0.08, step: 0.0005, label: 'feed rate' });
+fMold.addBinding(state, 'moldKill',       { min: 0.04, max: 0.075, step: 0.0005, label: 'kill rate' });
+fMold.addBinding(state, 'moldSeedCount',  { min: 1,    max: 24,   step: 1,     label: 'seed count' });
+fMold.addBinding(state, 'moldSeedRadius', { min: 0.05, max: 1,    step: 0.01,  label: 'seed radius' });
+fMold.addBinding(state, 'moldSteps',      { min: 5,    max: 80,   step: 1,     label: 'sim steps / frame' });
+addResetBtn(fMold, 22);
+fMold.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
+// Quick presets for the canonical Gray-Scott regimes.
+const moldPresets = fMold.addFolder({ title: 'Pattern preset', expanded: false });
+function applyMoldPreset(f, k) {
+  state.moldFeed = f; state.moldKill = k; advec.needsReset = true; pane.refresh();
+}
+moldPresets.addButton({ title: 'Branching tendrils' }).on('click', () => applyMoldPreset(0.039, 0.065));
+moldPresets.addButton({ title: 'Coral / fingerprint' })  .on('click', () => applyMoldPreset(0.055, 0.062));
+moldPresets.addButton({ title: 'Labyrinth / maze' })     .on('click', () => applyMoldPreset(0.029, 0.057));
+moldPresets.addButton({ title: 'Mitosis spots' })        .on('click', () => applyMoldPreset(0.0367, 0.0649));
+moldPresets.addButton({ title: 'Coral growth' })         .on('click', () => applyMoldPreset(0.0545, 0.062));
+
+const fForm = fWater.addFolder({ title: 'Watercolor formation', expanded: true });
+fForm.addBinding(state, 'formStrokeCount',  { min: 1,    max: 64,  step: 1,    label: 'stroke count' });
+fForm.addBinding(state, 'formStrokeSize',   { min: 0.01, max: 0.2, step: 0.005, label: 'stroke size' });
+fForm.addBinding(state, 'formStrokeWobble', { min: 0,    max: 1,   step: 0.01, label: 'edge wobble' });
+addResetBtn(fForm, 23);
+
+const fBloom = fWater.addFolder({ title: 'Cauliflower bloom storm', expanded: true });
+fBloom.addBinding(state, 'bloomLightBias',  { min: 0, max: 1, step: 0.01, label: 'light bias (B)' });
+fBloom.addBinding(state, 'bloomWobble',     { min: 0, max: 1, step: 0.01, label: 'bloom wobble' });
+fBloom.addBinding(state, 'bloomPaperShow',  { min: 0, max: 1, step: 0.01, label: 'paper-show pop' });
+addResetBtn(fBloom, 24);
+
+const fStage = fWater.addFolder({ title: 'Wet-stage layering', expanded: true });
+fStage.addBinding(state, 'stageBands',   { min: 2, max: 8, step: 1,    label: 'stages' });
+fStage.addBinding(state, 'stageOverlap', { min: 0, max: 1, step: 0.01, label: 'stage overlap' });
+addResetBtn(fStage, 25);
+
+const fMig = fWater.addFolder({ title: 'Pigment migration', expanded: true });
+fMig.addBinding(state, 'migrationStrength', { min: 0, max: 1, step: 0.01, label: 'strength' });
+fMig.addBinding(state, 'migrationDir', {
+  label: 'direction',
+  options: { 'along gradient': 0, 'perpendicular': 1 },
+});
+fMig.addBinding(state, 'migrationTurb', { min: 0, max: 1, step: 0.01, label: 'turbulence' });
+addResetBtn(fMig, 26);
+
 function updateModeFolders() {
   fRim.hidden    = state.mode !== 1;
   fPaper.hidden  = state.mode !== 2;
@@ -1465,6 +2149,18 @@ function updateModeFolders() {
   fAdvecC.hidden  = state.mode !== 12;
   fAdvecB.hidden  = state.mode !== 13;
   fAdvecS.hidden  = state.mode !== 14;
+  fWetEdge.hidden = state.mode !== 15;
+  fStroke.hidden    = state.mode !== 16;
+  fGlaze.hidden     = state.mode !== 17;
+  fEdgeFirst.hidden = state.mode !== 18;
+  fFlow.hidden      = state.mode !== 19;
+  fDabs.hidden      = state.mode !== 20;
+  fDensity.hidden   = state.mode !== 21;
+  fMold.hidden      = state.mode !== 22;
+  fForm.hidden      = state.mode !== 23;
+  fBloom.hidden     = state.mode !== 24;
+  fStage.hidden     = state.mode !== 25;
+  fMig.hidden       = state.mode !== 26;
 }
 updateModeFolders();
 
@@ -1520,7 +2216,10 @@ function encoderMaxDim(mime) {
 const MODE_NAMES_V2 = {
   0: 'off', 1: 'rim', 2: 'paper', 3: 'blooms', 4: 'diffusion',
   5: 'sediment', 6: 'salt', 7: 'iris', 8: 'wet-bleed', 9: 'pigment-run',
-  10: 'advec',
+  10: 'advec', 15: 'wet-edge',
+  16: 'stroke', 17: 'glaze', 18: 'edge-first', 19: 'flow', 20: 'dabs', 21: 'density',
+  22: 'mold',
+  23: 'wc-form', 24: 'bloom-storm', 25: 'wet-stage', 26: 'pig-migration',
 };
 const SED_SOURCE_NAMES = ['luma','sat','hue','detail','temp'];
 const SALT_SOURCE_NAMES = ['random','light','dark','col','edge'];
@@ -1535,10 +2234,23 @@ function makeFilenameV2() {
   else if (m === 4)  parts.push(`str=${fx(state.diffStrength)}`, `r=${fx(state.diffRadius)}`);
   else if (m === 5)  parts.push(`by=${SED_SOURCE_NAMES[state.sedSource] || 'luma'}`, `bands=${state.sedBands}`, `soft=${fx(state.sedSoftness)}`);
   else if (m === 6)  parts.push(`from=${SALT_SOURCE_NAMES[state.saltSource] || 'random'}`, `grain=${fx(state.saltDensity)}`, `bias=${fx(state.saltBias)}`);
-  else if (m === 7)  parts.push(`focus=${fx(state.irisFocusX)}-${fx(state.irisFocusY)}`, `jit=${fx(state.irisJitter)}`);
+  else if (m === 7)  parts.push(`focus=${fx(state.irisFocusX)}-${fx(state.irisFocusY)}`, `jit=${fx(state.irisJitter)}`, state.irisUniform ? 'uniform' : 'stretched');
   else if (m === 8)  parts.push(`fing=${fx(state.bleedFinger)}`, `amt=${fx(state.bleedAmount)}`, `halo=${fx(state.bleedHalo)}`);
   else if (m === 9)  parts.push(`grav=${fx(state.runGravity)}`, `drip=${fx(state.runDrip)}`);
   else if (m === 10) parts.push(`visc=${fx(state.advecVisc)}`, `rate=${fx(state.advecRate)}`);
+  else if (m === 15) parts.push(`wob=${fx(state.weEdgeWobble)}`, `tend=${state.weTendrilCount}`, `det=${fx(state.weDetailBias)}`, `ring=${fx(state.weDryRing)}`);
+  else if (m === 16) parts.push(`sc=${fx(state.strokeScale,1)}`, `aniso=${fx(state.strokeAniso,1)}`);
+  else if (m === 17) parts.push(`bands=${state.glazeBands}`, `soft=${fx(state.glazeSoftness)}`, state.glazeDirection ? 'lights-first' : 'darks-first', `warm=${fx(state.glazeWarm)}`);
+  else if (m === 18) parts.push(`ink=${fx(state.edgeFirstInk)}`, `fade=${fx(state.edgeFirstFade)}`);
+  else if (m === 19) parts.push(`flow=${fx(state.flowAmount)}`);
+  else if (m === 20) parts.push(`n=${state.dabsCount}`, `reach=${fx(state.dabsReach)}`, `wob=${fx(state.dabsWobble)}`);
+  else if (m === 21) parts.push(`grav=${fx(state.densityGravity)}`, `smear=${fx(state.densitySmear)}`);
+  else if (m === 22) parts.push(`f=${fx(state.moldFeed,3)}`, `k=${fx(state.moldKill,3)}`, `seeds=${state.moldSeedCount}`, `steps=${state.moldSteps}`);
+  else if (m === 23) parts.push(`n=${state.formStrokeCount}`, `sz=${fx(state.formStrokeSize)}`, `wob=${fx(state.formStrokeWobble)}`);
+  else if (m === 24) parts.push(`bias=${fx(state.bloomLightBias)}`, `wob=${fx(state.bloomWobble)}`, `paper=${fx(state.bloomPaperShow)}`);
+  else if (m === 25) parts.push(`bands=${state.stageBands}`, `over=${fx(state.stageOverlap)}`);
+  else if (m === 26) parts.push(`str=${fx(state.migrationStrength)}`, state.migrationDir ? 'perp' : 'along', `turb=${fx(state.migrationTurb)}`);
+  if (state.paperGrain > 0.001) parts.push(`paper=${fx(state.paperGrain)}`);
   // duration / fps / dimensions / pad are appended by the recorder using
   // the actual output values (after any encoder downscale).
   return `transition__${parts.join('__')}`;
@@ -1689,7 +2401,7 @@ async function startRecording(opts = {}) {
   const wasPlaying = state.playing;
   const prevT = state.t;
   state.playing = false;
-  if (state.mode >= 10 && state.mode <= 14) advec.needsReset = true;
+  if ((state.mode >= 10 && state.mode <= 14) || state.mode === 22) advec.needsReset = true;
 
   btnRecord.title = scale < 1
     ? `Scaled to ${offW}×${totalH}. Recording…`
@@ -1757,6 +2469,7 @@ fStyle.addBinding(state, 'fit', {
   options: { 'cover (crop)': 'cover', 'contain': 'contain', 'stretch': 'stretch' },
 });
 fStyle.addBinding(state, 'bg', { view: 'color' });
+fStyle.addBinding(state, 'paperGrain', { min: 0, max: 1, step: 0.01, label: 'paper grain' });
 
 // ----- Presets -----
 const PRESET_KEYS = [
@@ -1767,7 +2480,7 @@ const PRESET_KEYS = [
   'diffStrength', 'diffRadius',
   'sedBands', 'sedSoftness', 'sedDirection', 'sedSource',
   'saltDensity', 'saltContrast', 'saltSource', 'saltBias', 'saltImage',
-  'irisFocusX', 'irisFocusY', 'irisJitter',
+  'irisFocusX', 'irisFocusY', 'irisJitter', 'irisUniform',
   'bleedFinger', 'bleedAmount', 'bleedHalo',
   'runGravity', 'runDrip',
   'advecVisc', 'advecRate', 'advecSteps',
@@ -1775,6 +2488,21 @@ const PRESET_KEYS = [
   'advecCurlStr', 'advecCurlScale',
   'advecBrushFollow',
   'advecSeedCount', 'advecSeedRadius',
+  'weEdgeScale', 'weEdgeWobble', 'weDryRing', 'weBleed',
+  'weTendrilCount', 'weTendrilReach', 'weTendrilWidth', 'weTendrilStrength',
+  'weDetailBias',
+  'strokeScale', 'strokeAniso',
+  'glazeBands', 'glazeSoftness', 'glazeDirection', 'glazeWarm',
+  'edgeFirstInk', 'edgeFirstFade', 'edgeFirstScale',
+  'flowAmount',
+  'dabsCount', 'dabsReach', 'dabsWobble',
+  'densityGravity', 'densitySmear',
+  'paperGrain',
+  'moldFeed', 'moldKill', 'moldSeedCount', 'moldSeedRadius', 'moldSteps',
+  'formStrokeCount', 'formStrokeSize', 'formStrokeWobble',
+  'bloomLightBias', 'bloomWobble', 'bloomPaperShow',
+  'stageBands', 'stageOverlap',
+  'migrationStrength', 'migrationDir', 'migrationTurb',
   'organic', 'edges', 'spread', 'maskScale',
   'zoomA', 'panAx', 'panAy', 'zoomB', 'panBx', 'panBy',
 ];
@@ -1835,7 +2563,7 @@ function applyPreset(id) {
   const src = kind === 'factory' ? FACTORY_PRESETS[name] : loadUserPresets()[name];
   if (!src) return;
   for (const k of PRESET_KEYS) if (k in src) state[k] = src[k];
-  if (state.mode >= 10 && state.mode <= 14) advec.needsReset = true;
+  if ((state.mode >= 10 && state.mode <= 14) || state.mode === 22) advec.needsReset = true;
   pane.refresh();
   updateModeFolders();
 }
@@ -1912,7 +2640,7 @@ function loadSession() {
     padPresets._v = match !== undefined ? match : 0;
     pane.refresh();
     updateModeFolders();
-    if (state.mode >= 10 && state.mode <= 14) advec.needsReset = true;
+    if ((state.mode >= 10 && state.mode <= 14) || state.mode === 22) advec.needsReset = true;
   } catch {}
 }
 loadSession();
