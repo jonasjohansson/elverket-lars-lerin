@@ -6,6 +6,7 @@
 // subsequent milestones; right now only the default smooth dissolve runs.
 
 import { Pane } from 'tweakpane';
+import * as EssentialsPlugin from '@tweakpane/plugin-essentials';
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
 
 const canvas = document.getElementById('canvas');
@@ -26,10 +27,10 @@ device.addEventListener('uncapturederror', e => {
 });
 const ctx = canvas.getContext('webgpu');
 const presentationFormat = navigator.gpu.getPreferredCanvasFormat();
-ctx.configure({ device, format: presentationFormat, alphaMode: 'opaque' });
+ctx.configure({ device, format: presentationFormat, alphaMode: 'premultiplied' });
 
 const GPU_MAX_TEX = device.limits.maxTextureDimension2D;
-console.log('[transition-tool-v2] device limits.maxTextureDimension2D =', GPU_MAX_TEX);
+console.log('[transition-tool-v3] device limits.maxTextureDimension2D =', GPU_MAX_TEX);
 
 // ============================================================================
 // Shader (WGSL)
@@ -93,7 +94,9 @@ struct Params {
   stageBands: f32, stageOverlap: f32, _s1: f32, _s2: f32,
   migrationStrength: f32, migrationDir: u32, migrationTurb: f32, _m1: f32,
   boundsEnable: u32, boundsCx: f32, boundsCy: f32, boundsW: f32,
-  boundsH: f32, boundsSoftness: f32, weBLumaBias: f32, _bd2: f32,
+  boundsH: f32, boundsSoftness: f32, weBLumaBias: f32, maskShift: f32,
+  slotAColor: vec3f, keepAOutsideB: u32,
+  slotBColor: vec3f, _slotBPad: f32,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -154,8 +157,11 @@ fn fbm(q: vec2f) -> f32 {
 }
 fn luma(c: vec3f) -> f32 { return dot(c, vec3f(0.299, 0.587, 0.114)); }
 
-fn sampleFit(tex: texture_2d<f32>, uv: vec2f, scale: vec2f, offset: vec2f, valid: u32) -> vec4f {
+fn sampleFit(tex: texture_2d<f32>, uv: vec2f, scale: vec2f, offset: vec2f, valid: u32, color: vec3f) -> vec4f {
+  // valid encoding: 0 = no image (bg fallback), 1 = image, 2 = solid color, 3 = transparent.
   if (valid == 0u) { return vec4f(p.bg, 1.0); }
+  if (valid == 2u) { return vec4f(color, 1.0); }
+  if (valid == 3u) { return vec4f(0.0, 0.0, 0.0, 0.0); }
   let q = (uv - offset) / scale;
   if (q.x < 0.0 || q.x > 1.0 || q.y < 0.0 || q.y > 1.0) { return vec4f(p.bg, 1.0); }
   // textureSampleLevel avoids the uniform-control-flow requirement of
@@ -163,13 +169,13 @@ fn sampleFit(tex: texture_2d<f32>, uv: vec2f, scale: vec2f, offset: vec2f, valid
   return textureSampleLevel(tex, samp, q, 0.0);
 }
 
-fn edgeMag(tex: texture_2d<f32>, uv: vec2f, scale: vec2f, offset: vec2f, valid: u32) -> f32 {
+fn edgeMag(tex: texture_2d<f32>, uv: vec2f, scale: vec2f, offset: vec2f, valid: u32, color: vec3f) -> f32 {
   if (valid == 0u) { return 0.0; }
   let e = 0.0025;
-  let cx1 = luma(sampleFit(tex, uv + vec2f( e, 0.0), scale, offset, valid).rgb);
-  let cx2 = luma(sampleFit(tex, uv - vec2f( e, 0.0), scale, offset, valid).rgb);
-  let cy1 = luma(sampleFit(tex, uv + vec2f(0.0, e), scale, offset, valid).rgb);
-  let cy2 = luma(sampleFit(tex, uv - vec2f(0.0, e), scale, offset, valid).rgb);
+  let cx1 = luma(sampleFit(tex, uv + vec2f( e, 0.0), scale, offset, valid, color).rgb);
+  let cx2 = luma(sampleFit(tex, uv - vec2f( e, 0.0), scale, offset, valid, color).rgb);
+  let cy1 = luma(sampleFit(tex, uv + vec2f(0.0, e), scale, offset, valid, color).rgb);
+  let cy2 = luma(sampleFit(tex, uv - vec2f(0.0, e), scale, offset, valid, color).rgb);
   return clamp(length(vec2f(cx1 - cx2, cy1 - cy2)) * 4.0, 0.0, 1.0);
 }
 
@@ -229,8 +235,8 @@ fn sedimentMask(uv: vec2f, cA: vec3f, cB: vec3f) -> f32 {
     }
     v = h;
   } else if (p.sedSource == 3u) {             // edge detail
-    let eA = edgeMag(texA, uv, p.scaleA, p.offsetA, p.validA);
-    let eB = edgeMag(texB, uv, p.scaleB, p.offsetB, p.validB);
+    let eA = edgeMag(texA, uv, p.scaleA, p.offsetA, p.validA, p.slotAColor);
+    let eB = edgeMag(texB, uv, p.scaleB, p.offsetB, p.validB, p.slotBColor);
     v = max(eA, eB);
   } else {                                     // temperature
     v = clamp(0.5 + (src.r - src.b) * 0.7, 0.0, 1.0);
@@ -263,8 +269,8 @@ fn saltMask(uv: vec2f, cA: vec3f, cB: vec3f) -> f32 {
       let mn = min(min(src.r, src.g), src.b);
       prop = select(0.0, (mx - mn) / mx, mx > 1e-4);
     } else if (p.saltSource == 4u) {
-      let eA = edgeMag(texA, uv, p.scaleA, p.offsetA, p.validA);
-      let eB = edgeMag(texB, uv, p.scaleB, p.offsetB, p.validB);
+      let eA = edgeMag(texA, uv, p.scaleA, p.offsetA, p.validA, p.slotAColor);
+      let eB = edgeMag(texB, uv, p.scaleB, p.offsetB, p.validB, p.slotBColor);
       if (p.saltImage == 0u) { prop = eA; }
       else if (p.saltImage == 1u) { prop = eB; }
       else { prop = max(eA, eB); }
@@ -315,10 +321,10 @@ fn paperFiber(uv: vec2f) -> f32 {
 fn strokeFollowMask(uv: vec2f) -> f32 {
   // Local gradient of B's luma → perpendicular is the local stroke direction.
   let e = 0.003;
-  let gx = luma(sampleFit(texB, uv + vec2f( e, 0.0), p.scaleB, p.offsetB, p.validB).rgb)
-         - luma(sampleFit(texB, uv - vec2f( e, 0.0), p.scaleB, p.offsetB, p.validB).rgb);
-  let gy = luma(sampleFit(texB, uv + vec2f(0.0,  e), p.scaleB, p.offsetB, p.validB).rgb)
-         - luma(sampleFit(texB, uv - vec2f(0.0,  e), p.scaleB, p.offsetB, p.validB).rgb);
+  let gx = luma(sampleFit(texB, uv + vec2f( e, 0.0), p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb)
+         - luma(sampleFit(texB, uv - vec2f( e, 0.0), p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb);
+  let gy = luma(sampleFit(texB, uv + vec2f(0.0,  e), p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb)
+         - luma(sampleFit(texB, uv - vec2f(0.0,  e), p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb);
   let grad = vec2f(gx, gy);
   let glen = length(grad);
   let strokeDir = select(vec2f(1.0, 0.0), vec2f(-grad.y, grad.x) / glen, glen > 1e-4);
@@ -334,7 +340,7 @@ fn strokeFollowMask(uv: vec2f) -> f32 {
 }
 
 fn tonalGlazeMask(uv: vec2f) -> f32 {
-  let cB = sampleFit(texB, uv, p.scaleB, p.offsetB, p.validB);
+  let cB = sampleFit(texB, uv, p.scaleB, p.offsetB, p.validB, p.slotBColor);
   let L = luma(cB.rgb);
   let v = select(L, 1.0 - L, p.glazeDirection == 1u);
   let bands = max(2.0, p.glazeBands);
@@ -348,7 +354,7 @@ fn tonalGlazeMask(uv: vec2f) -> f32 {
 }
 
 fn edgeFirstMask(uv: vec2f) -> f32 {
-  let eB = edgeMag(texB, uv, p.scaleB, p.offsetB, p.validB);
+  let eB = edgeMag(texB, uv, p.scaleB, p.offsetB, p.validB, p.slotBColor);
   // Edges reveal early (low mask), flat areas reveal late.
   let base = clamp(1.0 - eB * 2.5, 0.0, 1.0);
   let wob = (fbm(uv * max(1.0, p.edgeFirstScale) + p.seed * 0.13) - 0.5) * 0.18;
@@ -375,7 +381,7 @@ fn dabsMask(uv: vec2f) -> f32 {
 }
 
 fn wetDensityMask(uv: vec2f) -> f32 {
-  let cB = sampleFit(texB, uv, p.scaleB, p.offsetB, p.validB);
+  let cB = sampleFit(texB, uv, p.scaleB, p.offsetB, p.validB, p.slotBColor);
   let mx = max(max(cB.r, cB.g), cB.b);
   let mn = min(min(cB.r, cB.g), cB.b);
   let sat = select(0.0, (mx - mn) / mx, mx > 1e-4);
@@ -466,10 +472,10 @@ fn watercolorFormationMask(uv: vec2f) -> f32 {
     let startT = hash21(vec2f(fi, 91.0)) * 0.7;
     // Orientation: perpendicular to B's gradient at the stroke origin.
     let e = 0.005;
-    let gx = luma(sampleFit(texB, sp + vec2f(e, 0.0), p.scaleB, p.offsetB, p.validB).rgb)
-           - luma(sampleFit(texB, sp - vec2f(e, 0.0), p.scaleB, p.offsetB, p.validB).rgb);
-    let gy = luma(sampleFit(texB, sp + vec2f(0.0, e), p.scaleB, p.offsetB, p.validB).rgb)
-           - luma(sampleFit(texB, sp - vec2f(0.0, e), p.scaleB, p.offsetB, p.validB).rgb);
+    let gx = luma(sampleFit(texB, sp + vec2f(e, 0.0), p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb)
+           - luma(sampleFit(texB, sp - vec2f(e, 0.0), p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb);
+    let gy = luma(sampleFit(texB, sp + vec2f(0.0, e), p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb)
+           - luma(sampleFit(texB, sp - vec2f(0.0, e), p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb);
     let grad = vec2f(gx, gy);
     let glen = length(grad);
     let strokeDir = select(vec2f(1.0, 0.0), vec2f(-grad.y, grad.x) / glen, glen > 1e-4);
@@ -495,7 +501,7 @@ fn watercolorFormationMask(uv: vec2f) -> f32 {
 fn cauliflowerBloomMask(uv: vec2f) -> f32 {
   // B's lightest pixels are the bloom origins (paper-show-through). Multi-octave
   // wobble breaks the iso-luma contours into cauliflower shapes.
-  let cB = sampleFit(texB, uv, p.scaleB, p.offsetB, p.validB);
+  let cB = sampleFit(texB, uv, p.scaleB, p.offsetB, p.validB, p.slotBColor);
   let L = luma(cB.rgb);
   let base = mix(0.5, 1.0 - L, p.bloomLightBias);
   let w1 = (fbm(uv * 2.0 + p.seed * 0.13) - 0.5) * 0.20 * p.bloomWobble;
@@ -507,7 +513,7 @@ fn cauliflowerBloomMask(uv: vec2f) -> f32 {
 
 fn wetStageMask(uv: vec2f) -> f32 {
   // Watercolor painting stages: lightest wash first, darkest accents last.
-  let cB = sampleFit(texB, uv, p.scaleB, p.offsetB, p.validB);
+  let cB = sampleFit(texB, uv, p.scaleB, p.offsetB, p.validB, p.slotBColor);
   let L = luma(cB.rgb);
   let v = 1.0 - L;
   let bands = max(2.0, p.stageBands);
@@ -576,19 +582,19 @@ fn wetEdgeMask(uv: vec2f) -> f32 {
 
   // Detail bias — A's high-detail regions reveal earlier (paint hangs in soft areas).
   if (p.weDetailBias > 0.001) {
-    let eA = edgeMag(texA, uv, p.scaleA, p.offsetA, p.validA);
+    let eA = edgeMag(texA, uv, p.scaleA, p.offsetA, p.validA, p.slotAColor);
     m = m - eA * p.weDetailBias * 0.35;
   }
 
   // B detail bias — front "reaches toward" B's focal points so they reveal first.
   if (p.weBDetailBias > 0.001) {
-    let eB = edgeMag(texB, uv, p.scaleB, p.offsetB, p.validB);
+    let eB = edgeMag(texB, uv, p.scaleB, p.offsetB, p.validB, p.slotBColor);
     m = m - eB * p.weBDetailBias * 0.35;
   }
 
   // B luma bias — positive: dark areas of B reveal first; negative: lights first.
   if (abs(p.weBLumaBias) > 0.001) {
-    let lB = luma(sampleFit(texB, uv, p.scaleB, p.offsetB, p.validB).rgb);
+    let lB = luma(sampleFit(texB, uv, p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb);
     m = m - (lB - 0.5) * p.weBLumaBias * 0.5;
   }
 
@@ -624,8 +630,8 @@ fn organicMask(uv: vec2f, lA: f32, lB: f32, edge: f32) -> f32 {
   let t = tCurve * (1.0 + 2.0 * sp) - sp;
   let env = pow(sin(3.14159265 * clamp(p.t, 0.0, 1.0)), 0.85);
 
-  let cA = sampleFit(texA, uv, p.scaleA, p.offsetA, p.validA);
-  let cB = sampleFit(texB, uv, p.scaleB, p.offsetB, p.validB);
+  let cA = sampleFit(texA, uv, p.scaleA, p.offsetA, p.validA, p.slotAColor);
+  let cB = sampleFit(texB, uv, p.scaleB, p.offsetB, p.validB, p.slotBColor);
   let lA = luma(cA.rgb);
   let lB = luma(cB.rgb);
 
@@ -679,11 +685,16 @@ fn organicMask(uv: vec2f, lA: f32, lB: f32, edge: f32) -> f32 {
     let grain = (vnoise(uv * 120.0 + p.seed * 1.7) - 0.5) * 0.04;
     mask = clamp(n + grain, 0.0, 1.0);
   } else {
-    let eA = edgeMag(texA, uv, p.scaleA, p.offsetA, p.validA);
-    let eB = edgeMag(texB, uv, p.scaleB, p.offsetB, p.validB);
+    let eA = edgeMag(texA, uv, p.scaleA, p.offsetA, p.validA, p.slotAColor);
+    let eB = edgeMag(texB, uv, p.scaleB, p.offsetB, p.validB, p.slotBColor);
     mask = organicMask(uv, lA, lB, max(eA, eB));
   }
 
+  // Global mask shift: lets the user rebalance any mode's mask distribution
+  // earlier (negative) or later (positive) without touching its inner logic.
+  // Useful for image-driven masks whose values cluster around the source's
+  // tonal distribution rather than spreading evenly across [0,1].
+  mask = clamp(mask + p.maskShift, 0.0, 1.0);
   var mixT = clamp(smoothstep(mask - sp, mask + sp, t), 0.0, 1.0);
 
   // ---- wet diffusion (mode 4): anticipatory tint of B into A ----
@@ -692,12 +703,12 @@ fn organicMask(uv: vec2f, lA: f32, lB: f32, edge: f32) -> f32 {
   if (p.mode == 15u && p.weBleed > 0.001) {
     let anticipate = smoothstep(mask - 0.35, mask + 0.05, t);
     let bR = 0.02;
-    var acc = sampleFit(texB, uv, p.scaleB, p.offsetB, p.validB).rgb;
+    var acc = sampleFit(texB, uv, p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb;
     var wsum = 1.0;
     for (var i = 0u; i < 6u; i = i + 1u) {
       let a = f32(i) * (6.2831853 / 6.0) + p.seed * 0.017;
       let d = vec2f(cos(a), sin(a));
-      acc = acc + sampleFit(texB, uv + d * bR, p.scaleB, p.offsetB, p.validB).rgb;
+      acc = acc + sampleFit(texB, uv + d * bR, p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb;
       wsum = wsum + 1.0;
     }
     let bleedB = acc / wsum;
@@ -708,14 +719,14 @@ fn organicMask(uv: vec2f, lA: f32, lB: f32, edge: f32) -> f32 {
     let anticipate = smoothstep(mask - 0.45, mask + 0.05, t);
     let bR = 0.025 + p.diffRadius * 0.08;
     // simple 12-tap soft blur of B
-    var acc = sampleFit(texB, uv, p.scaleB, p.offsetB, p.validB).rgb * 0.35;
+    var acc = sampleFit(texB, uv, p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb * 0.35;
     var wsum = 0.35;
     for (var i = 0u; i < 12u; i = i + 1u) {
       let a = f32(i) * (6.2831853 / 12.0) + p.seed * 0.013;
       let d = vec2f(cos(a), sin(a));
       let rr = select(0.55, 1.0, (i % 2u) == 0u);
       let w = 1.0 - rr * 0.45;
-      acc = acc + sampleFit(texB, uv + d * rr * bR, p.scaleB, p.offsetB, p.validB).rgb * w;
+      acc = acc + sampleFit(texB, uv + d * rr * bR, p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb * w;
       wsum = wsum + w;
     }
     let bleedB = acc / wsum;
@@ -728,10 +739,10 @@ fn organicMask(uv: vec2f, lA: f32, lB: f32, edge: f32) -> f32 {
   var cB_eff = cB.rgb;
   if (p.mode == 19u) {
     let ee = 0.005;
-    let gx = luma(sampleFit(texB, uv + vec2f( ee, 0.0), p.scaleB, p.offsetB, p.validB).rgb)
-           - luma(sampleFit(texB, uv - vec2f( ee, 0.0), p.scaleB, p.offsetB, p.validB).rgb);
-    let gy = luma(sampleFit(texB, uv + vec2f(0.0,  ee), p.scaleB, p.offsetB, p.validB).rgb)
-           - luma(sampleFit(texB, uv - vec2f(0.0,  ee), p.scaleB, p.offsetB, p.validB).rgb);
+    let gx = luma(sampleFit(texB, uv + vec2f( ee, 0.0), p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb)
+           - luma(sampleFit(texB, uv - vec2f( ee, 0.0), p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb);
+    let gy = luma(sampleFit(texB, uv + vec2f(0.0,  ee), p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb)
+           - luma(sampleFit(texB, uv - vec2f(0.0,  ee), p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb);
     let grad = vec2f(gx, gy);
     let glen = length(grad);
     if (glen > 1e-4) {
@@ -739,7 +750,7 @@ fn organicMask(uv: vec2f, lA: f32, lB: f32, edge: f32) -> f32 {
       let baseAmt = (1.0 - tCurve) * p.flowAmount * 0.18;
       // Wobble the warp amount so streaks aren't uniform — analog feel.
       let wob = (fbm(uv * 4.0 + p.seed * 0.21) - 0.5) * 0.5;
-      cB_eff = sampleFit(texB, uv + flowDir * baseAmt * (1.0 + wob), p.scaleB, p.offsetB, p.validB).rgb;
+      cB_eff = sampleFit(texB, uv + flowDir * baseAmt * (1.0 + wob), p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb;
     }
   }
 
@@ -748,10 +759,10 @@ fn organicMask(uv: vec2f, lA: f32, lB: f32, edge: f32) -> f32 {
   // "flows into place".
   if (p.mode == 26u) {
     let ee = 0.005;
-    let gx = luma(sampleFit(texB, uv + vec2f( ee, 0.0), p.scaleB, p.offsetB, p.validB).rgb)
-           - luma(sampleFit(texB, uv - vec2f( ee, 0.0), p.scaleB, p.offsetB, p.validB).rgb);
-    let gy = luma(sampleFit(texB, uv + vec2f(0.0,  ee), p.scaleB, p.offsetB, p.validB).rgb)
-           - luma(sampleFit(texB, uv - vec2f(0.0,  ee), p.scaleB, p.offsetB, p.validB).rgb);
+    let gx = luma(sampleFit(texB, uv + vec2f( ee, 0.0), p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb)
+           - luma(sampleFit(texB, uv - vec2f( ee, 0.0), p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb);
+    let gy = luma(sampleFit(texB, uv + vec2f(0.0,  ee), p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb)
+           - luma(sampleFit(texB, uv - vec2f(0.0,  ee), p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb);
     let grad = vec2f(gx, gy);
     let glen = length(grad);
     if (glen > 1e-4) {
@@ -761,7 +772,7 @@ fn organicMask(uv: vec2f, lA: f32, lB: f32, edge: f32) -> f32 {
       let turb1 = (fbm(uv * 3.0  + p.seed * 0.21) - 0.5) * 0.6;
       let turb2 = (fbm(uv * 12.0 + p.seed * 0.47) - 0.5) * 0.3;
       let turbMul = 1.0 + (turb1 + turb2) * p.migrationTurb;
-      cB_eff = sampleFit(texB, uv + dirAlong * baseAmt * turbMul, p.scaleB, p.offsetB, p.validB).rgb;
+      cB_eff = sampleFit(texB, uv + dirAlong * baseAmt * turbMul, p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb;
     }
   }
 
@@ -812,13 +823,13 @@ fn organicMask(uv: vec2f, lA: f32, lB: f32, edge: f32) -> f32 {
   // ---- pigment run drip (mode 9) ----
   if (p.mode == 9u && p.runDrip > 0.001 && env > 0.02 && t > mask) {
     let dripBand = exp(-pow((t - mask) / 0.08, 2.0));
-    let dripB = sampleFit(texB, uv + vec2f(0.0, p.runDrip * 0.05), p.scaleB, p.offsetB, p.validB).rgb;
+    let dripB = sampleFit(texB, uv + vec2f(0.0, p.runDrip * 0.05), p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb;
     outc = mix(outc, dripB, dripBand * p.runDrip * env * 0.35);
   }
 
   // ---- edge underdrawing sketch overlay (mode 18) ----
   if (p.mode == 18u && p.edgeFirstInk > 0.001) {
-    let eB = edgeMag(texB, uv, p.scaleB, p.offsetB, p.validB);
+    let eB = edgeMag(texB, uv, p.scaleB, p.offsetB, p.validB, p.slotBColor);
     // Ink ramps in fast, then fades as color floods in.
     let inUp = smoothstep(0.0, 0.18, p.t);
     let inDn = 1.0 - smoothstep(p.edgeFirstFade, p.edgeFirstFade + 0.18, p.t);
@@ -830,7 +841,7 @@ fn organicMask(uv: vec2f, lA: f32, lB: f32, edge: f32) -> f32 {
   // ---- wet-density vertical smear (mode 21) ----
   if (p.mode == 21u && p.densitySmear > 0.001 && env > 0.02) {
     let anticipate = smoothstep(mask - 0.25, mask + 0.05, t) * (1.0 - mixT);
-    let smearB = sampleFit(texB, uv - vec2f(0.0, 0.025), p.scaleB, p.offsetB, p.validB).rgb;
+    let smearB = sampleFit(texB, uv - vec2f(0.0, 0.025), p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb;
     outc = mix(outc, smearB, anticipate * p.densitySmear * env * 0.5);
   }
 
@@ -880,7 +891,24 @@ fn organicMask(uv: vec2f, lA: f32, lB: f32, edge: f32) -> f32 {
     outc = mix(outc, warmShift, p.paperGrain * 0.15);
   }
 
-  return vec4f(clamp(outc, vec3f(0.0), vec3f(1.0)), 1.0);
+  // Keep A as unchanged background outside B's rect when toggled — useful when
+  // B is smaller than the canvas (e.g. contained / zoomed-out).
+  var effMixT = mixT;
+  if (p.keepAOutsideB == 1u) {
+    let q = (uv - p.offsetB) / p.scaleB;
+    if (q.x < 0.0 || q.x > 1.0 || q.y < 0.0 || q.y > 1.0) {
+      outc = cA.rgb;
+      effMixT = 0.0;
+    }
+  }
+  // Per-slot alpha: 0 when that slot is in 'transparent' mode (valid==3u), 1 otherwise.
+  // Final alpha mixes the same way as RGB; output premultiplied for correct
+  // canvas compositing and AE imports.
+  let alphaA = select(1.0, 0.0, p.validA == 3u);
+  let alphaB = select(1.0, 0.0, p.validB == 3u);
+  let alpha = mix(alphaA, alphaB, effMixT);
+  let rgb = clamp(outc, vec3f(0.0), vec3f(1.0));
+  return vec4f(rgb * alpha, alpha);
 }
 `;
 
@@ -950,7 +978,9 @@ struct Params {
   stageBands: f32, stageOverlap: f32, _s1: f32, _s2: f32,
   migrationStrength: f32, migrationDir: u32, migrationTurb: f32, _m1: f32,
   boundsEnable: u32, boundsCx: f32, boundsCy: f32, boundsW: f32,
-  boundsH: f32, boundsSoftness: f32, weBLumaBias: f32, _bd2: f32,
+  boundsH: f32, boundsSoftness: f32, weBLumaBias: f32, maskShift: f32,
+  slotAColor: vec3f, keepAOutsideB: u32,
+  slotBColor: vec3f, _slotBPad: f32,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -994,8 +1024,10 @@ fn fbm(q: vec2f) -> f32 {
   return v;
 }
 fn luma(c: vec3f) -> f32 { return dot(c, vec3f(0.299, 0.587, 0.114)); }
-fn sampleFit(tex: texture_2d<f32>, uv: vec2f, scale: vec2f, offset: vec2f, valid: u32) -> vec4f {
+fn sampleFit(tex: texture_2d<f32>, uv: vec2f, scale: vec2f, offset: vec2f, valid: u32, color: vec3f) -> vec4f {
   if (valid == 0u) { return vec4f(p.bg, 1.0); }
+  if (valid == 2u) { return vec4f(color, 1.0); }
+  if (valid == 3u) { return vec4f(0.0, 0.0, 0.0, 0.0); }
   let q = (uv - offset) / scale;
   if (q.x < 0.0 || q.x > 1.0 || q.y < 0.0 || q.y > 1.0) { return vec4f(p.bg, 1.0); }
   return textureSampleLevel(tex, samp, q, 0.0);
@@ -1016,8 +1048,8 @@ fn curlField(uv: vec2f) -> vec2f {
   let dims = vec2f(textureDimensions(stateIn));
   let px = 1.0 / dims;
 
-  let cA = sampleFit(texA, uv, p.scaleA, p.offsetA, p.validA);
-  let cB = sampleFit(texB, uv, p.scaleB, p.offsetB, p.validB);
+  let cA = sampleFit(texA, uv, p.scaleA, p.offsetA, p.validA, p.slotAColor);
+  let cB = sampleFit(texB, uv, p.scaleB, p.offsetB, p.validB, p.slotBColor);
   let lA = luma(cA.rgb); let lB = luma(cB.rgb);
 
   // ---- read previous state, optionally pre-advected (variant 2: curl) ----
@@ -1059,10 +1091,10 @@ fn curlField(uv: vec2f) -> vec2f {
   } else if (p.advVariant == 3u) {
     // Brush-channel: diffusion along A's local stroke direction.
     let e = 0.003;
-    let gx = luma(sampleFit(texA, uv + vec2f(e, 0.0), p.scaleA, p.offsetA, p.validA).rgb) -
-             luma(sampleFit(texA, uv - vec2f(e, 0.0), p.scaleA, p.offsetA, p.validA).rgb);
-    let gy = luma(sampleFit(texA, uv + vec2f(0.0, e), p.scaleA, p.offsetA, p.validA).rgb) -
-             luma(sampleFit(texA, uv - vec2f(0.0, e), p.scaleA, p.offsetA, p.validA).rgb);
+    let gx = luma(sampleFit(texA, uv + vec2f(e, 0.0), p.scaleA, p.offsetA, p.validA, p.slotAColor).rgb) -
+             luma(sampleFit(texA, uv - vec2f(e, 0.0), p.scaleA, p.offsetA, p.validA, p.slotAColor).rgb);
+    let gy = luma(sampleFit(texA, uv + vec2f(0.0, e), p.scaleA, p.offsetA, p.validA, p.slotAColor).rgb) -
+             luma(sampleFit(texA, uv - vec2f(0.0, e), p.scaleA, p.offsetA, p.validA, p.slotAColor).rgb);
     let grad = vec2f(gx, gy);
     let glen = length(grad);
     let sd = select(vec2f(1.0, 0.0), vec2f(-grad.y, grad.x) / glen, glen > 1e-4);
@@ -1161,7 +1193,9 @@ struct Params {
   stageBands: f32, stageOverlap: f32, _s1: f32, _s2: f32,
   migrationStrength: f32, migrationDir: u32, migrationTurb: f32, _m1: f32,
   boundsEnable: u32, boundsCx: f32, boundsCy: f32, boundsW: f32,
-  boundsH: f32, boundsSoftness: f32, weBLumaBias: f32, _bd2: f32,
+  boundsH: f32, boundsSoftness: f32, weBLumaBias: f32, maskShift: f32,
+  slotAColor: vec3f, keepAOutsideB: u32,
+  slotBColor: vec3f, _slotBPad: f32,
 };
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var texA: texture_2d<f32>;
@@ -1269,7 +1303,7 @@ function makeDisplayBindGroup(finalState) {
 //   5  seed         13  scaleB.y                                          29 bloomCount     37 saltContrast
 //   6  validA       14  offsetB.x                                         30 bloomRim       38 saltBias
 //   7  validB       15  offsetB.y                                         31 bloomRate      39 saltImage
-const UBO_SIZE = 480;
+const UBO_SIZE = 512;
 const uniformBuffer = device.createBuffer({
   size: UBO_SIZE,
   usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -1406,6 +1440,14 @@ const state = {
   migrationStrength: 0.6, migrationDir: 0, migrationTurb: 0.5,
   // global transition bounds (Style folder)
   boundsEnable: false, boundsCx: 0.5, boundsCy: 0.5, boundsW: 0.6, boundsH: 0.6, boundsSoftness: 0.03,
+  // global mask timing shift (Dissolve folder)
+  maskShift: 0,
+  // per-slot fill modes: 'image' | 'solid' | 'transparent' (alpha output)
+  slotAFillMode: 'image', slotAColor: '#000000',
+  slotBFillMode: 'image', slotBColor: '#000000',
+  // When on, anything outside B's rect stays as unmodified A — useful when B
+  // is smaller than the canvas and you want A as a persistent background.
+  keepAOutsideB: false,
   // style / framing
   fit: 'cover',
   bg: '#000000',
@@ -1422,8 +1464,16 @@ function fitInfo(img, cw, ch, mode) {
   const ca = cw / ch;
   if (mode === 'stretch') return { sx: 1, sy: 1, ox: 0, oy: 0 };
   if (mode === 'cover') {
-    if (ia > ca) { const sx = ca / ia; return { sx, sy: 1, ox: (1 - sx) * 0.5, oy: 0 }; }
-    const sy = ia / ca; return { sx: 1, sy, ox: 0, oy: (1 - sy) * 0.5 };
+    // True cover: scale image so the smaller-relative axis matches the canvas,
+    // the larger axis extends past the canvas and gets cropped. Aspect preserved.
+    if (ia > ca) {
+      // Image wider than canvas → match canvas height, image overhangs left/right.
+      const sx = ia / ca;
+      return { sx, sy: 1, ox: (1 - sx) * 0.5, oy: 0 };
+    }
+    // Image more square / taller than canvas → match canvas width, overhangs top/bottom.
+    const sy = ca / ia;
+    return { sx: 1, sy, ox: 0, oy: (1 - sy) * 0.5 };
   }
   // contain
   if (ia > ca) { const sy = ca / ia; return { sx: 1, sy, ox: 0, oy: (1 - sy) * 0.5 }; }
@@ -1444,7 +1494,12 @@ function composedFit(slot, cw, ch) {
 
 function resizeCanvas() {
   if (!state.imgA && !state.imgB) return;
-  const ref = state.imgA || state.imgB;
+  // Size to whichever slot is actually rendering an image. When A is solid /
+  // transparent the canvas snaps to B's dimensions so the recorder exports at
+  // B's exact size (and vice versa).
+  const aReal = state.slotAFillMode === 'image' && state.imgA;
+  const bReal = state.slotBFillMode === 'image' && state.imgB;
+  const ref = aReal ? state.imgA : (bReal ? state.imgB : (state.imgA || state.imgB));
   const minimized = document.body.classList.contains('minimized');
   const sidePanel = minimized ? 0 : 360;
   const padding = minimized ? 0 : 32;
@@ -1483,8 +1538,9 @@ function writeUniforms() {
   uboF32[3]  = state.edges;
   uboF32[4]  = state.maskScale;
   uboF32[5]  = state.seed;
-  uboU32[6]  = state.imgA ? 1 : 0;
-  uboU32[7]  = state.imgB ? 1 : 0;
+  // valid encoding: 0=no image (bg), 1=image, 2=solid color, 3=transparent.
+  uboU32[6]  = state.slotAFillMode === 'solid' ? 2 : state.slotAFillMode === 'transparent' ? 3 : (state.imgA ? 1 : 0);
+  uboU32[7]  = state.slotBFillMode === 'solid' ? 2 : state.slotBFillMode === 'transparent' ? 3 : (state.imgB ? 1 : 0);
   // -- 8..15 --
   uboF32[8]  = fA.sx; uboF32[9]  = fA.sy;
   uboF32[10] = fA.ox; uboF32[11] = fA.oy;
@@ -1592,7 +1648,13 @@ function writeUniforms() {
   uboF32[116] = state.boundsH;
   uboF32[117] = state.boundsSoftness;
   uboF32[118] = state.weBLumaBias;
-  uboF32[119] = 0;
+  uboF32[119] = state.maskShift;
+  // -- 120..127 -- per-slot solid colors (used when fill mode = 'solid')
+  const ca = hexToRgb(state.slotAColor);
+  const cb = hexToRgb(state.slotBColor);
+  uboF32[120] = ca[0]; uboF32[121] = ca[1]; uboF32[122] = ca[2];
+  uboU32[123] = state.keepAOutsideB ? 1 : 0;
+  uboF32[124] = cb[0]; uboF32[125] = cb[1]; uboF32[126] = cb[2]; uboF32[127] = 0;
   // -- 80..95 -- new painterly modes (16..21) + global paper grain
   uboF32[80] = state.strokeScale;
   uboF32[81] = state.strokeAniso;
@@ -1631,7 +1693,7 @@ function render() {
         state.reverse = !state.reverse;
       } else {
         pT = 1; state.playing = false;
-        if (typeof btnPlay !== 'undefined') btnPlay.title = 'Play';
+        if (typeof updateTransportLabels !== 'undefined') updateTransportLabels();
       }
     }
     state.t = state.reverse ? (1 - pT) : pT;
@@ -1736,13 +1798,22 @@ filepicker.addEventListener('change', e => {
   e.target.value = '';
 });
 
-// IndexedDB persistence: remember the last A and B blobs across sessions.
-const IDB_NAME = 'transition-tool';
+// IndexedDB: 'images' tracks the last A/B (key 'imageA'/'imageB'); 'library'
+// is the persistent gallery of every image the user has ever loaded.
+const IDB_NAME = 'transition-tool-v3';
 const IDB_STORE = 'images';
+const IDB_LIB_STORE = 'library';
 function idbOpen() {
   return new Promise((resolve, reject) => {
     const r = indexedDB.open(IDB_NAME, 1);
-    r.onupgradeneeded = () => r.result.createObjectStore(IDB_STORE);
+    r.onupgradeneeded = () => {
+      const db = r.result;
+      if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE);
+      if (!db.objectStoreNames.contains(IDB_LIB_STORE)) {
+        const store = db.createObjectStore(IDB_LIB_STORE, { keyPath: 'id', autoIncrement: true });
+        store.createIndex('addedAt', 'addedAt');
+      }
+    };
     r.onsuccess = () => resolve(r.result);
     r.onerror = () => reject(r.error);
   });
@@ -1780,11 +1851,137 @@ async function idbClearAll() {
   } catch {}
 }
 
+// ---- library store (persistent gallery of all uploaded images) ----
+async function libList() {
+  try {
+    const db = await idbOpen();
+    return await new Promise((resolve, reject) => {
+      const tx  = db.transaction(IDB_LIB_STORE, 'readonly');
+      const req = tx.objectStore(IDB_LIB_STORE).getAll();
+      req.onsuccess = () => resolve((req.result || []).sort((a, b) => b.addedAt - a.addedAt));
+      req.onerror = () => reject(req.error);
+    });
+  } catch { return []; }
+}
+async function libAdd(entry) {
+  try {
+    const db = await idbOpen();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_LIB_STORE, 'readwrite');
+      const req = tx.objectStore(IDB_LIB_STORE).add(entry);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  } catch { return null; }
+}
+async function libDelete(id) {
+  try {
+    const db = await idbOpen();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_LIB_STORE, 'readwrite');
+      tx.objectStore(IDB_LIB_STORE).delete(id);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {}
+}
+// Generate a small JPEG thumbnail (~256px wide) from any image blob/file.
+async function makeThumb(blob, maxW = 256) {
+  try {
+    const bmp = await createImageBitmap(blob);
+    const w = Math.min(maxW, bmp.width);
+    const h = Math.round(w * bmp.height / bmp.width);
+    const c = (typeof OffscreenCanvas !== 'undefined')
+      ? new OffscreenCanvas(w, h)
+      : Object.assign(document.createElement('canvas'), { width: w, height: h });
+    c.getContext('2d').drawImage(bmp, 0, 0, w, h);
+    bmp.close?.();
+    if (c.convertToBlob) return await c.convertToBlob({ type: 'image/jpeg', quality: 0.78 });
+    return await new Promise(r => c.toBlob(r, 'image/jpeg', 0.78));
+  } catch { return null; }
+}
+
 function loadFile(file, slot) {
   if (!file.type.startsWith('image/')) return;
   idbPut(slot === 'A' ? 'imageA' : 'imageB', file);  // persist the blob
   loadFromUrl(URL.createObjectURL(file), slot);
+  // Also persist into the library (one entry per new file).
+  addToLibrary(file).then(() => renderLibrary());
 }
+async function addToLibrary(file) {
+  const thumb = await makeThumb(file, 256);
+  if (!thumb) return null;
+  return libAdd({
+    blob: file,
+    thumb,
+    addedAt: Date.now(),
+    name: file.name || 'untitled',
+  });
+}
+
+// ---- library UI ----
+const libGridEl = document.getElementById('library-grid');
+const _libThumbUrls = new Map();  // id -> object URL (revoked on re-render)
+let _libCache = [];
+
+function libRevokeAll() {
+  for (const url of _libThumbUrls.values()) URL.revokeObjectURL(url);
+  _libThumbUrls.clear();
+}
+function activeBlobIds() {
+  // Track which library entries correspond to the slots' current images. We
+  // compare by blob identity since loadFile keeps a single source-of-truth.
+  return { A: state._libIdA || null, B: state._libIdB || null };
+}
+async function renderLibrary() {
+  _libCache = await libList();
+  libRevokeAll();
+  libGridEl.innerHTML = '';
+  if (_libCache.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'library-empty';
+    empty.textContent = 'drop or pick images into A/B — they show here';
+    libGridEl.appendChild(empty);
+    return;
+  }
+  const { A: idA, B: idB } = activeBlobIds();
+  for (const entry of _libCache) {
+    const url = URL.createObjectURL(entry.thumb);
+    _libThumbUrls.set(entry.id, url);
+    const tile = document.createElement('div');
+    tile.className = 'library-thumb' + (entry.id === idA ? ' in-A' : '') + (entry.id === idB ? ' in-B' : '');
+    tile.title = `${entry.name}\nclick = A · shift-click = B · right-click to delete`;
+    tile.dataset.libId = entry.id;
+    const img = document.createElement('img');
+    img.src = url;
+    tile.appendChild(img);
+    libGridEl.appendChild(tile);
+  }
+}
+libGridEl.addEventListener('click', e => {
+  const tile = e.target.closest('.library-thumb');
+  if (!tile) return;
+  const id = parseInt(tile.dataset.libId, 10);
+  const entry = _libCache.find(x => x.id === id);
+  if (!entry) return;
+  const slot = e.shiftKey ? 'B' : 'A';
+  // Don't recurse through loadFile's addToLibrary — load directly + persist as last-A/B.
+  state['_libId' + slot] = id;
+  idbPut(slot === 'A' ? 'imageA' : 'imageB', entry.blob);
+  loadFromUrl(URL.createObjectURL(entry.blob), slot);
+  renderLibrary();
+});
+libGridEl.addEventListener('contextmenu', async e => {
+  const tile = e.target.closest('.library-thumb');
+  if (!tile) return;
+  e.preventDefault();
+  const id = parseInt(tile.dataset.libId, 10);
+  if (!confirm('Delete this image from the library?')) return;
+  await libDelete(id);
+  if (state._libIdA === id) state._libIdA = null;
+  if (state._libIdB === id) state._libIdB = null;
+  renderLibrary();
+});
 function loadFromUrl(url, slot) {
   const img = new Image();
   img.crossOrigin = 'anonymous';
@@ -1814,14 +2011,28 @@ function maybeAutoplay() {
   state.playing = true;
   state.t = 0;
   state.startTime = performance.now();
-  if (typeof btnPlay !== 'undefined') btnPlay.title = 'Pause';
+  if (typeof updateTransportLabels !== 'undefined') updateTransportLabels();
 }
 // On startup: try to restore persisted A/B from IndexedDB; fall back to the
-// bundled defaults if a slot has nothing stored.
+// bundled defaults if a slot has nothing stored. Then render the library grid.
+async function seedLibraryWithDefaultsIfEmpty() {
+  const list = await libList();
+  if (list.length > 0) return;
+  for (const path of ['./defaults/lofoten_A.jpg', './defaults/lofoten_B.jpg']) {
+    try {
+      const resp = await fetch(path);
+      if (!resp.ok) continue;
+      const blob = await resp.blob();
+      await addToLibrary(new File([blob], path.split('/').pop(), { type: blob.type }));
+    } catch {}
+  }
+}
 (async () => {
   const [blobA, blobB] = await Promise.all([idbGet('imageA'), idbGet('imageB')]);
   loadFromUrl(blobA ? URL.createObjectURL(blobA) : './defaults/lofoten_A.jpg', 'A');
   loadFromUrl(blobB ? URL.createObjectURL(blobB) : './defaults/lofoten_B.jpg', 'B');
+  await seedLibraryWithDefaultsIfEmpty();
+  renderLibrary();
 })();
 
 // per-slot drag-and-drop
@@ -1890,30 +2101,123 @@ togglePanelBtn.addEventListener('click', () => setMinimized(!document.body.class
 // Tweakpane (minimal for milestone 1)
 // ============================================================================
 const pane = new Pane({ container: document.getElementById('tp-host') });
+pane.registerPlugin(EssentialsPlugin);
+
+// Wrap addBinding / addFolder so every tracked binding records its options,
+// letting randomizeMode pick values in each control's actual UI range without
+// duplicating range tables. Applies recursively to all sub-folders.
+const _bindOpts = new WeakMap();
+const _bindKey  = new WeakMap();
+function _patchAdders(folder) {
+  const origBind = folder.addBinding.bind(folder);
+  folder.addBinding = (target, key, opts) => {
+    const api = origBind(target, key, opts);
+    // Only track bindings against the main state object — rating bindings use
+    // a local object so they never appear in the randomize walk.
+    if (target === state) {
+      _bindOpts.set(api, opts || {});
+      _bindKey.set(api, key);
+    }
+    return api;
+  };
+  const origFolder = folder.addFolder.bind(folder);
+  folder.addFolder = (opts) => _patchAdders(origFolder(opts));
+  if (folder.addTab) {
+    const origTab = folder.addTab.bind(folder);
+    folder.addTab = (opts) => {
+      const tab = origTab(opts);
+      for (const page of tab.pages) _patchAdders(page);
+      return tab;
+    };
+  }
+  return folder;
+}
+_patchAdders(pane);
+
+// ---- per-mode starred flag (simple boolean) ----
+const STARRED_LS_KEY = 'transition-tool-v3:starred';
+const starred = (() => { try { return JSON.parse(localStorage.getItem(STARRED_LS_KEY)) || {}; } catch { return {}; } })();
+function saveStarred() { try { localStorage.setItem(STARRED_LS_KEY, JSON.stringify(starred)); } catch {} }
+function setStarred(modeId, on) { if (on) starred[modeId] = true; else delete starred[modeId]; saveStarred(); }
+function isStarred(modeId)      { return !!starred[modeId]; }
+
+// Randomize the mode-specific controls of a folder using each binding's actual
+// UI range (recorded by _patchAdders). Rating + button-grid + button children
+// aren't tracked, so they're skipped naturally.
+function randomizeMode(modeId, folder) {
+  for (const child of folder.children) {
+    if (!_bindKey.has(child)) continue;
+    const key  = _bindKey.get(child);
+    const opts = _bindOpts.get(child) || {};
+    if (opts.options) {
+      const values = Object.values(opts.options);
+      state[key] = values[Math.floor(Math.random() * values.length)];
+    } else if (typeof opts.min === 'number' && typeof opts.max === 'number') {
+      const step = opts.step || 0.001;
+      const v = opts.min + Math.random() * (opts.max - opts.min);
+      state[key] = Math.round(v / step) * step;
+    } else if (typeof state[key] === 'boolean') {
+      state[key] = Math.random() < 0.5;
+    }
+  }
+  state.seed = Math.floor(Math.random() * 999);
+  if (modeId >= 10 && modeId <= 14) advec.needsReset = true;
+  pane.refresh();
+}
 
 const fPlay = pane.addFolder({ title: 'Playback', expanded: true });
 const bT = fPlay.addBinding(state, 't', { min: 0, max: 1, step: 0.001, label: 'progress' });
 fPlay.addBinding(state, 'duration', { min: 0.5, max: 30, step: 0.1 });
-const btnPlay = fPlay.addButton({ title: 'Pause' });
-const btnRestart = fPlay.addButton({ title: 'Restart from start' });
-const btnLoop = fPlay.addButton({ title: 'Loop: on' });
-btnPlay.on('click', () => {
-  if (state.playing) { state.playing = false; btnPlay.title = 'Play'; }
+
+function togglePlay() {
+  if (state.playing) { state.playing = false; }
   else {
     state.playing = true;
     const consumed = state.reverse ? (1 - state.t) : state.t;
     state.startTime = performance.now() - consumed * state.duration * 1000;
-    btnPlay.title = 'Pause';
   }
-});
-btnRestart.on('click', () => {
+  updateTransportLabels();
+}
+function restartPlayback() {
   state.t = 0; state.reverse = false; state.playing = true;
-  state.startTime = performance.now(); btnPlay.title = 'Pause';
-});
-btnLoop.on('click', () => {
+  state.startTime = performance.now();
+  updateTransportLabels();
+}
+function toggleLoop() {
   state.loop = !state.loop;
-  btnLoop.title = 'Loop: ' + (state.loop ? 'on' : 'off');
+  updateTransportLabels();
+}
+const transportGrid = fPlay.addBlade({
+  view: 'buttongrid',
+  size: [3, 1],
+  cells: (x) => ({ title: [state.playing ? 'Pause' : 'Play', 'Restart', 'Loop: ' + (state.loop ? 'on' : 'off')][x] }),
+  label: '',
 });
+transportGrid.on('click', e => {
+  const idx = e.index[0];
+  if (idx === 0) togglePlay();
+  else if (idx === 1) restartPlayback();
+  else if (idx === 2) toggleLoop();
+});
+function updateTransportLabels() {
+  const btns = transportGrid.element.querySelectorAll('button');
+  if (btns[0]) btns[0].textContent = state.playing ? 'Pause' : 'Play';
+  if (btns[2]) btns[2].textContent = 'Loop: ' + (state.loop ? 'on' : 'off');
+}
+
+// ---- top-level tabs (Playback stays above; everything else goes in a tab) ----
+const tabs = pane.addTab({
+  pages: [
+    { title: 'Mode' },
+    { title: 'Frame' },
+    { title: 'Output' },
+    { title: 'Saved' },
+  ],
+});
+const tabMode   = tabs.pages[0];
+const tabFrame  = tabs.pages[1];
+const tabOutput = tabs.pages[2];
+const tabSaved  = tabs.pages[3];
 
 // Per-mode default values — used by the "Reset defaults" button in each
 // mode folder to restore that mode's params without touching anything else.
@@ -1958,66 +2262,94 @@ function resetModeDefaults(modeId) {
   if (modeId >= 10 && modeId <= 14) advec.needsReset = true;
   pane.refresh();
 }
-function addResetBtn(folder, modeId) {
-  folder.addButton({ title: 'Reset defaults' }).on('click', () => resetModeDefaults(modeId));
+function addModeFooter(folder, modeId) {
+  // Single-cell star toggle — starred or not.
+  const starGrid = folder.addBlade({
+    view: 'buttongrid',
+    size: [1, 1],
+    cells: () => ({ title: isStarred(modeId) ? '★ starred' : '☆ star this mode' }),
+    label: '',
+  });
+  const paintStar = () => {
+    const btn = starGrid.element.querySelector('button');
+    if (!btn) return;
+    const on = isStarred(modeId);
+    btn.textContent = on ? '★ starred' : '☆ star this mode';
+    btn.classList.toggle('rating-active', on);
+  };
+  starGrid.on('click', () => { setStarred(modeId, !isStarred(modeId)); paintStar(); });
+  queueMicrotask(paintStar);
+  // Randomize + Reset side-by-side.
+  const actionGrid = folder.addBlade({
+    view: 'buttongrid',
+    size: [2, 1],
+    cells: (x) => ({ title: ['🎲 Randomize', 'Reset'][x] }),
+    label: '',
+  });
+  actionGrid.on('click', e => {
+    if (e.index[0] === 0) randomizeMode(modeId, folder);
+    else resetModeDefaults(modeId);
+  });
 }
 
 // ----- Watercolor mode + per-mode controls -----
-const fWater = pane.addFolder({ title: 'Watercolor', expanded: true });
+const fWater = tabMode.addFolder({ title: 'Watercolor', expanded: true });
+const MODE_OPTIONS = {
+  '— off (smooth)':                       0,
+  'Painterly — pigment rim':              1,
+  'Painterly — paper grain':              2,
+  'Painterly — backrun blooms':           3,
+  'Painterly — wet diffusion':            4,
+  'Painterly — tonal sediment':           5,
+  'Painterly — salt':                     6,
+  'Painterly — iris':                     7,
+  'Painterly — wet bleed':                8,
+  'Painterly — pigment run':              9,
+  'Advection — wet':                      10,
+  'Advection — gravity':                  11,
+  'Advection — curl-noise eddies':        12,
+  'Advection — brush-channel':            13,
+  'Advection — seed-point injection':     14,
+  'Wet edge — rect ingress':              15,
+  'Image-driven — stroke-follow':         16,
+  'Image-driven — tonal wash':            17,
+  'Image-driven — edge underdrawing':     18,
+  'Image-driven — painterly flow':        19,
+  'Image-driven — color-pool dabs':       20,
+  'Image-driven — wet-density gravity':   21,
+  'Decay — mold tendrils':                22,
+  'Strong watercolor — formation':        23,
+  'Strong watercolor — cauliflower bloom':24,
+  'Strong watercolor — wet-stage layer':  25,
+  'Strong watercolor — pigment migration':26,
+};
+const MODE_NAMES_FULL = Object.fromEntries(Object.entries(MODE_OPTIONS).map(([n, id]) => [id, n]));
 fWater.addBinding(state, 'mode', {
   label: 'mode',
-  options: {
-    'off (smooth)':    0,
-    'pigment rim':     1,
-    'paper grain':     2,
-    'backrun blooms':  3,
-    'wet diffusion':   4,
-    'tonal sediment':  5,
-    'salt':            6,
-    'iris':            7,
-    'wet bleed':              8,
-    'pigment run':            9,
-    'wet advection':          10,
-    'gravity advection':      11,
-    'curl-noise eddies':      12,
-    'brush-channel advection': 13,
-    'seed-point injection':   14,
-    'wet edge (rect ingress)': 15,
-    'stroke-follow':           16,
-    'tonal wash':              17,
-    'edge underdrawing':       18,
-    'painterly flow':          19,
-    'color-pool dabs':         20,
-    'wet-density gravity':     21,
-    'mold tendrils':           22,
-    'watercolor formation':    23,
-    'cauliflower bloom storm': 24,
-    'wet-stage layering':      25,
-    'pigment migration':       26,
-  },
+  options: MODE_OPTIONS,
 }).on('change', () => { updateModeFolders(); advec.needsReset = true; });
 
 const fRim    = fWater.addFolder({ title: 'Pigment rim',    expanded: true });
 fRim.addBinding(state, 'rimWidth', { min: 0, max: 0.4, step: 0.005, label: 'rim width' });
 fRim.addBinding(state, 'rimDark',  { min: 0, max: 1, step: 0.01, label: 'rim dark' });
-addResetBtn(fRim, 1);
+addModeFooter(fRim, 1);
 
 const fPaper  = fWater.addFolder({ title: 'Paper grain',    expanded: true });
 fPaper.addBinding(state, 'paperAngle',       { min: 0, max: 1, step: 0.005, label: 'fiber angle' });
 fPaper.addBinding(state, 'paperAniso',       { min: 1, max: 10, step: 0.1, label: 'anisotropy' });
 fPaper.addBinding(state, 'paperGranulation', { min: 0, max: 1, step: 0.01, label: 'granulation' });
-addResetBtn(fPaper, 2);
+addModeFooter(fPaper, 2);
 
 const fBlooms = fWater.addFolder({ title: 'Backrun blooms', expanded: true });
 fBlooms.addBinding(state, 'bloomCount', { min: 1, max: 24, step: 1, label: 'count' });
 fBlooms.addBinding(state, 'bloomRate',  { min: 0.1, max: 2, step: 0.01, label: 'growth rate' });
 fBlooms.addBinding(state, 'bloomRim',   { min: 0, max: 1, step: 0.01, label: 'rim dark' });
-addResetBtn(fBlooms, 3);
+addModeFooter(fBlooms, 3);
 
 const fDiff   = fWater.addFolder({ title: 'Wet diffusion',  expanded: true });
 fDiff.addBinding(state, 'diffStrength', { min: 0, max: 1, step: 0.01, label: 'strength' });
 fDiff.addBinding(state, 'diffRadius',   { min: 0, max: 1, step: 0.01, label: 'radius' });
-addResetBtn(fDiff, 4);
+addModeFooter(fDiff, 4);
 
 const fSed    = fWater.addFolder({ title: 'Tonal sediment', expanded: true });
 fSed.addBinding(state, 'sedSource', {
@@ -2030,7 +2362,7 @@ fSed.addBinding(state, 'sedDirection', {
   label: 'order',
   options: { 'low → high': 0, 'high → low': 1 },
 });
-addResetBtn(fSed, 5);
+addModeFooter(fSed, 5);
 
 const fSalt   = fWater.addFolder({ title: 'Salt',           expanded: true });
 fSalt.addBinding(state, 'saltDensity',  { min: 0, max: 1, step: 0.01, label: 'grain' });
@@ -2044,31 +2376,31 @@ fSalt.addBinding(state, 'saltImage', {
   options: { 'A': 0, 'B': 1, 'both': 2 },
 });
 fSalt.addBinding(state, 'saltBias',     { min: 0, max: 1, step: 0.01, label: 'bias amount' });
-addResetBtn(fSalt, 6);
+addModeFooter(fSalt, 6);
 
 const fIris   = fWater.addFolder({ title: 'Iris',           expanded: true });
 fIris.addBinding(state, 'irisUniform', { label: 'uniform circle' });
 fIris.addBinding(state, 'irisFocusX', { min: 0, max: 1, step: 0.005, label: 'focus x' });
 fIris.addBinding(state, 'irisFocusY', { min: 0, max: 1, step: 0.005, label: 'focus y' });
 fIris.addBinding(state, 'irisJitter', { min: 0, max: 1, step: 0.01, label: 'jitter' });
-addResetBtn(fIris, 7);
+addModeFooter(fIris, 7);
 
 const fBleed  = fWater.addFolder({ title: 'Wet bleed',      expanded: true });
 fBleed.addBinding(state, 'bleedFinger', { min: 0, max: 1, step: 0.01, label: 'finger' });
 fBleed.addBinding(state, 'bleedAmount', { min: 0, max: 1, step: 0.01, label: 'amount' });
 fBleed.addBinding(state, 'bleedHalo',   { min: 0, max: 1, step: 0.01, label: 'wet halo' });
-addResetBtn(fBleed, 8);
+addModeFooter(fBleed, 8);
 
 const fRun    = fWater.addFolder({ title: 'Pigment run',    expanded: true });
 fRun.addBinding(state, 'runGravity', { min: 0, max: 1, step: 0.01, label: 'gravity' });
 fRun.addBinding(state, 'runDrip',    { min: 0, max: 1, step: 0.01, label: 'drip' });
-addResetBtn(fRun, 9);
+addModeFooter(fRun, 9);
 
 const fAdvec  = fWater.addFolder({ title: 'Wet advection',  expanded: true });
 fAdvec.addBinding(state, 'advecVisc',  { min: 0, max: 1, step: 0.01, label: 'viscosity' });
 fAdvec.addBinding(state, 'advecRate',  { min: 0, max: 1, step: 0.01, label: 'mixing rate' });
 fAdvec.addBinding(state, 'advecSteps', { min: 1, max: 8, step: 1, label: 'steps / frame' });
-addResetBtn(fAdvec, 10);
+addModeFooter(fAdvec, 10);
 fAdvec.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
 
 const fAdvecG = fWater.addFolder({ title: 'Gravity advection', expanded: true });
@@ -2077,24 +2409,24 @@ fAdvecG.addBinding(state, 'advecGravity',     { min: 0, max: 1, step: 0.01, labe
 fAdvecG.addBinding(state, 'advecGravStreak',  { min: 0, max: 1, step: 0.01, label: 'streak' });
 fAdvecG.addBinding(state, 'advecGravLateral', { min: 0, max: 1, step: 0.01, label: 'lateral spread' });
 fAdvecG.addBinding(state, 'advecGravBias',    { min: 0, max: 1, step: 0.01, label: 'shadow ↔ flow' });
-addResetBtn(fAdvecG, 11);
+addModeFooter(fAdvecG, 11);
 fAdvecG.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
 
 const fAdvecC = fWater.addFolder({ title: 'Curl-noise eddies', expanded: true });
 fAdvecC.addBinding(state, 'advecCurlStr',   { min: 0, max: 1, step: 0.01, label: 'eddy strength' });
 fAdvecC.addBinding(state, 'advecCurlScale', { min: 0.5, max: 8, step: 0.1, label: 'eddy scale' });
-addResetBtn(fAdvecC, 12);
+addModeFooter(fAdvecC, 12);
 fAdvecC.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
 
 const fAdvecB = fWater.addFolder({ title: 'Brush-channel advection', expanded: true });
 fAdvecB.addBinding(state, 'advecBrushFollow', { min: 0, max: 1, step: 0.01, label: 'follow strokes' });
-addResetBtn(fAdvecB, 13);
+addModeFooter(fAdvecB, 13);
 fAdvecB.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
 
 const fAdvecS = fWater.addFolder({ title: 'Seed-point injection', expanded: true });
 fAdvecS.addBinding(state, 'advecSeedCount',  { min: 1, max: 16, step: 1, label: 'seed count' });
 fAdvecS.addBinding(state, 'advecSeedRadius', { min: 0.1, max: 1, step: 0.01, label: 'reach' });
-addResetBtn(fAdvecS, 14);
+addModeFooter(fAdvecS, 14);
 fAdvecS.addButton({ title: 'Reset simulation' }).on('click', () => { advec.needsReset = true; });
 
 const fWetEdge = fWater.addFolder({ title: 'Wet edge (rect)', expanded: true });
@@ -2110,12 +2442,12 @@ fWetEdge.addBinding(state, 'weBLumaBias',       { min: -1,   max: 1,  step: 0.01
 fWetEdge.addBinding(state, 'weReverse',         { label: 'reverse (center→out)' });
 fWetEdge.addBinding(state, 'weDryRing',         { min: 0,    max: 1,  step: 0.01, label: 'dry-ring dark' });
 fWetEdge.addBinding(state, 'weBleed',           { min: 0,    max: 1,  step: 0.01, label: 'anticipatory bleed' });
-addResetBtn(fWetEdge, 15);
+addModeFooter(fWetEdge, 15);
 
 const fStroke = fWater.addFolder({ title: 'Stroke-follow', expanded: true });
 fStroke.addBinding(state, 'strokeScale', { min: 0.5, max: 20, step: 0.1, label: 'stroke scale' });
 fStroke.addBinding(state, 'strokeAniso', { min: 1,   max: 12, step: 0.1, label: 'anisotropy' });
-addResetBtn(fStroke, 16);
+addModeFooter(fStroke, 16);
 
 const fGlaze = fWater.addFolder({ title: 'Tonal wash', expanded: true });
 fGlaze.addBinding(state, 'glazeBands',    { min: 2, max: 8, step: 1,    label: 'washes' });
@@ -2125,28 +2457,28 @@ fGlaze.addBinding(state, 'glazeDirection', {
   options: { 'darks first': 0, 'lights first': 1 },
 });
 fGlaze.addBinding(state, 'glazeWarm', { min: 0, max: 1, step: 0.01, label: 'warm dry-shift' });
-addResetBtn(fGlaze, 17);
+addModeFooter(fGlaze, 17);
 
 const fEdgeFirst = fWater.addFolder({ title: 'Edge underdrawing', expanded: true });
 fEdgeFirst.addBinding(state, 'edgeFirstInk',   { min: 0,    max: 1,  step: 0.01, label: 'ink' });
 fEdgeFirst.addBinding(state, 'edgeFirstFade',  { min: 0.05, max: 0.9, step: 0.01, label: 'sketch fades at t=' });
 fEdgeFirst.addBinding(state, 'edgeFirstScale', { min: 1,    max: 10, step: 0.1,  label: 'mask scale' });
-addResetBtn(fEdgeFirst, 18);
+addModeFooter(fEdgeFirst, 18);
 
 const fFlow = fWater.addFolder({ title: 'Painterly flow', expanded: true });
 fFlow.addBinding(state, 'flowAmount', { min: 0, max: 1, step: 0.01, label: 'flow amount' });
-addResetBtn(fFlow, 19);
+addModeFooter(fFlow, 19);
 
 const fDabs = fWater.addFolder({ title: 'Color-pool dabs', expanded: true });
 fDabs.addBinding(state, 'dabsCount',  { min: 1,    max: 128, step: 1,    label: 'dab count' });
 fDabs.addBinding(state, 'dabsReach',  { min: 0.05, max: 1,   step: 0.01, label: 'reach' });
 fDabs.addBinding(state, 'dabsWobble', { min: 0,    max: 1,   step: 0.01, label: 'edge wobble' });
-addResetBtn(fDabs, 20);
+addModeFooter(fDabs, 20);
 
 const fDensity = fWater.addFolder({ title: 'Wet-density gravity', expanded: true });
 fDensity.addBinding(state, 'densityGravity', { min: 0, max: 1, step: 0.01, label: 'gravity bias' });
 fDensity.addBinding(state, 'densitySmear',   { min: 0, max: 1, step: 0.01, label: 'wet smear' });
-addResetBtn(fDensity, 21);
+addModeFooter(fDensity, 21);
 
 const fMold = fWater.addFolder({ title: 'Mold tendrils', expanded: true });
 fMold.addBinding(state, 'moldSeedCount',        { min: 1,    max: 16, step: 1,    label: 'seed count' });
@@ -2154,24 +2486,24 @@ fMold.addBinding(state, 'moldTendrilsPerSeed',  { min: 1,    max: 8,  step: 1,  
 fMold.addBinding(state, 'moldReach',            { min: 0.05, max: 1,  step: 0.01, label: 'reach' });
 fMold.addBinding(state, 'moldWidth',            { min: 0.05, max: 1,  step: 0.01, label: 'tendril width' });
 fMold.addBinding(state, 'moldWobble',           { min: 0,    max: 1,  step: 0.01, label: 'wobble' });
-addResetBtn(fMold, 22);
+addModeFooter(fMold, 22);
 
 const fForm = fWater.addFolder({ title: 'Watercolor formation', expanded: true });
 fForm.addBinding(state, 'formStrokeCount',  { min: 1,    max: 64,  step: 1,    label: 'stroke count' });
 fForm.addBinding(state, 'formStrokeSize',   { min: 0.01, max: 0.2, step: 0.005, label: 'stroke size' });
 fForm.addBinding(state, 'formStrokeWobble', { min: 0,    max: 1,   step: 0.01, label: 'edge wobble' });
-addResetBtn(fForm, 23);
+addModeFooter(fForm, 23);
 
 const fBloom = fWater.addFolder({ title: 'Cauliflower bloom storm', expanded: true });
 fBloom.addBinding(state, 'bloomLightBias',  { min: 0, max: 1, step: 0.01, label: 'light bias (B)' });
 fBloom.addBinding(state, 'bloomWobble',     { min: 0, max: 1, step: 0.01, label: 'bloom wobble' });
 fBloom.addBinding(state, 'bloomPaperShow',  { min: 0, max: 1, step: 0.01, label: 'paper-show pop' });
-addResetBtn(fBloom, 24);
+addModeFooter(fBloom, 24);
 
 const fStage = fWater.addFolder({ title: 'Wet-stage layering', expanded: true });
 fStage.addBinding(state, 'stageBands',   { min: 2, max: 8, step: 1,    label: 'stages' });
 fStage.addBinding(state, 'stageOverlap', { min: 0, max: 1, step: 0.01, label: 'stage overlap' });
-addResetBtn(fStage, 25);
+addModeFooter(fStage, 25);
 
 const fMig = fWater.addFolder({ title: 'Pigment migration', expanded: true });
 fMig.addBinding(state, 'migrationStrength', { min: 0, max: 1, step: 0.01, label: 'strength' });
@@ -2180,7 +2512,7 @@ fMig.addBinding(state, 'migrationDir', {
   options: { 'along gradient': 0, 'perpendicular': 1 },
 });
 fMig.addBinding(state, 'migrationTurb', { min: 0, max: 1, step: 0.01, label: 'turbulence' });
-addResetBtn(fMig, 26);
+addModeFooter(fMig, 26);
 
 function updateModeFolders() {
   fRim.hidden    = state.mode !== 1;
@@ -2212,15 +2544,16 @@ function updateModeFolders() {
 }
 updateModeFolders();
 
-const fDis = pane.addFolder({ title: 'Dissolve', expanded: true });
+const fDis = tabMode.addFolder({ title: 'Dissolve', expanded: true });
 fDis.addBinding(state, 'organic',   { min: 0, max: 1, step: 0.01 });
 fDis.addBinding(state, 'edges',     { min: -1, max: 1, step: 0.01 });
 fDis.addBinding(state, 'spread',    { min: 0, max: 1, step: 0.01 });
 fDis.addBinding(state, 'maskScale', { min: 0.3, max: 4, step: 0.05, label: 'mask scale' });
 fDis.addBinding(state, 'curve', { options: { 'linear': 0, 'ease-in-out': 1, 'ease-in': 2, 'ease-out': 3 } });
 fDis.addBinding(state, 'seed', { min: 0, max: 999, step: 1 });
+fDis.addBinding(state, 'maskShift', { min: -0.5, max: 0.5, step: 0.005, label: 'mask shift' });
 
-const fImg = pane.addFolder({ title: 'Framing', expanded: false });
+const fImg = tabFrame.addFolder({ title: 'Framing', expanded: true });
 fImg.addBinding(state, 'zoomA', { min: 0.5, max: 4, step: 0.01, label: 'A zoom' });
 fImg.addBinding(state, 'panAx', { min: -1, max: 1, step: 0.005, label: 'A pan x' });
 fImg.addBinding(state, 'panAy', { min: -1, max: 1, step: 0.005, label: 'A pan y' });
@@ -2310,7 +2643,7 @@ function makeFilenameV2() {
 }
 
 let recording = false;
-const fExp = pane.addFolder({ title: 'Export', expanded: true });
+const fExp = tabOutput.addFolder({ title: 'Export', expanded: true });
 fExp.addBinding(state, 'exportFps', {
   label: 'fps', options: { '24 fps': 24, '25 fps': 25, '30 fps': 30, '50 fps': 50, '60 fps': 60 },
 });
@@ -2339,6 +2672,64 @@ bPadPreset.on('change', e => {
   pane.refresh();
 });
 const bPad = fExp.addBinding(state, 'exportPadBottom', { min: 0, max: 3, step: 0.001, label: 'pad below (× h)' });
+
+// ---- output folder (File System Access API, Chromium-only) ----
+const HAS_FS_ACCESS = typeof window.showDirectoryPicker === 'function';
+let outputDirHandle = null;
+const outputFolderProxy = { name: 'browser default' };
+(async () => {
+  const saved = await idbGet('outputDir');
+  if (saved) {
+    outputDirHandle = saved;
+    outputFolderProxy.name = saved.name;
+    try { pane.refresh(); } catch {}
+  }
+})();
+async function getOutputDirHandleWithPermission() {
+  if (!outputDirHandle) return null;
+  try {
+    let perm = await outputDirHandle.queryPermission({ mode: 'readwrite' });
+    if (perm !== 'granted') perm = await outputDirHandle.requestPermission({ mode: 'readwrite' });
+    return perm === 'granted' ? outputDirHandle : null;
+  } catch { return null; }
+}
+async function saveBlobToOutputFolder(blob, filename) {
+  const dir = await getOutputDirHandleWithPermission();
+  if (!dir) return false;
+  try {
+    const fileHandle = await dir.getFileHandle(filename, { create: true });
+    const writable = await fileHandle.createWritable();
+    await writable.write(blob);
+    await writable.close();
+    return true;
+  } catch (e) {
+    console.error('[output folder save]', e);
+    return false;
+  }
+}
+fExp.addBinding(outputFolderProxy, 'name', { readonly: true, label: 'output folder' });
+fExp.addBlade({
+  view: 'buttongrid',
+  size: [2, 1],
+  cells: (x) => ({ title: HAS_FS_ACCESS ? ['📁 Pick folder', 'Use default'][x] : ['(not supported in this browser)', ''][x] }),
+  label: '',
+}).on('click', async e => {
+  if (!HAS_FS_ACCESS) return;
+  if (e.index[0] === 0) {
+    try {
+      const handle = await window.showDirectoryPicker({ mode: 'readwrite' });
+      outputDirHandle = handle;
+      outputFolderProxy.name = handle.name;
+      await idbPut('outputDir', handle);
+      pane.refresh();
+    } catch (err) { if (err.name !== 'AbortError') alert('Folder pick failed: ' + err.message); }
+  } else {
+    outputDirHandle = null;
+    outputFolderProxy.name = 'browser default';
+    await idbPut('outputDir', null);
+    pane.refresh();
+  }
+});
 // Slider → preset: keep the dropdown showing the matching preset (or 'none')
 // when the slider lands on a value we have a preset for.
 bPad.on('change', () => {
@@ -2494,7 +2885,6 @@ async function startRecording(opts = {}) {
     return;
   }
 
-  const url = URL.createObjectURL(blob);
   // Build filename with duration, fps, actual output dimensions, and pad
   // (appended here so the actual encoded size is reflected, not the
   // pre-scale request).
@@ -2509,20 +2899,42 @@ async function startRecording(opts = {}) {
     base = `${base}__${tail.join('__')}`;
   }
   const filename = /\.mp4$/i.test(base) ? base : `${base}.mp4`;
-  const a = document.createElement('a');
-  a.href = url; a.download = filename; a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
 
-  btnRecord.title = `saved (${(blob.size / 1024 / 1024).toFixed(1)} MB)`;
+  // Try the persistent output folder first; fall back to a browser download.
+  const savedToFolder = await saveBlobToOutputFolder(blob, filename);
+  let where = '';
+  if (savedToFolder) {
+    where = ` → ${outputDirHandle?.name || 'folder'}`;
+  } else {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  btnRecord.title = `saved (${(blob.size / 1024 / 1024).toFixed(1)} MB)${where}`;
   setTimeout(() => { btnRecord.title = originalTitle; }, 2500);
 }
 
-const fStyle = pane.addFolder({ title: 'Style', expanded: false });
+const fStyle = tabFrame.addFolder({ title: 'Style', expanded: true });
 fStyle.addBinding(state, 'fit', {
   options: { 'cover (crop)': 'cover', 'contain': 'contain', 'stretch': 'stretch' },
 });
 fStyle.addBinding(state, 'bg', { view: 'color' });
 fStyle.addBinding(state, 'paperGrain', { min: 0, max: 1, step: 0.01, label: 'paper grain' });
+
+const fSlotFill = fStyle.addFolder({ title: 'A / B fill', expanded: false });
+fSlotFill.addBinding(state, 'slotAFillMode', {
+  label: 'A fill',
+  options: { 'image': 'image', 'solid color': 'solid', 'transparent (alpha)': 'transparent' },
+}).on('change', () => resizeCanvas());
+fSlotFill.addBinding(state, 'slotAColor', { view: 'color', label: 'A color' });
+fSlotFill.addBinding(state, 'slotBFillMode', {
+  label: 'B fill',
+  options: { 'image': 'image', 'solid color': 'solid', 'transparent (alpha)': 'transparent' },
+}).on('change', () => resizeCanvas());
+fSlotFill.addBinding(state, 'slotBColor', { view: 'color', label: 'B color' });
+fSlotFill.addBinding(state, 'keepAOutsideB', { label: 'keep A outside B' });
 
 const fBounds = fStyle.addFolder({ title: 'Transition bounds', expanded: false });
 fBounds.addBinding(state, 'boundsEnable',   { label: 'limit to box' });
@@ -2565,7 +2977,7 @@ const PRESET_KEYS = [
   'stageBands', 'stageOverlap',
   'migrationStrength', 'migrationDir', 'migrationTurb',
   'boundsEnable', 'boundsCx', 'boundsCy', 'boundsW', 'boundsH', 'boundsSoftness',
-  'organic', 'edges', 'spread', 'maskScale',
+  'organic', 'edges', 'spread', 'maskScale', 'maskShift',
   'zoomA', 'panAx', 'panAy', 'zoomB', 'panBx', 'panBy',
 ];
 
@@ -2611,7 +3023,7 @@ const FACTORY_PRESETS = {
   },
 };
 
-const LS_KEY = 'transition-tool-v2:presets';
+const LS_KEY = 'transition-tool-v3:presets';
 const loadUserPresets = () => { try { return JSON.parse(localStorage.getItem(LS_KEY)) || {}; } catch { return {}; } };
 const saveUserPresetsToLS = (o) => localStorage.setItem(LS_KEY, JSON.stringify(o));
 
@@ -2631,7 +3043,7 @@ function applyPreset(id) {
 }
 
 const presetUI = { current: '', newName: '' };
-const fPresets = pane.addFolder({ title: 'Presets', expanded: true });
+const fPresets = tabSaved.addFolder({ title: 'Presets', expanded: true });
 
 function buildPresetOptions() {
   const opts = { '— select —': '' };
@@ -2667,10 +3079,36 @@ function rebuildPresetsFolder() {
 }
 rebuildPresetsFolder();
 
+// ----- Starred modes export -----
+const fStarred = tabSaved.addFolder({ title: 'Starred modes', expanded: true });
+fStarred.addButton({ title: '📋 Copy starred summary' }).on('click', async () => {
+  const entries = Object.keys(starred)
+    .map(id => ({ id: +id, name: MODE_NAMES_FULL[+id] || `mode ${id}` }))
+    .sort((a, b) => a.id - b.id);
+  if (entries.length === 0) {
+    alert('No starred modes yet — star some first.');
+    return;
+  }
+  const text = `# Starred modes (transition-v3, ${new Date().toISOString().slice(0, 10)})\n` +
+    entries.map(e => `★  ${e.name} (mode ${e.id})`).join('\n');
+  try {
+    await navigator.clipboard.writeText(text);
+    alert(`Copied ${entries.length} starred mode${entries.length === 1 ? '' : 's'} to clipboard.\nPaste it back to Claude.`);
+  } catch {
+    console.log(text);
+    alert('Clipboard blocked — see browser console for the summary.');
+  }
+});
+fStarred.addButton({ title: 'Clear all stars' }).on('click', () => {
+  if (!confirm('Clear all starred modes?')) return;
+  for (const k of Object.keys(starred)) delete starred[k];
+  saveStarred();
+});
+
 // Keyboard
 window.addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') return;
-  if (e.key === ' ')          { e.preventDefault(); btnPlay.element.querySelector('button').click(); }
+  if (e.key === ' ')          { e.preventDefault(); togglePlay(); }
   if (e.key === 'Tab')        { e.preventDefault(); setMinimized(!document.body.classList.contains('minimized')); }
   if (e.key === 'ArrowLeft')  { state.t = Math.max(0, state.t - 0.02); pane.refresh(); }
   if (e.key === 'ArrowRight') { state.t = Math.min(1, state.t + 0.02); pane.refresh(); }
@@ -2678,11 +3116,12 @@ window.addEventListener('keydown', e => {
 
 // Expose for headless / automation experiments
 // ----- Auto-persist all settings to localStorage -----
-const SESSION_LS_KEY = 'transition-tool-v2:session';
+const SESSION_LS_KEY = 'transition-tool-v3:session';
 const PERSIST_KEYS = [
   ...PRESET_KEYS,
   'fit', 'bg',
   'exportFps', 'exportSizeMode', 'exportPadBottom',
+  'slotAFillMode', 'slotAColor', 'slotBFillMode', 'slotBColor', 'keepAOutsideB',
 ];
 function saveSession() {
   try {
@@ -2709,4 +3148,4 @@ loadSession();
 pane.on('change', () => saveSession());
 
 window.__tool = { state, pane, device, adapter };
-console.log('[transition-tool-v2] WebGPU ready, format:', presentationFormat);
+console.log('[transition-tool-v3] WebGPU ready, format:', presentationFormat);
