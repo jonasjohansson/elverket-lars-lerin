@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Transition v4</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <div id="stage">
+    <canvas id="canvas" class="empty"></canvas>
+  </div>
+
+  <button id="toggle-panel" title="Hide controls (Tab)">‹</button>
+
+  <div id="side">
+    <div id="slot-bar">
+      <div class="slots slots-3">
+        <div class="slot" data-slot="A" title="Click or drop image A"><span class="lab">A</span><span class="placeholder">click / drop</span></div>
+        <div class="slot" data-slot="T" title="Click or drop video — used as transition mask between A and B"><span class="lab">T</span><span class="placeholder">video</span></div>
+        <div class="slot" data-slot="B" title="Click or drop image B"><span class="lab">B</span><span class="placeholder">click / drop</span></div>
+      </div>
+      <div class="row-btns">
+        <button id="swap" title="Swap A and B">Swap A ↔ B</button>
+        <button id="reset" title="Restore the bundled Lerin defaults">Reset</button>
+        <button id="clear" title="Empty both slots">Clear</button>
+      </div>
+    </div>
+    <div id="library-section">
+      <div class="library-head">
+        <span class="library-title">Library</span>
+        <span class="library-hint">click = A · shift-click = B · right-click to delete</span>
+      </div>
+      <div id="library-grid"></div>
+    </div>
+    <div id="tp-host"></div>
+  </div>
+
+  <div id="gpu-error">
+    <div><b>WebGPU is not available in this browser.</b></div>
+    <div>This is the WebGPU build of the transition tool — it needs Chrome 113+, Edge 113+, Firefox 141+, or Safari 18+ on macOS/iOS 18+.</div>
+    <div>Use <a href="../transition-v1/">the WebGL2 version</a> instead.</div>
+  </div>
+
+  <input type="file" id="filepicker" accept="image/*,video/*">
+  <script type="importmap">
+  {
+    "imports": {
+      "tweakpane": "https://esm.sh/tweakpane@4.0.5",
+      "@tweakpane/plugin-essentials": "https://esm.sh/@tweakpane/plugin-essentials@0.2.1?deps=tweakpane@4.0.5",
+      "mp4-muxer": "https://esm.sh/mp4-muxer@5.1.5"
+    }
+  }
+  </script>
+  <script type="module" src="./main.js"></script>
+</body>
+</html>
