@@ -103,10 +103,11 @@ struct Params {
   burnGlowColor: vec3f, burnGlowFromB: f32,
   videoMaskInvert: u32, videoMaskFeather: f32, burnColorBleed: f32, videoDisplace: f32,
   meltCellScale: f32, meltCenterX: f32, meltCenterY: f32, meltInkAmount: f32,
-  meltGlowIntensity: f32, meltCellJitter: f32, _ml1: f32, _ml2: f32,
-  meltGlowColor: vec3f, _ml3: f32,
+  meltGlowIntensity: f32, meltCellJitter: f32, videoDisplaceB: f32, videoBrightness: f32,
+  meltGlowColor: vec3f, videoContrast: f32,
   lightIntensity: f32, lightSpread: f32, lightPeakT: f32, lightFlashWidth: f32,
-  lightColor: vec3f, _lp1: f32,
+  lightColor: vec3f, videoSaturate: f32,
+  _rg0: f32, _rg1: f32, _rg2: f32, _rg3: f32,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -115,6 +116,7 @@ struct Params {
 @group(0) @binding(3) var samp: sampler;
 @group(0) @binding(4) var advState: texture_2d<f32>;
 @group(0) @binding(5) var texT: texture_2d<f32>;
+@group(0) @binding(6) var texRegions: texture_2d<f32>;
 
 @vertex fn vs(@builtin(vertex_index) idx: u32) -> VSOut {
   // 6-vertex fullscreen triangle pair, with UV in [0,1] (y up to match WebGL).
@@ -585,6 +587,17 @@ fn filmMeltMask(uv: vec2f) -> f32 {
   return clamp(m + n, 0.0, 1.0);
 }
 
+// Sample the T-slot video with brightness / contrast / saturation applied,
+// so the user can shape the mask polarity without re-encoding the source.
+fn adjustedT(uv: vec2f) -> vec3f {
+  let raw = textureSampleLevel(texT, samp, uv, 0.0).rgb;
+  var c = raw + vec3f(p.videoBrightness);
+  c = (c - 0.5) * p.videoContrast + 0.5;
+  let gray = luma(c);
+  c = mix(vec3f(gray), c, p.videoSaturate);
+  return clamp(c, vec3f(0.0), vec3f(1.0));
+}
+
 fn burnMask(uv: vec2f) -> f32 {
   // Two-octave UV warp BEFORE measuring distance — macro deformation of the
   // canvas "edges" so the front is organic at multiple scales (no uniform sweep).
@@ -806,10 +819,9 @@ fn organicMask(uv: vec2f, lA: f32, lB: f32, edge: f32) -> f32 {
   } else if (p.mode == 27u) {
     mask = burnMask(uv);
   } else if (p.mode == 28u) {
-    // Video-driven mask: T slot's video luminance drives reveal. Default —
-    // bright video pixels reveal early. Invert flips so dark pixels reveal
-    // first instead.
-    let cT = textureSampleLevel(texT, samp, uv, 0.0).rgb;
+    // Video-driven mask: T slot's video luminance (after brightness/contrast/
+    // saturation adjustment) drives reveal. Invert flips polarity.
+    let cT = adjustedT(uv);
     let lT = luma(cT);
     mask = clamp(select(1.0 - lT, lT, p.videoMaskInvert == 1u), 0.0, 1.0);
   } else if (p.mode == 29u) {
@@ -819,6 +831,12 @@ fn organicMask(uv: vec2f, lA: f32, lB: f32, edge: f32) -> f32 {
     // painting "burns through"); darker areas reveal as the bloom expands.
     let n = (fbm(uv * 2.5 + p.seed * 0.13) - 0.5) * 0.15;
     mask = clamp((1.0 - lA) + n, 0.0, 1.0);
+  } else if (p.mode == 31u) {
+    // SAM sequential region reveal: each pixel's red-channel value in
+    // texRegions encodes the t at which that pixel fades (built from SAM
+    // segmentation results — earlier regions = smaller pixelT, background = 1).
+    let reg = textureSampleLevel(texRegions, samp, uv, 0.0);
+    mask = clamp(reg.r, 0.0, 1.0);
   } else {
     let eA = edgeMag(texA, uv, p.scaleA, p.offsetA, p.validA, p.slotAColor);
     let eB = edgeMag(texB, uv, p.scaleB, p.offsetB, p.validB, p.slotBColor);
@@ -918,19 +936,19 @@ fn organicMask(uv: vec2f, lA: f32, lB: f32, edge: f32) -> f32 {
     }
   }
 
-  // Mode 28 (video mask) optional displacement — use the T video's luma
-  // gradient to subtly push A and B during the transition. Both samples are
-  // displaced by the same vector so the canvas itself appears to ripple where
-  // the video has bright/dark edges.
-  if (p.mode == 28u && p.videoDisplace > 0.001) {
+  // T-video displacement (global, applies to any mode) — use the T video's
+  // luma gradient to push A and B independently. videoDisplaceB is signed:
+  // negative pushes B opposite to A's direction. Safe with no video loaded —
+  // placeholder texture has zero gradient.
+  if (abs(p.videoDisplace) > 0.001 || abs(p.videoDisplaceB) > 0.001) {
     let e = 0.005;
-    let lL = luma(textureSampleLevel(texT, samp, uv - vec2f(e, 0.0), 0.0).rgb);
-    let lR = luma(textureSampleLevel(texT, samp, uv + vec2f(e, 0.0), 0.0).rgb);
-    let lU = luma(textureSampleLevel(texT, samp, uv - vec2f(0.0, e), 0.0).rgb);
-    let lD = luma(textureSampleLevel(texT, samp, uv + vec2f(0.0, e), 0.0).rgb);
-    let disp = vec2f(lR - lL, lD - lU) * p.videoDisplace * 0.08;
-    colA_eff = sampleFit(texA, uv + disp, p.scaleA, p.offsetA, p.validA, p.slotAColor).rgb;
-    cB_eff   = sampleFit(texB, uv + disp, p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb;
+    let lL = luma(adjustedT(uv - vec2f(e, 0.0)));
+    let lR = luma(adjustedT(uv + vec2f(e, 0.0)));
+    let lU = luma(adjustedT(uv - vec2f(0.0, e)));
+    let lD = luma(adjustedT(uv + vec2f(0.0, e)));
+    let dispBase = vec2f(lR - lL, lD - lU) * 0.08;
+    colA_eff = sampleFit(texA, uv + dispBase * p.videoDisplace,  p.scaleA, p.offsetA, p.validA, p.slotAColor).rgb;
+    cB_eff   = sampleFit(texB, uv + dispBase * p.videoDisplaceB, p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb;
   }
 
   var outc = mix(colA_eff, cB_eff, mixT);
@@ -1027,7 +1045,7 @@ fn organicMask(uv: vec2f, lA: f32, lB: f32, edge: f32) -> f32 {
   // transition front so the video's visible content (like its own burnt edges,
   // smoke, ink, etc.) shows through the transition.
   if (p.mode == 28u && p.videoMaskFeather > 0.001) {
-    let cT = textureSampleLevel(texT, samp, uv, 0.0).rgb;
+    let cT = adjustedT(uv);
     // Peak at the active front (mixT ≈ 0.5), falls off either side. 4xy(1-xy)
     // gives a 0..1 dome centred on mixT=0.5.
     let frontProx = 4.0 * mixT * (1.0 - mixT);
@@ -1202,6 +1220,7 @@ const bindGroupLayout = device.createBindGroupLayout({
     { binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
     { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
     { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+    { binding: 6, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
   ],
 });
 device.pushErrorScope('validation');
@@ -1261,10 +1280,11 @@ struct Params {
   burnGlowColor: vec3f, burnGlowFromB: f32,
   videoMaskInvert: u32, videoMaskFeather: f32, burnColorBleed: f32, videoDisplace: f32,
   meltCellScale: f32, meltCenterX: f32, meltCenterY: f32, meltInkAmount: f32,
-  meltGlowIntensity: f32, meltCellJitter: f32, _ml1: f32, _ml2: f32,
-  meltGlowColor: vec3f, _ml3: f32,
+  meltGlowIntensity: f32, meltCellJitter: f32, videoDisplaceB: f32, videoBrightness: f32,
+  meltGlowColor: vec3f, videoContrast: f32,
   lightIntensity: f32, lightSpread: f32, lightPeakT: f32, lightFlashWidth: f32,
-  lightColor: vec3f, _lp1: f32,
+  lightColor: vec3f, videoSaturate: f32,
+  _rg0: f32, _rg1: f32, _rg2: f32, _rg3: f32,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -1273,6 +1293,7 @@ struct Params {
 @group(0) @binding(3) var samp: sampler;
 @group(0) @binding(4) var stateIn: texture_2d<f32>;
 @group(0) @binding(5) var texT: texture_2d<f32>;
+@group(0) @binding(6) var texRegions: texture_2d<f32>;
 
 @vertex fn vs(@builtin(vertex_index) idx: u32) -> VSOut {
   let positions = array<vec2f, 6>(
@@ -1487,10 +1508,11 @@ struct Params {
   burnGlowColor: vec3f, burnGlowFromB: f32,
   videoMaskInvert: u32, videoMaskFeather: f32, burnColorBleed: f32, videoDisplace: f32,
   meltCellScale: f32, meltCenterX: f32, meltCenterY: f32, meltInkAmount: f32,
-  meltGlowIntensity: f32, meltCellJitter: f32, _ml1: f32, _ml2: f32,
-  meltGlowColor: vec3f, _ml3: f32,
+  meltGlowIntensity: f32, meltCellJitter: f32, videoDisplaceB: f32, videoBrightness: f32,
+  meltGlowColor: vec3f, videoContrast: f32,
   lightIntensity: f32, lightSpread: f32, lightPeakT: f32, lightFlashWidth: f32,
-  lightColor: vec3f, _lp1: f32,
+  lightColor: vec3f, videoSaturate: f32,
+  _rg0: f32, _rg1: f32, _rg2: f32, _rg3: f32,
 };
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var texA: texture_2d<f32>;
@@ -1498,6 +1520,7 @@ struct Params {
 @group(0) @binding(3) var samp: sampler;
 @group(0) @binding(4) var stateIn: texture_2d<f32>;
 @group(0) @binding(5) var texT: texture_2d<f32>;
+@group(0) @binding(6) var texRegions: texture_2d<f32>;
 @vertex fn vs(@builtin(vertex_index) idx: u32) -> VSOut {
   let positions = array<vec2f, 6>(
     vec2f(-1.0, -1.0), vec2f( 1.0, -1.0), vec2f(-1.0,  1.0),
@@ -1574,6 +1597,7 @@ function makeSimBindGroup(stateIn) {
       { binding: 3, resource: sampler },
       { binding: 4, resource: stateIn.createView() },
       { binding: 5, resource: (texT || placeholderTexT).createView() },
+      { binding: 6, resource: texRegions.createView() },
     ],
   });
 }
@@ -1587,6 +1611,7 @@ function makeDisplayBindGroup(finalState) {
       { binding: 3, resource: sampler },
       { binding: 4, resource: finalState.createView() },
       { binding: 5, resource: (texT || placeholderTexT).createView() },
+      { binding: 6, resource: texRegions.createView() },
     ],
   });
 }
@@ -1601,7 +1626,7 @@ function makeDisplayBindGroup(finalState) {
 //   5  seed         13  scaleB.y                                          29 bloomCount     37 saltContrast
 //   6  validA       14  offsetB.x                                         30 bloomRim       38 saltBias
 //   7  validB       15  offsetB.y                                         31 bloomRate      39 saltImage
-const UBO_SIZE = 672;
+const UBO_SIZE = 688;
 const uniformBuffer = device.createBuffer({
   size: UBO_SIZE,
   usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -1628,6 +1653,21 @@ let texA = makePlaceholderTexture();
 let texB = makePlaceholderTexture();
 let placeholderTexT = makePlaceholderTexture();
 let texT = null;
+// Per-pixel "fade time" texture for mode 31 (sequential region reveal). r =
+// pixelT in [0,1]; built from SAM regions. Default is a 1×1 with r=1 so when
+// no regions are saved, mode 31 just shows A unchanged (instead of flipping
+// to B at t=0, which would look broken).
+function makeRegionsPlaceholderTexture() {
+  const tex = device.createTexture({
+    label: 'tex-regions-placeholder',
+    size: [1, 1, 1], format: 'rgba8unorm',
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+  });
+  device.queue.writeTexture({ texture: tex }, new Uint8Array([255, 0, 0, 255]), { bytesPerRow: 4 }, [1, 1, 1]);
+  return tex;
+}
+const placeholderTexRegions = makeRegionsPlaceholderTexture();
+let texRegions = placeholderTexRegions;
 
 // Placeholder state texture so the bind group is valid before sim runs.
 // Replaced with real ping-pong textures on first advection frame.
@@ -1647,6 +1687,7 @@ function makeBindGroup(stateView) {
       { binding: 3, resource: sampler },
       { binding: 4, resource: stateView || placeholderState.createView() },
       { binding: 5, resource: (texT || placeholderTexT).createView() },
+      { binding: 6, resource: texRegions.createView() },
     ],
   });
 }
@@ -1773,7 +1814,8 @@ const state = {
   burnBIgnite: 0, burnGlowFromB: 0,
   burnColorBleed: 0,
   // mode 28 — video mask
-  videoMaskInvert: false, videoMaskFeather: 0, videoDisplace: 0.2,
+  videoMaskInvert: false, videoMaskFeather: 0, videoDisplace: 0.2, videoDisplaceB: 0.2,
+  videoBrightness: 0, videoContrast: 1, videoSaturate: 1,
   // mode 29 — film melt
   meltCellScale: 7, meltCenterX: 0.5, meltCenterY: 0.5, meltCellJitter: 0.7,
   meltInkAmount: 0.8, meltGlowIntensity: 0.5, meltGlowColor: '#c46a18',
@@ -2015,16 +2057,17 @@ function writeUniforms() {
   uboF32[151] = state.meltInkAmount;
   uboF32[152] = state.meltGlowIntensity;
   uboF32[153] = state.meltCellJitter;
-  uboF32[154] = 0; uboF32[155] = 0;
+  uboF32[154] = state.videoDisplaceB;
+  uboF32[155] = state.videoBrightness;
   const mgc = hexToRgb(state.meltGlowColor);
-  uboF32[156] = mgc[0]; uboF32[157] = mgc[1]; uboF32[158] = mgc[2]; uboF32[159] = 0;
+  uboF32[156] = mgc[0]; uboF32[157] = mgc[1]; uboF32[158] = mgc[2]; uboF32[159] = state.videoContrast;
   // -- 160..167 -- light bloom (mode 30)
   uboF32[160] = state.lightIntensity;
   uboF32[161] = state.lightSpread;
   uboF32[162] = state.lightPeakT;
   uboF32[163] = state.lightFlashWidth;
   const lc = hexToRgb(state.lightColor);
-  uboF32[164] = lc[0]; uboF32[165] = lc[1]; uboF32[166] = lc[2]; uboF32[167] = 0;
+  uboF32[164] = lc[0]; uboF32[165] = lc[1]; uboF32[166] = lc[2]; uboF32[167] = state.videoSaturate;
   // -- 80..95 -- new painterly modes (16..21) + global paper grain
   uboF32[80] = state.strokeScale;
   uboF32[81] = state.strokeAniso;
@@ -2662,12 +2705,14 @@ const tabs = pane.addTab({
     { title: 'Frame' },
     { title: 'Output' },
     { title: 'Saved' },
+    { title: 'Segment' },
   ],
 });
-const tabMode   = tabs.pages[0];
-const tabFrame  = tabs.pages[1];
-const tabOutput = tabs.pages[2];
-const tabSaved  = tabs.pages[3];
+const tabMode    = tabs.pages[0];
+const tabFrame   = tabs.pages[1];
+const tabOutput  = tabs.pages[2];
+const tabSaved   = tabs.pages[3];
+const tabSegment = tabs.pages[4];
 
 // Per-mode default values — used by the "Reset defaults" button in each
 // mode folder to restore that mode's params without touching anything else.
@@ -2795,6 +2840,7 @@ const MODE_OPTIONS = {
   'Video mask (T slot)':                  28,
   'Film melt — ink burn from center':     29,
   'Light bloom — overexposure to reveal': 30,
+  'SAM — sequential region reveal':       31,
 };
 const MODE_NAMES_FULL = Object.fromEntries(Object.entries(MODE_OPTIONS).map(([n, id]) => [id, n]));
 fWater.addBinding(state, 'mode', {
@@ -3008,7 +3054,9 @@ addModeFooter(fBurn, 27);
 const fVideoMask = fWater.addFolder({ title: 'Video mask (T slot)', expanded: true });
 fVideoMask.addBinding(state, 'videoMaskInvert', { label: 'invert (dark first)' });
 fVideoMask.addBinding(state, 'videoMaskFeather', { min: 0, max: 1, step: 0.01, label: 'feather (show video at front)' });
-fVideoMask.addBinding(state, 'videoDisplace',    { min: 0, max: 1, step: 0.01, label: 'displace A & B' });
+fVideoMask.addBinding(state, 'videoBrightness', { min: -1, max: 1, step: 0.01, label: 'brightness' });
+fVideoMask.addBinding(state, 'videoContrast',   { min: 0,  max: 3, step: 0.01, label: 'contrast' });
+fVideoMask.addBinding(state, 'videoSaturate',   { min: 0,  max: 3, step: 0.01, label: 'saturate' });
 addModeFooter(fVideoMask, 28);
 
 const fMelt = fWater.addFolder({ title: 'Film melt (ink burn)', expanded: true });
@@ -3458,6 +3506,8 @@ fStyle.addBinding(state, 'fit', {
 });
 fStyle.addBinding(state, 'bg', { view: 'color' });
 fStyle.addBinding(state, 'paperGrain', { min: 0, max: 1, step: 0.01, label: 'paper grain' });
+fStyle.addBinding(state, 'videoDisplace',  { min: -1, max: 1, step: 0.01, label: 'T displace A' });
+fStyle.addBinding(state, 'videoDisplaceB', { min: -1, max: 1, step: 0.01, label: 'T displace B' });
 
 const fSlotFill = fStyle.addFolder({ title: 'A / B fill', expanded: false });
 fSlotFill.addBinding(state, 'slotAFillMode', {
@@ -3516,7 +3566,8 @@ const PRESET_KEYS = [
   'burnGlowIntensity', 'burnGlowWidth', 'burnEmberTrail',
   'burnSeedCount', 'burnBrowning', 'burnBrowningWidth', 'burnAshSpatter', 'burnGlowColor',
   'burnBIgnite', 'burnGlowFromB', 'burnColorBleed',
-  'videoMaskInvert', 'videoMaskFeather', 'videoDisplace',
+  'videoMaskInvert', 'videoMaskFeather', 'videoDisplace', 'videoDisplaceB',
+  'videoBrightness', 'videoContrast', 'videoSaturate',
   'meltCellScale', 'meltCenterX', 'meltCenterY', 'meltCellJitter',
   'meltInkAmount', 'meltGlowIntensity', 'meltGlowColor',
   'lightIntensity', 'lightSpread', 'lightPeakT', 'lightFlashWidth', 'lightColor',
@@ -3657,6 +3708,375 @@ window.addEventListener('keydown', e => {
   if (e.key === 'ArrowLeft')  { state.t = Math.max(0, state.t - 0.02); pane.refresh(); }
   if (e.key === 'ArrowRight') { state.t = Math.min(1, state.t + 0.02); pane.refresh(); }
 });
+
+// ============================================================================
+// SAM (Segment Anything) — point-prompt segmentation on image A.
+//
+// MVP: load model on demand, encode A once, click overlay to drop a positive
+// (or shift-click negative) point, see the predicted mask as a tinted overlay
+// on top of the WebGPU canvas. Multi-region storage + sequential reveal will
+// build on this once the interaction feels right.
+//
+// Notes:
+//  - Uses transformers.js with the slimsam-77-uniform checkpoint (~25 MB)
+//    instead of full SAM (~360 MB). Quality is good enough for figure picking.
+//  - The overlay-to-image mapping currently assumes A fills the canvas. If A
+//    is letterboxed via fillMode/scale/offset, the click position will be off.
+//    Fix once we wire the mask into the GPU pipeline.
+// ============================================================================
+
+const TRANSFORMERS_URL = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.2';
+const SAM_MODEL_ID = 'Xenova/slimsam-77-uniform';
+
+const sam = {
+  status: 'idle',     // idle | loading | ready | encoding | encoded | segmenting | error
+  lib: null,
+  model: null,
+  processor: null,
+  rawImage: null,
+  imageInputs: null,
+  imageEmbeddings: null,
+  encodedImgRef: null,
+  points: [],         // [{x, y, label}] in source-image pixel coords
+  maskCanvas: null,   // OffscreenCanvas with the current mask painted
+  segmentMode: false,
+};
+
+const samUIState = { status: 'load model to begin' };
+let samStatusBinding = null;
+
+function samSetStatus(msg) {
+  samUIState.status = msg;
+  if (samStatusBinding) samStatusBinding.refresh();
+  console.log('[SAM]', msg);
+}
+
+async function samLoadModel() {
+  if (['loading','ready','encoding','encoded','segmenting'].includes(sam.status)) {
+    samSetStatus('model already loaded');
+    return;
+  }
+  sam.status = 'loading';
+  samSetStatus('loading model (~25 MB on first run) …');
+  try {
+    sam.lib = sam.lib || await import(TRANSFORMERS_URL);
+    sam.model = await sam.lib.SamModel.from_pretrained(SAM_MODEL_ID, { device: 'webgpu', dtype: 'fp16' })
+      .catch(async (e) => {
+        console.warn('[SAM] webgpu/fp16 load failed, falling back', e);
+        return sam.lib.SamModel.from_pretrained(SAM_MODEL_ID);
+      });
+    sam.processor = await sam.lib.AutoProcessor.from_pretrained(SAM_MODEL_ID);
+    sam.status = 'ready';
+    samSetStatus('model ready — encode A next');
+  } catch (err) {
+    console.error('[SAM] load failed', err);
+    sam.status = 'error';
+    samSetStatus(`load failed: ${err.message || err}`);
+  }
+}
+
+async function samEncodeA() {
+  if (!sam.model) { samSetStatus('load model first'); return; }
+  if (!state.imgA) { samSetStatus('no image in slot A'); return; }
+  sam.status = 'encoding';
+  samSetStatus('encoding image A …');
+  try {
+    const bitmap = await createImageBitmap(state.imgA);
+    const c = new OffscreenCanvas(bitmap.width, bitmap.height);
+    const cctx = c.getContext('2d');
+    cctx.drawImage(bitmap, 0, 0);
+    bitmap.close();
+    const imageData = cctx.getImageData(0, 0, c.width, c.height);
+    sam.rawImage = new sam.lib.RawImage(imageData.data, c.width, c.height, 4);
+    sam.imageInputs = await sam.processor(sam.rawImage);
+    sam.imageEmbeddings = await sam.model.get_image_embeddings(sam.imageInputs);
+    sam.encodedImgRef = state.imgA;
+    sam.points = [];
+    sam.maskCanvas = null;
+    samDrawOverlay();
+    sam.status = 'encoded';
+    samSetStatus(`encoded ${c.width}×${c.height} — click overlay to segment`);
+  } catch (err) {
+    console.error('[SAM] encode failed', err);
+    sam.status = 'error';
+    samSetStatus(`encode failed: ${err.message || err}`);
+  }
+}
+
+async function samSegmentAtPoint(imgX, imgY, label = 1) {
+  if (!sam.imageEmbeddings) { samSetStatus('encode A first'); return; }
+  if (sam.encodedImgRef !== state.imgA) { samSetStatus('A changed — re-encode'); return; }
+  sam.points.push({ x: imgX, y: imgY, label });
+  const wasStatus = sam.status;
+  sam.status = 'segmenting';
+  samSetStatus(`segmenting (${sam.points.length} pt${sam.points.length===1?'':'s'}) …`);
+  try {
+    // shape: [num_objects=1, num_points, 2] and [num_objects=1, num_points]
+    const points = [sam.points.map(p => [p.x, p.y])];
+    const labels = [sam.points.map(p => p.label)];
+    const decoderInputs = await sam.processor(sam.rawImage, {
+      input_points: points,
+      input_labels: labels,
+    });
+    const outputs = await sam.model({
+      ...sam.imageEmbeddings,
+      input_points: decoderInputs.input_points,
+      input_labels: decoderInputs.input_labels,
+    });
+    const masks = await sam.processor.post_process_masks(
+      outputs.pred_masks,
+      sam.imageInputs.original_sizes,
+      sam.imageInputs.reshaped_input_sizes,
+    );
+    const scores = outputs.iou_scores.data;
+    let bestIdx = 0;
+    for (let i = 1; i < scores.length; i++) if (scores[i] > scores[bestIdx]) bestIdx = i;
+    sam.maskCanvas = samBuildMaskCanvas(masks[0], bestIdx);
+    samDrawOverlay();
+    sam.status = 'encoded';
+    samSetStatus(`mask (iou=${scores[bestIdx].toFixed(2)}) — click to refine, shift-click excludes`);
+  } catch (err) {
+    console.error('[SAM] segment failed', err);
+    sam.status = wasStatus;
+    samSetStatus(`segment failed: ${err.message || err}`);
+  }
+}
+
+function samBuildMaskCanvas(maskTensor, maskIdx) {
+  // maskTensor.dims = [num_obj=1, num_masks_per_obj, H, W]
+  const dims = maskTensor.dims;
+  const H = dims[dims.length - 2];
+  const W = dims[dims.length - 1];
+  const stride = H * W;
+  const start = maskIdx * stride;
+  const data = maskTensor.data;
+  const c = new OffscreenCanvas(W, H);
+  const ctx = c.getContext('2d');
+  const img = ctx.createImageData(W, H);
+  for (let i = 0; i < stride; i++) {
+    const on = Boolean(data[start + i]);
+    const o = i * 4;
+    img.data[o + 0] = 70;
+    img.data[o + 1] = 170;
+    img.data[o + 2] = 255;
+    img.data[o + 3] = on ? 120 : 0;
+  }
+  ctx.putImageData(img, 0, 0);
+  return c;
+}
+
+const samOverlay = document.getElementById('sam-overlay');
+const samOverlayCtx = samOverlay.getContext('2d');
+
+function samSyncOverlay() {
+  const r = canvas.getBoundingClientRect();
+  samOverlay.style.left   = r.left   + 'px';
+  samOverlay.style.top    = r.top    + 'px';
+  samOverlay.style.width  = r.width  + 'px';
+  samOverlay.style.height = r.height + 'px';
+  const dpr = window.devicePixelRatio || 1;
+  const bw = Math.max(1, Math.round(r.width  * dpr));
+  const bh = Math.max(1, Math.round(r.height * dpr));
+  if (samOverlay.width  !== bw) samOverlay.width  = bw;
+  if (samOverlay.height !== bh) samOverlay.height = bh;
+}
+
+function samDrawOverlay() {
+  if (!sam.segmentMode) return;
+  samSyncOverlay();
+  samOverlayCtx.clearRect(0, 0, samOverlay.width, samOverlay.height);
+  if (!sam.encodedImgRef) return;
+  const iw = sam.encodedImgRef.naturalWidth  || sam.encodedImgRef.width;
+  const ih = sam.encodedImgRef.naturalHeight || sam.encodedImgRef.height;
+  if (sam.maskCanvas) {
+    samOverlayCtx.imageSmoothingEnabled = false;
+    samOverlayCtx.drawImage(sam.maskCanvas, 0, 0, samOverlay.width, samOverlay.height);
+  }
+  const dpr = window.devicePixelRatio || 1;
+  for (const p of sam.points) {
+    const cx = (p.x / iw) * samOverlay.width;
+    const cy = (p.y / ih) * samOverlay.height;
+    samOverlayCtx.beginPath();
+    samOverlayCtx.arc(cx, cy, 6 * dpr, 0, Math.PI * 2);
+    samOverlayCtx.fillStyle = p.label === 1 ? '#4af' : '#f55';
+    samOverlayCtx.fill();
+    samOverlayCtx.lineWidth = 1.5 * dpr;
+    samOverlayCtx.strokeStyle = '#000';
+    samOverlayCtx.stroke();
+  }
+}
+
+function samSetSegmentMode(on) {
+  sam.segmentMode = on;
+  samOverlay.classList.toggle('visible', on);
+  samOverlay.classList.toggle('interactive', on);
+  if (on) samDrawOverlay();
+}
+
+samOverlay.addEventListener('click', (e) => {
+  if (!sam.segmentMode) return;
+  if (!sam.encodedImgRef) { samSetStatus('encode A first'); return; }
+  const r = samOverlay.getBoundingClientRect();
+  const iw = sam.encodedImgRef.naturalWidth  || sam.encodedImgRef.width;
+  const ih = sam.encodedImgRef.naturalHeight || sam.encodedImgRef.height;
+  if (e.altKey) { sam.points = []; sam.maskCanvas = null; samDrawOverlay(); return; }
+  const label = e.shiftKey ? 0 : 1;
+  const px = ((e.clientX - r.left) / r.width)  * iw;
+  const py = ((e.clientY - r.top)  / r.height) * ih;
+  samSegmentAtPoint(px, py, label);
+});
+
+window.addEventListener('resize', () => { if (sam.segmentMode) samDrawOverlay(); });
+new ResizeObserver(() => { if (sam.segmentMode) samDrawOverlay(); }).observe(canvas);
+
+function samClearMask() {
+  sam.points = [];
+  sam.maskCanvas = null;
+  samDrawOverlay();
+  samSetStatus(sam.encodedImgRef ? 'cleared — click overlay to start' : 'load model + encode A');
+}
+
+// ----- Saved regions: build a per-pixel "fade time" texture for mode 31 -----
+//
+// Each saved region is a binary mask at the encoded image's resolution. To
+// drive mode 31 we pack them into one rgba8unorm texture where r = pixelT in
+// [0,1], the t at which that pixel should be midway through fading A→B. With
+// N saved regions we use N+1 time slots: region i (1-indexed) → (i-0.5)/(N+1),
+// background → (N+0.5)/(N+1). Overlapping regions: latest save wins.
+sam.regions = []; // [{ id, name, w, h, data: Uint8Array(w*h) of 0|1 }]
+
+function samExtractCurrentMaskAsBinary() {
+  if (!sam.maskCanvas) return null;
+  const W = sam.maskCanvas.width;
+  const H = sam.maskCanvas.height;
+  const ctx = sam.maskCanvas.getContext('2d');
+  const img = ctx.getImageData(0, 0, W, H);
+  const out = new Uint8Array(W * H);
+  for (let i = 0, j = 3; i < out.length; i++, j += 4) out[i] = img.data[j] > 0 ? 1 : 0;
+  return { w: W, h: H, data: out };
+}
+
+function samRebuildRegionsTexture() {
+  // Replace the bound texRegions texture in-place. If no regions remain, fall
+  // back to the 1×1 placeholder (r=0 means everything fades immediately at
+  // t=0 — but mode 31 only renders sensibly with at least one region).
+  const wasReal = texRegions && texRegions !== placeholderTexRegions;
+  if (!sam.regions.length) {
+    if (wasReal) texRegions.destroy();
+    texRegions = placeholderTexRegions;
+    bindGroup = makeBindGroup();
+    return;
+  }
+  const W = sam.regions[0].w;
+  const H = sam.regions[0].h;
+  const N = sam.regions.length;
+  const slots = N + 1; // +1 for background
+  const bgByte = Math.round(((slots - 0.5) / slots) * 255);
+  const data = new Uint8Array(W * H * 4);
+  for (let i = 0; i < W * H; i++) { data[i*4 + 0] = bgByte; data[i*4 + 3] = 255; }
+  for (let r = 0; r < N; r++) {
+    const region = sam.regions[r];
+    if (region.w !== W || region.h !== H) {
+      console.warn(`[SAM] region ${r} size ${region.w}×${region.h} ≠ first ${W}×${H} — skipping`);
+      continue;
+    }
+    const ptByte = Math.round((((r + 1) - 0.5) / slots) * 255);
+    const mask = region.data;
+    for (let i = 0; i < W * H; i++) if (mask[i]) data[i*4 + 0] = ptByte;
+  }
+  if (wasReal) texRegions.destroy();
+  const tex = device.createTexture({
+    label: 'tex-regions',
+    size: [W, H, 1], format: 'rgba8unorm',
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+  });
+  device.queue.writeTexture({ texture: tex }, data, { bytesPerRow: W * 4 }, [W, H, 1]);
+  texRegions = tex;
+  bindGroup = makeBindGroup();
+}
+
+function samSaveCurrentMaskAsRegion(name) {
+  const bin = samExtractCurrentMaskAsBinary();
+  if (!bin) { samSetStatus('no mask to save — click first'); return; }
+  // sanity check: region sizes must match across the list
+  if (sam.regions.length && (sam.regions[0].w !== bin.w || sam.regions[0].h !== bin.h)) {
+    samSetStatus(`size mismatch ${bin.w}×${bin.h} ≠ ${sam.regions[0].w}×${sam.regions[0].h} — clear regions first`);
+    return;
+  }
+  const id = Date.now() + Math.random();
+  const finalName = name || `region ${sam.regions.length + 1}`;
+  sam.regions.push({ id, name: finalName, w: bin.w, h: bin.h, data: bin.data });
+  sam.points = [];
+  sam.maskCanvas = null;
+  samDrawOverlay();
+  samRebuildRegionsTexture();
+  samRefreshRegionsList();
+  samSetStatus(`saved "${finalName}" — ${sam.regions.length} region${sam.regions.length===1?'':'s'} — click to start the next`);
+}
+
+function samRemoveRegion(id) {
+  const before = sam.regions.length;
+  sam.regions = sam.regions.filter(r => r.id !== id);
+  if (sam.regions.length !== before) {
+    samRebuildRegionsTexture();
+    samRefreshRegionsList();
+    samSetStatus(`removed — ${sam.regions.length} left`);
+  }
+}
+
+function samClearRegions() {
+  if (!sam.regions.length) { samSetStatus('no regions to clear'); return; }
+  sam.regions = [];
+  samRebuildRegionsTexture();
+  samRefreshRegionsList();
+  samSetStatus('all regions cleared');
+}
+
+// ----- UI -----
+const fSamLoad = tabSegment.addFolder({ title: 'Model', expanded: true });
+samStatusBinding = fSamLoad.addBinding(samUIState, 'status', { readonly: true, label: 'status' });
+fSamLoad.addButton({ title: '1. Load model (~25 MB)' }).on('click', () => samLoadModel());
+fSamLoad.addButton({ title: '2. Encode current A' }).on('click', () => samEncodeA());
+
+const fSamPick = tabSegment.addFolder({ title: 'Pick (overlay clicks)', expanded: true });
+const samToggle = { active: false };
+fSamPick.addBinding(samToggle, 'active', { label: 'segment mode' }).on('change', (ev) => {
+  samSetSegmentMode(ev.value);
+});
+fSamPick.addButton({ title: 'Clear points / mask' }).on('click', () => samClearMask());
+fSamPick.addButton({ title: '+ Save current mask as region' }).on('click', () => samSaveCurrentMaskAsRegion());
+
+const fSamRegions = tabSegment.addFolder({ title: 'Regions', expanded: true });
+fSamRegions.addButton({ title: 'Clear all regions' }).on('click', () => samClearRegions());
+// Child folder so dynamically-added per-region buttons stay grouped — refresh
+// just disposes and rebuilds the children, not the parent's structural buttons.
+const fSamRegionsList = fSamRegions.addFolder({ title: 'List', expanded: true });
+let samRegionBlades = [];
+function samRefreshRegionsList() {
+  for (const b of samRegionBlades) b.dispose();
+  samRegionBlades = [];
+  if (!sam.regions.length) {
+    samRegionBlades.push(fSamRegionsList.addButton({ title: '(none — save a mask first)', disabled: true }));
+  } else {
+    for (let i = 0; i < sam.regions.length; i++) {
+      const region = sam.regions[i];
+      const btn = fSamRegionsList.addButton({ title: `× ${i + 1}. ${region.name}` });
+      btn.on('click', () => samRemoveRegion(region.id));
+      samRegionBlades.push(btn);
+    }
+  }
+}
+samRefreshRegionsList();
+
+const fSamHelp = tabSegment.addFolder({ title: 'Help', expanded: false });
+const samHelp = {
+  click: 'include region',
+  shiftClick: 'exclude region',
+  altClick: 'reset mask',
+};
+fSamHelp.addBinding(samHelp, 'click',      { readonly: true, label: 'click' });
+fSamHelp.addBinding(samHelp, 'shiftClick', { readonly: true, label: 'shift-click' });
+fSamHelp.addBinding(samHelp, 'altClick',   { readonly: true, label: 'alt-click' });
 
 // Expose for headless / automation experiments
 // ----- Auto-persist all settings to localStorage -----

@@ -13,6 +13,16 @@ body.minimized #canvas { box-shadow: none; }
 body.minimized #canvas { max-width: 100vw; max-height: 100vh; }
 #canvas.empty { display: none; }
 
+/* SAM segmentation overlay — positioned by JS to sit exactly over the WebGPU
+   canvas. pointer-events on only when segment mode is active. */
+#sam-overlay {
+  position: fixed; pointer-events: none;
+  display: none;
+  z-index: 50;
+}
+#sam-overlay.visible { display: block; }
+#sam-overlay.interactive { pointer-events: auto; cursor: crosshair; }
+
 #side {
   position: fixed; top: 0; right: 0; bottom: 0; width: 360px;
   background: #0d0d0d; border-left: 1px solid #1a1a1a;
