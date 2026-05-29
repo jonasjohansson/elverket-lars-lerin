@@ -227,8 +227,8 @@ fn paperMask(uv: vec2f) -> f32 {
   // head start, so the reveal ignites in organic pools across the surface
   // rather than sweeping as a single global threshold front.
   if (p.paperPatches > 0.001) {
-    let patch = fbm(uv * 2.3 + p.seed * 0.37 + 11.0);
-    m = clamp(m + (patch - 0.5) * p.paperPatches * 1.2, 0.0, 1.0);
+    let patchN = fbm(uv * 2.3 + p.seed * 0.37 + 11.0);
+    m = clamp(m + (patchN - 0.5) * p.paperPatches * 1.2, 0.0, 1.0);
   }
   return m;
 }
