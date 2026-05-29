@@ -90,7 +90,7 @@ struct Params {
   // -- 368..383 -- dabs wobble / density / global paper grain
   dabsWobble: f32, densityGravity: f32, densitySmear: f32, paperGrain: f32,
   formStrokeCount: u32, formStrokeSize: f32, formStrokeWobble: f32, _f1: f32,
-  bloomLightBias: f32, bloomWobble: f32, bloomPaperShow: f32, _b1: f32,
+  bloomLightBias: f32, bloomWobble: f32, bloomPaperShow: f32, bloomImageBias: f32,
   stageBands: f32, stageOverlap: f32, _s1: f32, _s2: f32,
   migrationStrength: f32, migrationDir: u32, migrationTurb: f32, _m1: f32,
   boundsEnable: u32, boundsCx: f32, boundsCy: f32, boundsW: f32,
@@ -107,7 +107,7 @@ struct Params {
   meltGlowColor: vec3f, videoContrast: f32,
   lightIntensity: f32, lightSpread: f32, lightPeakT: f32, lightFlashWidth: f32,
   lightColor: vec3f, videoSaturate: f32,
-  _rg0: f32, _rg1: f32, _rg2: f32, _rg3: f32,
+  paperGrowth: f32, paperFollow: f32, paperPatches: f32, videoDisplaceAmount: f32,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -197,12 +197,40 @@ fn edgeMag(tex: texture_2d<f32>, uv: vec2f, scale: vec2f, offset: vec2f, valid: 
 fn paperMask(uv: vec2f) -> f32 {
   let ang = p.paperAngle * 3.14159265;
   let ca = cos(ang); let sa = sin(ang);
-  let g  = vec2f(ca * (uv.x - 0.5) + sa * (uv.y - 0.5),
+  var g  = vec2f(ca * (uv.x - 0.5) + sa * (uv.y - 0.5),
                 -sa * (uv.x - 0.5) + ca * (uv.y - 0.5));
+
+  // ---- image follow: bend the fiber frame along B's local luma gradient so
+  // the grain runs with the painting's strokes instead of one fixed angle.
+  if (p.paperFollow > 0.001) {
+    let e = 0.004;
+    let gx = luma(sampleFit(texB, uv + vec2f(e, 0.0), p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb)
+           - luma(sampleFit(texB, uv - vec2f(e, 0.0), p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb);
+    let gy = luma(sampleFit(texB, uv + vec2f(0.0, e), p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb)
+           - luma(sampleFit(texB, uv - vec2f(0.0, e), p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb);
+    g = g + vec2f(gx, gy) * p.paperFollow * 2.5;
+  }
+
   let stretched = vec2f(g.x * p.maskScale, g.y * p.maskScale * p.paperAniso);
   let base = fbm(stretched + p.seed * 0.13);
-  let tooth = fbm(uv * (p.maskScale * 14.0) + p.seed * 1.7) - 0.5;
-  return clamp(base + tooth * p.paperGranulation * 0.35, 0.0, 1.0);
+
+  // ---- fiber growth: the fine "tooth" grain creeps ALONG the fiber direction
+  // as t advances. Early on it is sampled offset down the grain (filaments
+  // look short / unformed), settling into place by t=1 so individual fibers
+  // appear to extend and fill in rather than simply fade up in place.
+  let grow = (1.0 - clamp(p.t, 0.0, 1.0)) * p.paperGrowth;
+  let toothUV = uv * (p.maskScale * 14.0) + vec2f(ca, sa) * grow * 5.0 + p.seed * 1.7;
+  let tooth = fbm(toothUV) - 0.5;
+  var m = clamp(base + tooth * p.paperGranulation * 0.35, 0.0, 1.0);
+
+  // ---- local patches: a coarse low-frequency field gives scattered regions a
+  // head start, so the reveal ignites in organic pools across the surface
+  // rather than sweeping as a single global threshold front.
+  if (p.paperPatches > 0.001) {
+    let patch = fbm(uv * 2.3 + p.seed * 0.37 + 11.0);
+    m = clamp(m + (patch - 0.5) * p.paperPatches * 1.2, 0.0, 1.0);
+  }
+  return m;
 }
 
 fn bloomsMask(uv: vec2f) -> f32 {
@@ -210,7 +238,24 @@ fn bloomsMask(uv: vec2f) -> f32 {
   for (var i = 0u; i < 24u; i = i + 1u) {
     if (i >= p.bloomCount) { break; }
     let fi = f32(i) + p.seed * 0.07 + 1.0;
-    let sp = vec2f(hash21(vec2f(fi * 1.3, 13.0)), hash21(vec2f(fi * 2.7, 47.0)));
+    var sp = vec2f(hash21(vec2f(fi * 1.3, 13.0)), hash21(vec2f(fi * 2.7, 47.0)));
+
+    // ---- image-driven seeding: try a few candidate origins and migrate the
+    // bloom toward the brightest pool in B nearby — backruns form where wet
+    // pigment collects, so blooms erupt from the painting's light areas
+    // instead of purely random points.
+    if (p.bloomImageBias > 0.001) {
+      var best = sp;
+      var bestL = luma(sampleFit(texB, sp, p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb);
+      for (var k = 1u; k < 4u; k = k + 1u) {
+        let cand = vec2f(hash21(vec2f(fi * 1.3 + f32(k) * 7.1, 13.0)),
+                         hash21(vec2f(fi * 2.7 + f32(k) * 3.9, 47.0)));
+        let lc = luma(sampleFit(texB, cand, p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb);
+        if (lc > bestL) { bestL = lc; best = cand; }
+      }
+      sp = mix(sp, best, p.bloomImageBias);
+    }
+
     let startT = hash21(vec2f(fi, 91.0)) * 0.4;
     let jitter = 0.85 + 0.3 * hash21(vec2f(fi, 11.0));
     let d = distance(uv, sp);
@@ -946,7 +991,7 @@ fn organicMask(uv: vec2f, lA: f32, lB: f32, edge: f32) -> f32 {
     let lR = luma(adjustedT(uv + vec2f(e, 0.0)));
     let lU = luma(adjustedT(uv - vec2f(0.0, e)));
     let lD = luma(adjustedT(uv + vec2f(0.0, e)));
-    let dispBase = vec2f(lR - lL, lD - lU) * 0.08;
+    let dispBase = vec2f(lR - lL, lD - lU) * 0.08 * p.videoDisplaceAmount;
     colA_eff = sampleFit(texA, uv + dispBase * p.videoDisplace,  p.scaleA, p.offsetA, p.validA, p.slotAColor).rgb;
     cB_eff   = sampleFit(texB, uv + dispBase * p.videoDisplaceB, p.scaleB, p.offsetB, p.validB, p.slotBColor).rgb;
   }
@@ -1192,11 +1237,12 @@ fn organicMask(uv: vec2f, lA: f32, lB: f32, edge: f32) -> f32 {
       effMixT = 0.0;
     }
   }
-  // Per-slot alpha: 0 when that slot is in 'transparent' mode (valid==3u), 1 otherwise.
-  // Final alpha mixes the same way as RGB; output premultiplied for correct
-  // canvas compositing and AE imports.
-  let alphaA = select(1.0, 0.0, p.validA == 3u);
-  let alphaB = select(1.0, 0.0, p.validB == 3u);
+  // Per-slot alpha comes straight from sampleFit: a PNG's own alpha channel for
+  // image slots (valid==1u), 0 for 'transparent' fill mode (valid==3u), and 1 for
+  // bg/solid (valid 0u/2u). Final alpha mixes the same way as RGB; output is
+  // premultiplied for correct canvas compositing and AE imports.
+  let alphaA = cA.a;
+  let alphaB = cB.a;
   let alpha = mix(alphaA, alphaB, effMixT);
   let rgb = clamp(outc, vec3f(0.0), vec3f(1.0));
   return vec4f(rgb * alpha, alpha);
@@ -1267,7 +1313,7 @@ struct Params {
   edgeFirstScale: f32, flowAmount: f32, dabsCount: u32, dabsReach: f32,
   dabsWobble: f32, densityGravity: f32, densitySmear: f32, paperGrain: f32,
   formStrokeCount: u32, formStrokeSize: f32, formStrokeWobble: f32, _f1: f32,
-  bloomLightBias: f32, bloomWobble: f32, bloomPaperShow: f32, _b1: f32,
+  bloomLightBias: f32, bloomWobble: f32, bloomPaperShow: f32, bloomImageBias: f32,
   stageBands: f32, stageOverlap: f32, _s1: f32, _s2: f32,
   migrationStrength: f32, migrationDir: u32, migrationTurb: f32, _m1: f32,
   boundsEnable: u32, boundsCx: f32, boundsCy: f32, boundsW: f32,
@@ -1284,7 +1330,7 @@ struct Params {
   meltGlowColor: vec3f, videoContrast: f32,
   lightIntensity: f32, lightSpread: f32, lightPeakT: f32, lightFlashWidth: f32,
   lightColor: vec3f, videoSaturate: f32,
-  _rg0: f32, _rg1: f32, _rg2: f32, _rg3: f32,
+  paperGrowth: f32, paperFollow: f32, paperPatches: f32, videoDisplaceAmount: f32,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -1495,7 +1541,7 @@ struct Params {
   edgeFirstScale: f32, flowAmount: f32, dabsCount: u32, dabsReach: f32,
   dabsWobble: f32, densityGravity: f32, densitySmear: f32, paperGrain: f32,
   formStrokeCount: u32, formStrokeSize: f32, formStrokeWobble: f32, _f1: f32,
-  bloomLightBias: f32, bloomWobble: f32, bloomPaperShow: f32, _b1: f32,
+  bloomLightBias: f32, bloomWobble: f32, bloomPaperShow: f32, bloomImageBias: f32,
   stageBands: f32, stageOverlap: f32, _s1: f32, _s2: f32,
   migrationStrength: f32, migrationDir: u32, migrationTurb: f32, _m1: f32,
   boundsEnable: u32, boundsCx: f32, boundsCy: f32, boundsW: f32,
@@ -1512,7 +1558,7 @@ struct Params {
   meltGlowColor: vec3f, videoContrast: f32,
   lightIntensity: f32, lightSpread: f32, lightPeakT: f32, lightFlashWidth: f32,
   lightColor: vec3f, videoSaturate: f32,
-  _rg0: f32, _rg1: f32, _rg2: f32, _rg3: f32,
+  paperGrowth: f32, paperFollow: f32, paperPatches: f32, videoDisplaceAmount: f32,
 };
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var texA: texture_2d<f32>;
@@ -1694,7 +1740,11 @@ function makeBindGroup(stateView) {
 let bindGroup = makeBindGroup();
 
 async function uploadImageToSlot(img, slot) {
-  let bitmap = await createImageBitmap(img);
+  // premultiplyAlpha:'none' keeps the PNG's straight (un-premultiplied) alpha in
+  // the texture. The shader blends straight RGB and premultiplies once at output
+  // (canvas is alphaMode:'premultiplied'), so a premultiplied bitmap here would
+  // double-darken semi-transparent edges.
+  let bitmap = await createImageBitmap(img, { premultiplyAlpha: 'none' });
   let w = bitmap.width, h = bitmap.height;
   // If the image is larger than the GPU's max 2D texture dimension, downscale
   // it during decode rather than letting the texture creation fail silently.
@@ -1704,7 +1754,7 @@ async function uploadImageToSlot(img, slot) {
     const nw = Math.round(w * scale), nh = Math.round(h * scale);
     console.log(`[upload ${slot}] image ${w}x${h} exceeds GPU max ${GPU_MAX_TEX} — downscaling to ${nw}x${nh}`);
     const big = bitmap;
-    bitmap = await createImageBitmap(big, { resizeWidth: nw, resizeHeight: nh, resizeQuality: 'high' });
+    bitmap = await createImageBitmap(big, { resizeWidth: nw, resizeHeight: nh, resizeQuality: 'high', premultiplyAlpha: 'none' });
     big.close();
     w = nw; h = nh;
   }
@@ -1747,7 +1797,11 @@ const state = {
   // mode-specific defaults (mirrors v1)
   rimWidth: 0.12, rimDark: 0.6,
   paperAngle: 0, paperAniso: 4, paperGranulation: 0.5,
+  // mode 2 organic/animated extensions: fibers grow along the grain, bend
+  // along B's strokes, and reveal ignites in local patches (0 = old static look)
+  paperGrowth: 0.5, paperFollow: 0.35, paperPatches: 0.45,
   bloomCount: 8, bloomRim: 0.6, bloomRate: 0.55,
+  bloomImageBias: 0.6,  // mode 3: bias bloom seeds toward B's bright pools
   diffStrength: 0.55, diffRadius: 0.45,
   sedBands: 6, sedSoftness: 0.35, sedDirection: 0, sedSource: 0,
   saltDensity: 0.0, saltContrast: 0.55,
@@ -1815,6 +1869,7 @@ const state = {
   burnColorBleed: 0,
   // mode 28 — video mask
   videoMaskInvert: false, videoMaskFeather: 0, videoDisplace: 0.2, videoDisplaceB: 0.2,
+  videoDisplaceAmount: 1.0,  // master multiplier on T-video displacement (0..4)
   videoBrightness: 0, videoContrast: 1, videoSaturate: 1,
   // mode 29 — film melt
   meltCellScale: 7, meltCenterX: 0.5, meltCenterY: 0.5, meltCellJitter: 0.7,
@@ -2006,7 +2061,7 @@ function writeUniforms() {
   uboF32[100] = state.bloomLightBias;
   uboF32[101] = state.bloomWobble;
   uboF32[102] = state.bloomPaperShow;
-  uboF32[103] = 0;
+  uboF32[103] = state.bloomImageBias;
   uboF32[104] = state.stageBands;
   uboF32[105] = state.stageOverlap;
   uboF32[106] = 0; uboF32[107] = 0;
@@ -2068,6 +2123,11 @@ function writeUniforms() {
   uboF32[163] = state.lightFlashWidth;
   const lc = hexToRgb(state.lightColor);
   uboF32[164] = lc[0]; uboF32[165] = lc[1]; uboF32[166] = lc[2]; uboF32[167] = state.videoSaturate;
+  // -- 168..170 -- mode 2 paper-grain organic/animated extensions
+  uboF32[168] = state.paperGrowth;
+  uboF32[169] = state.paperFollow;
+  uboF32[170] = state.paperPatches;
+  uboF32[171] = state.videoDisplaceAmount;
   // -- 80..95 -- new painterly modes (16..21) + global paper grain
   uboF32[80] = state.strokeScale;
   uboF32[81] = state.strokeAniso;
@@ -2657,7 +2717,7 @@ function randomizeMode(modeId, folder) {
 
 const fPlay = pane.addFolder({ title: 'Playback', expanded: true });
 const bT = fPlay.addBinding(state, 't', { min: 0, max: 1, step: 0.001, label: 'progress' });
-fPlay.addBinding(state, 'duration', { min: 0.5, max: 30, step: 0.1 });
+fPlay.addBinding(state, 'duration', { min: 0.5, max: 45, step: 0.1 });
 
 function togglePlay() {
   if (state.playing) { state.playing = false; }
@@ -2718,8 +2778,8 @@ const tabSegment = tabs.pages[4];
 // mode folder to restore that mode's params without touching anything else.
 const MODE_DEFAULTS = {
   1:  { rimWidth: 0.12, rimDark: 0.6 },
-  2:  { paperAngle: 0, paperAniso: 4, paperGranulation: 0.5 },
-  3:  { bloomCount: 8, bloomRim: 0.6, bloomRate: 0.55 },
+  2:  { paperAngle: 0, paperAniso: 4, paperGranulation: 0.5, paperGrowth: 0.5, paperFollow: 0.35, paperPatches: 0.45 },
+  3:  { bloomCount: 8, bloomRim: 0.6, bloomRate: 0.55, bloomImageBias: 0.6 },
   4:  { diffStrength: 0.55, diffRadius: 0.45 },
   5:  { sedBands: 6, sedSoftness: 0.35, sedDirection: 0, sedSource: 0 },
   6:  { saltDensity: 0.0, saltContrast: 0.55, saltSource: 1, saltBias: 0.6, saltImage: 2 },
@@ -2857,12 +2917,16 @@ const fPaper  = fWater.addFolder({ title: 'Paper grain',    expanded: true });
 fPaper.addBinding(state, 'paperAngle',       { min: 0, max: 1, step: 0.005, label: 'fiber angle' });
 fPaper.addBinding(state, 'paperAniso',       { min: 1, max: 10, step: 0.1, label: 'anisotropy' });
 fPaper.addBinding(state, 'paperGranulation', { min: 0, max: 1, step: 0.01, label: 'granulation' });
+fPaper.addBinding(state, 'paperGrowth',      { min: 0, max: 1, step: 0.01, label: 'fiber growth' });
+fPaper.addBinding(state, 'paperFollow',      { min: 0, max: 1, step: 0.01, label: 'follow B strokes' });
+fPaper.addBinding(state, 'paperPatches',     { min: 0, max: 1, step: 0.01, label: 'local patches' });
 addModeFooter(fPaper, 2);
 
 const fBlooms = fWater.addFolder({ title: 'Backrun blooms', expanded: true });
 fBlooms.addBinding(state, 'bloomCount', { min: 1, max: 24, step: 1, label: 'count' });
 fBlooms.addBinding(state, 'bloomRate',  { min: 0.1, max: 2, step: 0.01, label: 'growth rate' });
 fBlooms.addBinding(state, 'bloomRim',   { min: 0, max: 1, step: 0.01, label: 'rim dark' });
+fBlooms.addBinding(state, 'bloomImageBias', { min: 0, max: 1, step: 0.01, label: 'follow B lights' });
 addModeFooter(fBlooms, 3);
 
 const fDiff   = fWater.addFolder({ title: 'Wet diffusion',  expanded: true });
@@ -3506,6 +3570,7 @@ fStyle.addBinding(state, 'fit', {
 });
 fStyle.addBinding(state, 'bg', { view: 'color' });
 fStyle.addBinding(state, 'paperGrain', { min: 0, max: 1, step: 0.01, label: 'paper grain' });
+fStyle.addBinding(state, 'videoDisplaceAmount', { min: 0, max: 4, step: 0.01, label: 'T displace amount' });
 fStyle.addBinding(state, 'videoDisplace',  { min: -1, max: 1, step: 0.01, label: 'T displace A' });
 fStyle.addBinding(state, 'videoDisplaceB', { min: -1, max: 1, step: 0.01, label: 'T displace B' });
 
@@ -3534,8 +3599,8 @@ fBounds.addBinding(state, 'boundsSoftness', { min: 0, max: 0.3,  step: 0.005, la
 const PRESET_KEYS = [
   'duration', 'mode', 'curve', 'seed',
   'rimWidth', 'rimDark',
-  'paperAngle', 'paperAniso', 'paperGranulation',
-  'bloomCount', 'bloomRim', 'bloomRate',
+  'paperAngle', 'paperAniso', 'paperGranulation', 'paperGrowth', 'paperFollow', 'paperPatches',
+  'bloomCount', 'bloomRim', 'bloomRate', 'bloomImageBias',
   'diffStrength', 'diffRadius',
   'sedBands', 'sedSoftness', 'sedDirection', 'sedSource',
   'saltDensity', 'saltContrast', 'saltSource', 'saltBias', 'saltImage',
@@ -3566,7 +3631,7 @@ const PRESET_KEYS = [
   'burnGlowIntensity', 'burnGlowWidth', 'burnEmberTrail',
   'burnSeedCount', 'burnBrowning', 'burnBrowningWidth', 'burnAshSpatter', 'burnGlowColor',
   'burnBIgnite', 'burnGlowFromB', 'burnColorBleed',
-  'videoMaskInvert', 'videoMaskFeather', 'videoDisplace', 'videoDisplaceB',
+  'videoMaskInvert', 'videoMaskFeather', 'videoDisplace', 'videoDisplaceB', 'videoDisplaceAmount',
   'videoBrightness', 'videoContrast', 'videoSaturate',
   'meltCellScale', 'meltCenterX', 'meltCenterY', 'meltCellJitter',
   'meltInkAmount', 'meltGlowIntensity', 'meltGlowColor',
