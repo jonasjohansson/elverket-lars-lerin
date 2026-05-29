@@ -91,7 +91,7 @@ struct Params {
   dabsWobble: f32, densityGravity: f32, densitySmear: f32, paperGrain: f32,
   formStrokeCount: u32, formStrokeSize: f32, formStrokeWobble: f32, _f1: f32,
   bloomLightBias: f32, bloomWobble: f32, bloomPaperShow: f32, bloomImageBias: f32,
-  stageBands: f32, stageOverlap: f32, _s1: f32, _s2: f32,
+  stageBands: f32, stageOverlap: f32, matteOutput: u32, matteInvert: u32,
   migrationStrength: f32, migrationDir: u32, migrationTurb: f32, _m1: f32,
   boundsEnable: u32, boundsCx: f32, boundsCy: f32, boundsW: f32,
   boundsH: f32, boundsSoftness: f32, weBLumaBias: f32, maskShift: f32,
@@ -1244,6 +1244,18 @@ fn organicMask(uv: vec2f, lA: f32, lB: f32, edge: f32) -> f32 {
   let alphaA = cA.a;
   let alphaB = cB.a;
   let alpha = mix(alphaA, alphaB, effMixT);
+
+  // ---- matte output: emit the transition reveal as a grayscale luma matte
+  // (black = still A / not transitioned, white = fully B / transitioned) so
+  // the exact same organic movement can be recorded as a B/W matte video for
+  // use as a luma/track matte in After Effects. Fully opaque so it records
+  // cleanly. matteInvert flips polarity for "reveal A over B" style mattes.
+  if (p.matteOutput == 1u) {
+    var mv = clamp(effMixT, 0.0, 1.0);
+    if (p.matteInvert == 1u) { mv = 1.0 - mv; }
+    return vec4f(vec3f(mv), 1.0);
+  }
+
   let rgb = clamp(outc, vec3f(0.0), vec3f(1.0));
   return vec4f(rgb * alpha, alpha);
 }
@@ -1314,7 +1326,7 @@ struct Params {
   dabsWobble: f32, densityGravity: f32, densitySmear: f32, paperGrain: f32,
   formStrokeCount: u32, formStrokeSize: f32, formStrokeWobble: f32, _f1: f32,
   bloomLightBias: f32, bloomWobble: f32, bloomPaperShow: f32, bloomImageBias: f32,
-  stageBands: f32, stageOverlap: f32, _s1: f32, _s2: f32,
+  stageBands: f32, stageOverlap: f32, matteOutput: u32, matteInvert: u32,
   migrationStrength: f32, migrationDir: u32, migrationTurb: f32, _m1: f32,
   boundsEnable: u32, boundsCx: f32, boundsCy: f32, boundsW: f32,
   boundsH: f32, boundsSoftness: f32, weBLumaBias: f32, maskShift: f32,
@@ -1542,7 +1554,7 @@ struct Params {
   dabsWobble: f32, densityGravity: f32, densitySmear: f32, paperGrain: f32,
   formStrokeCount: u32, formStrokeSize: f32, formStrokeWobble: f32, _f1: f32,
   bloomLightBias: f32, bloomWobble: f32, bloomPaperShow: f32, bloomImageBias: f32,
-  stageBands: f32, stageOverlap: f32, _s1: f32, _s2: f32,
+  stageBands: f32, stageOverlap: f32, matteOutput: u32, matteInvert: u32,
   migrationStrength: f32, migrationDir: u32, migrationTurb: f32, _m1: f32,
   boundsEnable: u32, boundsCx: f32, boundsCy: f32, boundsW: f32,
   boundsH: f32, boundsSoftness: f32, weBLumaBias: f32, maskShift: f32,
@@ -2064,7 +2076,8 @@ function writeUniforms() {
   uboF32[103] = state.bloomImageBias;
   uboF32[104] = state.stageBands;
   uboF32[105] = state.stageOverlap;
-  uboF32[106] = 0; uboF32[107] = 0;
+  uboU32[106] = state.matteOutput ? 1 : 0;
+  uboU32[107] = state.matteInvert ? 1 : 0;
   uboF32[108] = state.migrationStrength;
   uboU32[109] = state.migrationDir;
   uboF32[110] = state.migrationTurb;
@@ -3195,6 +3208,8 @@ fImg.addBinding(state, 'panBy', { min: -1, max: 1, step: 0.005, label: 'B pan y'
 // ----- Export / Record -----
 state.exportFps = 25;
 state.exportSizeMode = '1920';
+state.matteOutput = false;  // emit transition as a B/W luma matte (for AE)
+state.matteInvert = false;
 state.exportPadBottom = 0;  // 0 = no padding; 1 = add full-height black below; 1.416 ≈ Elverket floor ratio
 
 // Prefer HEVC (H.265) over H.264 — HEVC headroom is ~7680 vs ~3840 for AVC, so
@@ -3276,6 +3291,8 @@ function makeFilenameV2() {
 
 let recording = false;
 const fExp = tabOutput.addFolder({ title: 'Export', expanded: true });
+fExp.addBinding(state, 'matteOutput', { label: 'matte output (B/W)' });
+fExp.addBinding(state, 'matteInvert', { label: 'matte invert' });
 fExp.addBinding(state, 'exportFps', {
   label: 'fps', options: { '24 fps': 24, '25 fps': 25, '30 fps': 30, '50 fps': 50, '60 fps': 60 },
 });
@@ -3544,6 +3561,7 @@ async function startRecording(opts = {}) {
       `${offW}x${totalH}`,
     ];
     if (state.exportPadBottom > 0) tail.push(`pad=${fx(state.exportPadBottom)}`);
+    if (state.matteOutput) tail.push(state.matteInvert ? 'matte-inv' : 'matte');
     base = `${base}__${tail.join('__')}`;
   }
   const filename = /\.mp4$/i.test(base) ? base : `${base}.mp4`;
@@ -4149,7 +4167,7 @@ const SESSION_LS_KEY = 'transition-tool-v4:session';
 const PERSIST_KEYS = [
   ...PRESET_KEYS,
   'fit', 'bg',
-  'exportFps', 'exportSizeMode', 'exportPadBottom',
+  'exportFps', 'exportSizeMode', 'exportPadBottom', 'matteOutput', 'matteInvert',
   'slotAFillMode', 'slotAColor', 'slotBFillMode', 'slotBColor', 'keepAOutsideB',
 ];
 function saveSession() {
