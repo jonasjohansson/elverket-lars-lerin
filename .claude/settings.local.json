@@ -7,7 +7,11 @@
       "mcp__touchdesigner__create_td_node",
       "mcp__touchdesigner__update_td_node_parameters",
       "mcp__touchdesigner__get_td_node_parameters",
-      "mcp__touchdesigner__get_td_node_errors"
+      "mcp__touchdesigner__get_td_node_errors",
+      "mcp__google-workspace__list_drive_items",
+      "mcp__google-workspace__create_drive_folder",
+      "mcp__google-workspace__create_spreadsheet",
+      "mcp__google-workspace__modify_sheet_values"
     ]
   }
 }

@@ -191,7 +191,7 @@ const state = {
   lamaPatchPad: 96,     // px of source context around each mask before LaMa sees it
   lamaMaskDilation: 6,  // px to grow the SAM mask so LaMa has a halo to blend into
   lamaPasses: 1,        // 1 = single pass; >1 = jittered crops averaged together
-  lamaTextureBlend: 0.5,// 0 = pure LaMa (smooth); 1 = full paper-grain transfer
+  lamaTextureBlend: 0.7,// 0 = pure LaMa (smooth); 1 = full multi-scale texture transfer
   samModelId: SAM_DEFAULT_MODEL,
 };
 
@@ -510,8 +510,10 @@ document.addEventListener('drop', (e) => {
   slotTEl.classList.remove('drop-target');
   const f = e.dataTransfer?.files?.[0];
   if (!f) return;
-  // Route by mime: video → T slot, image → A slot
-  if (f.type.startsWith('video/')) loadVideoToT(f);
+  // Route by mime / extension: video → T slot, image → A slot, .psd → PSD import
+  const isPsd = /\.psd$/i.test(f.name) || f.type === 'image/vnd.adobe.photoshop';
+  if (isPsd) loadPsd(f);
+  else if (f.type.startsWith('video/')) loadVideoToT(f);
   else if (f.type.startsWith('image/')) loadFile(f);
 });
 
@@ -536,6 +538,86 @@ slotTEl.addEventListener('drop', (e) => {
   const f = e.dataTransfer?.files?.[0];
   if (f?.type.startsWith('video/')) loadVideoToT(f);
 });
+
+// PSD import via ag-psd (lazy-loaded). Composite becomes image A; every
+// visible leaf layer with image data becomes a region whose mask is derived
+// from that layer's alpha channel. Layer dimensions are normalized to the
+// PSD canvas size (layers are positioned via their left/top offsets).
+async function loadPsd(file) {
+  setStatus(`loading PSD parser …`);
+  const { readPsd } = await import('https://esm.sh/ag-psd@27');
+  setStatus(`parsing ${file.name} …`);
+  const buf = await file.arrayBuffer();
+  const psd = readPsd(buf);
+  const W = psd.width, H = psd.height;
+  if (!psd.canvas) throw new Error('PSD has no composite — re-save with "Maximize compatibility" on');
+
+  // Composite → A image
+  const compositeBlob = await new Promise(r => psd.canvas.toBlob(r, 'image/png'));
+  const url = URL.createObjectURL(compositeBlob);
+  const img = new Image();
+  img.src = url;
+  await img.decode();
+  await uploadImage(img);
+  await idbPut('imageA', compositeBlob);
+  await idbDelete('regions');
+  // Add to library so the user can pull this PSD's composite back later
+  const thumb = await makeThumb(compositeBlob, 256);
+  if (thumb) {
+    const id = await libAdd({ blob: compositeBlob, thumb, addedAt: Date.now(), name: file.name });
+    state._libIdCurrent = id;
+  }
+  renderLibrary();
+
+  // Walk layers, flatten to visible leaves with image data
+  function walk(layers, out = []) {
+    for (const layer of layers || []) {
+      if (layer.hidden) continue;
+      if (layer.children) walk(layer.children, out);
+      else if (layer.canvas) out.push(layer);
+    }
+    return out;
+  }
+  const leaves = walk(psd.children);
+
+  regions.length = 0;
+  let imported = 0;
+  for (const layer of leaves) {
+    const left = layer.left | 0;
+    const top  = layer.top  | 0;
+    // Render the layer onto a full-PSD-sized canvas so its mask aligns with A
+    const full = new OffscreenCanvas(W, H);
+    full.getContext('2d').drawImage(layer.canvas, left, top);
+    const fimg = full.getContext('2d').getImageData(0, 0, W, H);
+    const data = new Uint8Array(W * H);
+    let hasPixels = false;
+    for (let i = 0, j = 3; i < data.length; i++, j += 4) {
+      if (fimg.data[j] > 0) { data[i] = 1; hasPixels = true; }
+    }
+    if (!hasPixels) continue;
+    // maskCanvas for overlay display (white-with-alpha)
+    const mc = new OffscreenCanvas(W, H);
+    const mim = new ImageData(W, H);
+    for (let i = 0, j = 0; i < data.length; i++, j += 4) {
+      mim.data[j + 0] = 255;
+      mim.data[j + 1] = 255;
+      mim.data[j + 2] = 255;
+      mim.data[j + 3] = data[i] ? 180 : 0;
+    }
+    mc.getContext('2d').putImageData(mim, 0, 0);
+    regions.push({
+      id: Date.now() + Math.random(),
+      name: layer.name || `layer ${imported + 1}`,
+      w: W, h: H, data, maskCanvas: mc,
+    });
+    imported++;
+  }
+  rebuildRegionsTexture();
+  refreshRegionsUI();
+  await saveRegionsToIDB();
+  setStatus(`PSD imported: ${imported} layer${imported === 1 ? '' : 's'} → regions ready`);
+  setInpaintStatus('regions ready — generate inpaint or use background image method');
+}
 
 async function loadVideoToT(file) {
   const url = URL.createObjectURL(file);
@@ -1467,64 +1549,95 @@ async function runLamaInpaint() {
   setInpaintStatus(`LaMa inpaint ready (${regions.length} regions, ${W}×${H}, ${((performance.now() - t0)/1000).toFixed(1)}s)`);
 }
 
-// Paper-grain transfer: LaMa output is smooth where the original had brush
-// texture and paper noise. We compute the source's high-frequency detail
-// (source − blurred source), and for each masked pixel we OVERLAY detail
-// sampled from a non-masked patch of the source. Pseudo-random per-pixel
-// offsets break the obvious tile pattern. Result: the inpainted area picks
-// up the same paper grain magnitude/style as the rest of the painting.
+// Multi-scale texture transfer. LaMa produces smooth output; the original
+// watercolor has texture at multiple frequencies (paper grain ~3px, brush
+// variation ~12px, wash bands ~40px). We:
+//   1) Compute three blurs of the source: 3 / 12 / 40 px.
+//   2) Build a "nearest non-mask pixel" map via BFS so each masked pixel
+//      knows where to grab texture from (preserves spatial structure better
+//      than a single patch tiled randomly).
+//   3) For each masked pixel, sample detail at each scale from the nearest
+//      non-mask pixel (+ small jitter to break radial streaking) and add
+//      all three scales to the LaMa color.
 function applyTextureTransfer(target, srcCanvas, mask, W, H, strength) {
-  // 1. Blurred copy of A (low-pass)
-  const blurred = new OffscreenCanvas(W, H);
-  const bctx = blurred.getContext('2d');
-  bctx.filter = 'blur(3px)';
-  bctx.drawImage(srcCanvas, 0, 0);
-  bctx.filter = 'none';
-  const srcData  = srcCanvas.getContext('2d').getImageData(0, 0, W, H).data;
-  const blurData = bctx.getImageData(0, 0, W, H).data;
-
-  // 2. Find a 96×96 patch that's entirely non-masked. Scan the borders +
-  // mid-edges. If nothing clean is found, fall back to (0, 0) — its detail
-  // may include object content but the grain transfer is still better than
-  // pure LaMa smoothness.
-  const patch = 96;
-  const candidates = [];
-  for (let cy = 0; cy <= H - patch; cy += 48) {
-    for (let cx = 0; cx <= W - patch; cx += 48) candidates.push([cx, cy]);
+  function blurDataAt(radius) {
+    const c = new OffscreenCanvas(W, H);
+    const cx = c.getContext('2d');
+    cx.filter = `blur(${radius}px)`;
+    cx.drawImage(srcCanvas, 0, 0);
+    cx.filter = 'none';
+    return cx.getImageData(0, 0, W, H).data;
   }
-  let cornerX = 0, cornerY = 0;
-  for (const [cx, cy] of candidates) {
-    let blocked = false;
-    for (let y = 0; y < patch && !blocked; y += 12) {
-      for (let x = 0; x < patch && !blocked; x += 12) {
-        if (mask[(cy + y) * W + cx + x]) blocked = true;
-      }
-    }
-    if (!blocked) { cornerX = cx; cornerY = cy; break; }
+  const src = srcCanvas.getContext('2d').getImageData(0, 0, W, H).data;
+  const bs  = blurDataAt(3);   // small — grain
+  const bm  = blurDataAt(12);  // mid   — brush variation
+  const bl  = blurDataAt(40);  // large — washes / cloud bands
+
+  // BFS distance transform: for each masked pixel, the index of its nearest
+  // non-masked pixel. Flat typed-array queue for perf on large images.
+  const near = new Int32Array(W * H).fill(-1);
+  const queue = new Int32Array(W * H);
+  let qHead = 0, qTail = 0;
+  for (let i = 0; i < W * H; i++) {
+    if (!mask[i]) { near[i] = i; queue[qTail++] = i; }
+  }
+  while (qHead < qTail) {
+    const i = queue[qHead++];
+    const y = (i / W) | 0;
+    const x = i - y * W;
+    if (x > 0     && near[i - 1] === -1) { near[i - 1] = near[i]; queue[qTail++] = i - 1; }
+    if (x < W - 1 && near[i + 1] === -1) { near[i + 1] = near[i]; queue[qTail++] = i + 1; }
+    if (y > 0     && near[i - W] === -1) { near[i - W] = near[i]; queue[qTail++] = i - W; }
+    if (y < H - 1 && near[i + W] === -1) { near[i + W] = near[i]; queue[qTail++] = i + W; }
   }
 
-  // 3. For each masked pixel, sample detail at a pseudo-random offset into
-  // the chosen patch and add it to the LaMa result.
+  // Hash for per-pixel jitter so deep-in-mask pixels don't all reflect to
+  // the same edge point (which would cause obvious radial smearing).
   const hash2d = (x, y) => {
     let h = (x | 0) * 374761393 + (y | 0) * 668265263;
     h = (h ^ (h >>> 13)) * 1274126177;
     return ((h ^ (h >>> 16)) >>> 0);
   };
-  for (let y = 0; y < H; y++) {
-    for (let x = 0; x < W; x++) {
-      const i = y * W + x;
-      if (!mask[i]) continue;
-      const rng = hash2d(x, y);
-      const tx = cornerX + (rng % patch);
-      const ty = cornerY + ((rng >>> 8) % patch);
-      const sIdx = (ty * W + tx) * 4;
-      const tIdx = i * 4;
-      const dr = srcData[sIdx + 0] - blurData[sIdx + 0];
-      const dg = srcData[sIdx + 1] - blurData[sIdx + 1];
-      const db = srcData[sIdx + 2] - blurData[sIdx + 2];
-      target[tIdx + 0] = Math.max(0, Math.min(255, target[tIdx + 0] + dr * strength));
-      target[tIdx + 1] = Math.max(0, Math.min(255, target[tIdx + 1] + dg * strength));
-      target[tIdx + 2] = Math.max(0, Math.min(255, target[tIdx + 2] + db * strength));
+  const jitter = 24; // px wiggle around the nearest-edge sample
+
+  // Cap mirror reflection so deep-mask pixels don't sample from very far
+  // away (which gives unrelated content); keep texture local to the mask
+  // edge while still varying spatially across the masked area.
+  const maxReflect = 100;
+
+  for (let i = 0; i < W * H; i++) {
+    if (!mask[i]) continue;
+    const y = (i / W) | 0;
+    const x = i - y * W;
+    const n = near[i];
+    const nx = n - ((n / W) | 0) * W;
+    const ny = (n / W) | 0;
+    // Mirror: reflect through the nearest edge point. Cap the reflection
+    // distance to maxReflect so we never sample halfway across the image.
+    let dx = nx - x, dy = ny - y;
+    const d = Math.hypot(dx, dy);
+    if (d > maxReflect) { dx = dx / d * maxReflect; dy = dy / d * maxReflect; }
+    let mx = Math.round(nx + dx);
+    let my = Math.round(ny + dy);
+    // Jitter to break exact mirror symmetry
+    const rng = hash2d(x, y);
+    mx += (rng % (jitter * 2 + 1)) - jitter;
+    my += ((rng >>> 8) % (jitter * 2 + 1)) - jitter;
+    mx = Math.max(0, Math.min(W - 1, mx));
+    my = Math.max(0, Math.min(H - 1, my));
+    let mIdx = my * W + mx;
+    // If the mirrored position is still in the mask (e.g. a region wider
+    // than 2 × maxReflect, or a different region in the path), fall back
+    // to the original nearest-edge pixel.
+    if (mask[mIdx]) mIdx = n;
+    const sIdx = mIdx * 4;
+    const tIdx = i * 4;
+    for (let c = 0; c < 3; c++) {
+      const dSmall = src[sIdx + c] - bs[sIdx + c];
+      const dMid   = bs[sIdx + c] - bm[sIdx + c];
+      const dLarge = bm[sIdx + c] - bl[sIdx + c];
+      const add = (dSmall + dMid + dLarge) * strength;
+      target[tIdx + c] = Math.max(0, Math.min(255, target[tIdx + c] + add));
     }
   }
 }
@@ -2097,15 +2210,15 @@ tp.panePlay.addBinding(state, 'stagger',  { min: 0, max: 1,   step: 0.01,  label
 const fVideo = tp.panePlay.addFolder({ title: 'Video mask (T slot)', expanded: false });
 fVideo.addBinding(state, 'videoStrength', { min: 0, max: 1, step: 0.01, label: 'strength' });
 fVideo.addBinding(state, 'videoInvert',   { label: 'invert (dark first)' });
-// Play / Restart / Loop as a 3-cell button grid for compactness
+// Play / Restart as a 2-cell button grid. Loop lives as a checkbox below
+// so it isn't duplicated (it used to be both a button and a binding).
 const playGrid = tp.panePlay.addBlade({
-  view: 'buttongrid', size: [3, 1],
-  cells: (x) => ({ title: ['▶ Play', '⟲ Restart', 'Loop'][x] }),
+  view: 'buttongrid', size: [2, 1],
+  cells: (x) => ({ title: ['▶ Play', '⟲ Restart'][x] }),
 });
 playGrid.on('click', (e) => {
   if (e.index[0] === 0) setPlaying(!state.playing);
   if (e.index[0] === 1) setT(0);
-  if (e.index[0] === 2) { state.loop = !state.loop; }
 });
 tp.panePlay.addBinding(state, 'loop', { label: 'loop on end' });
 
@@ -2124,35 +2237,50 @@ tp.paneSeg.addBinding(state, 'samModelId', {
 });
 tp.paneSeg.addButton({ title: '1. Load SAM model' }).on('click', () => samLoadModel());
 tp.paneSeg.addButton({ title: '2. Encode image' }).on('click', () => samEncodeImage());
-tp.paneSeg.addBinding(samUI, 'mode', { label: '3. segment mode' }).on('change', (e) => setSegmentMode(e.value));
-tp.paneSeg.addButton({ title: '↶ Undo last point' }).on('click', () => {
-  if (!sam.points.length) { setStatus('no points to undo'); return; }
-  sam.points.pop();
-  if (sam.points.length === 0) {
-    sam.maskCanvas = null; drawOverlay();
-    setStatus('all points removed — click to start');
+tp.paneSeg.addBinding(samUI, 'mode', { label: 'segment mode' }).on('change', (e) => setSegmentMode(e.value));
+
+// Mask edit — grow/shrink/brush the active SAM mask. Expanded by default
+// since this is the primary refinement workflow after a SAM click.
+const fMaskEdit = tp.paneSeg.addFolder({ title: 'Mask edit', expanded: true });
+
+// Undo / reset as a single 2-cell row — natural pair, both modify the
+// in-progress SAM points without committing anything.
+const pointBtns = fMaskEdit.addBlade({
+  view: 'buttongrid', size: [2, 1],
+  cells: (x) => ({ title: ['↶ Undo point', 'Reset points'][x] }),
+});
+pointBtns.on('click', (e) => {
+  if (e.index[0] === 0) {
+    if (!sam.points.length) { setStatus('no points to undo'); return; }
+    sam.points.pop();
+    if (sam.points.length === 0) {
+      sam.maskCanvas = null; drawOverlay();
+      setStatus('all points removed — click to start');
+    } else { drawOverlay(); runSamInference(); }
   } else {
-    drawOverlay();
-    runSamInference();
+    samClearMask();
   }
 });
-tp.paneSeg.addButton({ title: '+ Save mask as region' }).on('click', () => saveCurrentMaskAsRegion());
-tp.paneSeg.addButton({ title: 'reset current points' }).on('click', () => samClearMask());
-
-// Mask edit — grow/shrink the active mask, or paint into it manually
-const fMaskEdit = tp.paneSeg.addFolder({ title: 'Mask edit', expanded: false });
-fMaskEdit.addBinding(growUI, 'amount', { min: 1, max: 64, step: 1, label: 'grow amount (px)' });
-fMaskEdit.addButton({ title: '↗ Grow current mask' })
-  .on('click', () => applyMaskMorphology(growUI.amount, 'grow'));
-fMaskEdit.addButton({ title: '↙ Shrink current mask' })
-  .on('click', () => applyMaskMorphology(growUI.amount, 'shrink'));
 fMaskEdit.addBlade({ view: 'separator' });
-fMaskEdit.addBinding(brushUI, 'mode', { label: 'brush mode (drag to paint)' });
-fMaskEdit.addBinding(brushUI, 'size', { min: 5, max: 200, step: 1, label: 'brush size (px)' });
+fMaskEdit.addBinding(growUI, 'amount', { min: 1, max: 64, step: 1, label: 'amount (px)' });
+const growBtns = fMaskEdit.addBlade({
+  view: 'buttongrid', size: [2, 1],
+  cells: (x) => ({ title: ['↗ Grow', '↙ Shrink'][x] }),
+});
+growBtns.on('click', (e) => {
+  applyMaskMorphology(growUI.amount, e.index[0] === 0 ? 'grow' : 'shrink');
+});
+fMaskEdit.addBlade({ view: 'separator' });
+fMaskEdit.addBinding(brushUI, 'mode', { label: 'brush (drag to paint)' });
+fMaskEdit.addBinding(brushUI, 'size', { min: 5, max: 200, step: 1, label: 'brush size' });
 fMaskEdit.addBinding(brushUI, 'action', {
   label: 'brush action',
   options: { 'include (add)': 'include', 'exclude (cut)': 'exclude' },
 });
+
+// Final action of the Segment pane: commit the active mask as a saved region.
+tp.paneSeg.addBlade({ view: 'separator' });
+tp.paneSeg.addButton({ title: '+ Save mask as region' }).on('click', () => saveCurrentMaskAsRegion());
 
 // Inpaint pane
 tp.paneInpaint = new Pane({ container: document.getElementById('tp-inpaint'), title: 'Inpaint' });
@@ -2164,13 +2292,16 @@ tp.inpaintMethodBinding = tp.paneInpaint.addBinding(inpaintUI, 'method', {
     'LaMa (offline)':          'lama',
     'Background image (manual)':'background',
     'fal.ai API (hosted)':     'api',
-    'SD (browser, WIP)':       'sd',
   },
 });
 tp.inpaintMethodBinding.on('change', (e) => {
   state.inpaintMethod = e.value;
   syncMethodVisibility();
   refreshInpaintButton();
+  // Auto-expand the params folder that matches the chosen method so the
+  // relevant knobs are visible without an extra click.
+  if (tp.fLama) tp.fLama.expanded = (state.inpaintMethod === 'lama');
+  if (tp.fApi)  tp.fApi.expanded  = (state.inpaintMethod === 'api');
 });
 tp.inpaintStatusBinding = tp.paneInpaint.addBinding(inpaintUI, 'status', { readonly: true, label: 'status' });
 
